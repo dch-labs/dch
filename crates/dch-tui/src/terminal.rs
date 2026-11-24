@@ -94,6 +94,34 @@ pub fn background_support() -> BackgroundSupport {
     }
 }
 
+/// Whether the terminal's default background carries a canvas this
+/// session wrote.
+///
+/// The grounding walk's second question on a direct terminal: the
+/// exchange may be [`BackgroundSupport::Answered`] yet carry no
+/// installed canvas — the startup retry's fallback restored the
+/// terminal's own background under a palette the registry cannot
+/// un-mask — and grounding a deferred canvas over the restored
+/// background would paint cells that no longer match what the
+/// terminal shows. Every write that lands a canvas raises the flag;
+/// the captured restore and the paintless restore lower it. A
+/// multiplexed pane paints its own canvas and never consults it.
+static CANVAS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the terminal's default background carries a canvas this
+/// session wrote.
+///
+/// True only after a canvas write landed — the startup install, or
+/// a theme burst's canvas half — and false again once a restore
+/// gives the terminal its own background back. The display's
+/// grounding walk reads this beside the support verdict so a
+/// deferred palette whose terminal was restored keeps the terminal's
+/// scheme.
+#[must_use]
+pub fn canvas_installed() -> bool {
+    CANVAS_INSTALLED.load(Ordering::SeqCst)
+}
+
 /// Whether a live switch should ask the terminal now: only a session
 /// that never got an answer — skipped at startup, never queried since
 /// — asks. A proven terminal writes; a refused one is never asked
@@ -255,20 +283,51 @@ pub fn init_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacken
 /// that window is gated, not blindly consumed (the query's own doc
 /// records the accepted residual).
 ///
-/// Returns whether the override landed: `true` when the terminal
+/// A pane inside a multiplexer runs none of the exchange: the set
+/// there retargets the pane's default inside the multiplexer's grid,
+/// and every erase the multiplexer performs on its own — the reflow
+/// of a resized window, the clear of a display-panes overlay, the
+/// alternate-screen handoff at exit — then paints with the theme's
+/// canvas in places the frame never drew: other panes mid-redraw,
+/// newly exposed rows, the tab the client switches to. The frame
+/// paints its canvas itself in that seat (see the grounding walk in
+/// the display), so the pane keeps the client's own default and no
+/// erase of the multiplexer's can ever show the theme's color where
+/// the frame did not put it.
+///
+/// Returns whether the canvas stands: `true` when the terminal
 /// answered and its default background now carries the theme's
-/// canvas; `false` when it stayed silent or the canvas is not RGB.
-/// A caller whose palette assumes the canvas must read `false` as
-/// "defer to the terminal" — the palette's terminal-background
-/// colors were chosen against the theme's canvas, which this
-/// terminal is not showing.
+/// canvas — or when the frame paints the canvas itself, a
+/// multiplexed pane; `false` when it stayed silent or the canvas is
+/// not RGB. A caller whose palette assumes the canvas must read
+/// `false` as "defer to the terminal" — the palette's
+/// terminal-background colors were chosen against the theme's
+/// canvas, which this terminal is not showing.
 #[must_use]
 pub fn sync_default_background(background: Color) -> bool {
-    query_and_install(background).installed
+    if multiplexer_client() {
+        return true;
+    }
+    query_and_install(background, true, std::time::Duration::ZERO).installed
 }
 
-/// Ask the terminal for its default background and install the new
-/// override when it answers — the mid-session half of the exchange.
+/// The beat a retry of the startup question waits for input to show
+/// itself before asking.
+///
+/// The launch check samples one instant: keys already typed ahead are
+/// sitting in the queue, and a zero wait reads them honestly. A retry
+/// cannot lean on that instant — it runs just after the event reader
+/// parks, and input that arrives continuously (a typist between two
+/// keys, a flood between two gestures) can hold a gap exactly wide
+/// enough for a zero wait to miss. One beat wide enough to span a
+/// gap between gestures — yet short enough that no user could read a
+/// frame in it — lets continuous input defer the ask every time,
+/// exactly as the launch rule intends, while an idle terminal still
+/// settles its answer inside the blink of a first frame.
+const RETRY_INPUT_BEAT: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Ask the terminal for its default background and capture what it
+/// answers — the mid-session half of the exchange, writing nothing.
 ///
 /// # The caller owns stdin
 ///
@@ -292,8 +351,43 @@ pub fn sync_default_background(background: Color) -> bool {
 /// instead: the reply parser consumes it, the session settles
 /// [`BackgroundSupport::Refused`], and no byte comes back — the same
 /// one-shot cost the startup window documents.
+///
+/// The override itself is deliberately not written here: the asking
+/// tier's caller is a committed theme switch, whose canvas write
+/// belongs inside the synchronized burst that lands the re-styled
+/// cells — [`finish_theme_burst`] performs it, warranted by the
+/// captured original this exchange leaves behind — because a canvas
+/// flipped at keypress time would beat the text it must land beside.
+/// The startup-retry counterpart,
+/// [`ask_and_install_default_background`], writes at once instead:
+/// its landing is followed by a whole-screen repaint, so no frame
+/// exists for an early write to race. `QueryOutcome::installed`
+/// therefore means the canvas stands — now or in the caller's flush.
 pub(crate) fn ask_default_background(background: Color) -> QueryOutcome {
-    query_and_install(background)
+    if multiplexer_client() {
+        return QueryOutcome::default();
+    }
+    query_and_install(background, false, RETRY_INPUT_BEAT)
+}
+
+/// Ask the terminal for its default background and install the new
+/// override when it answers — the startup-retry half of the exchange.
+///
+/// # The caller owns stdin
+///
+/// Same contract as [`ask_default_background`]: the reply is read
+/// from stdin, so the event reader must be quiesced through the same
+/// handshake, and the answer teaches the support record exactly as
+/// the write-less half's does. The one difference is the write's
+/// moment: this half runs where its landing is followed by a
+/// whole-screen repaint, so the override is written the moment the
+/// answer arrives and the record it leaves warrants later switches
+/// without another question.
+pub(crate) fn ask_and_install_default_background(background: Color) -> QueryOutcome {
+    if multiplexer_client() {
+        return QueryOutcome::default();
+    }
+    query_and_install(background, true, RETRY_INPUT_BEAT)
 }
 
 /// What the query-and-override exchange left behind.
@@ -304,10 +398,13 @@ pub(crate) fn ask_default_background(background: Color) -> QueryOutcome {
 /// dropped.
 #[derive(Default)]
 pub(crate) struct QueryOutcome {
-    /// Whether the terminal answered and the override was written.
+    /// Whether the terminal answered and the canvas stands.
     ///
-    /// False on silence, a stolen keystroke, or a paintless palette —
-    /// in every case the caller keeps the deferred palette.
+    /// True when the answer arrived — the override is either written
+    /// already or warranted for the caller's flush, which the asking
+    /// half relies on to land the write inside its burst. False on
+    /// silence, a stolen keystroke, or a paintless palette — in every
+    /// case the caller keeps the deferred palette.
     pub(crate) installed: bool,
 
     /// The one byte a non-reply keystroke lost to the query reader.
@@ -318,14 +415,22 @@ pub(crate) struct QueryOutcome {
 }
 
 /// The query-and-override exchange shared by the startup and
-/// mid-session halves. The caller owns stdin; the halves differ only
-/// in who guarantees that.
-fn query_and_install(background: Color) -> QueryOutcome {
+/// mid-session halves. The caller owns stdin; the halves differ in
+/// who guarantees that and in whether the override is written here
+/// (`install`) or left to the caller's own flush — a committed theme
+/// switch needs the write inside the burst that lands its cells, so
+/// its half asks without installing and the burst performs the write
+/// the answer warrants.
+fn query_and_install(
+    background: Color,
+    install: bool,
+    input_wait: std::time::Duration,
+) -> QueryOutcome {
     let Color::Rgb(red, green, blue) = background else {
         return QueryOutcome::default();
     };
     #[cfg(unix)]
-    let outcome = query_unix(red, green, blue);
+    let outcome = query_unix(red, green, blue, install, input_wait);
     #[cfg(not(unix))]
     let outcome = {
         let _ = (red, green, blue);
@@ -334,26 +439,38 @@ fn query_and_install(background: Color) -> QueryOutcome {
     outcome
 }
 
-/// The unix half of the exchange: query, record the verdict, install.
+/// The unix half of the exchange: query, record the verdict, and —
+/// when the caller's half writes here — install.
 ///
 /// Split from [`query_and_install`] so the platform halves each read
 /// as one straight line — the caller owns stdin either way, and only
-/// the byte-level exchange differs.
+/// the byte-level exchange differs. An answered terminal is captured
+/// and recorded on every path; `install` alone decides whether the
+/// override's bytes leave now or stay with the caller's flush.
 #[cfg(unix)]
-fn query_unix(red: u8, green: u8, blue: u8) -> QueryOutcome {
-    let outcome = query_default_background();
+fn query_unix(
+    red: u8,
+    green: u8,
+    blue: u8,
+    install: bool,
+    input_wait: std::time::Duration,
+) -> QueryOutcome {
+    let outcome = query_default_background(input_wait);
     record_support(reply_verdict(&outcome));
     match outcome {
         QueryReply::Answered(original) => {
             let _stored = ORIGINAL_BACKGROUND.set(original);
             refresh_signal_restore_bytes(original);
-            let mut stdout = io::stdout();
-            drop(write!(
-                stdout,
-                "{}",
-                background_sequence((red, green, blue))
-            ));
-            drop(stdout.flush());
+            if install {
+                let mut stdout = io::stdout();
+                drop(write!(
+                    stdout,
+                    "{}",
+                    background_sequence((red, green, blue))
+                ));
+                drop(stdout.flush());
+                CANVAS_INSTALLED.store(true, Ordering::SeqCst);
+            }
             QueryOutcome {
                 installed: true,
                 stolen: None,
@@ -442,8 +559,14 @@ fn live_override_plan(original_captured: bool, background: Color) -> LiveOverrid
 /// the terminal's own `Reset` — answered without writing a byte, so a
 /// caller can decide to defer the write into a later flush (beside the
 /// re-styled cells it belongs with) without paying the write twice or
-/// guessing at the gate.
+/// guessing at the gate. A multiplexed pane answers by its palette
+/// alone: it writes no terminal default at all, and the frame paints
+/// its canvas under its own cells, so an `Rgb` palette is always
+/// paintable there — the one verdict a caller needs.
 pub(crate) fn write_only_warranted(background: Color) -> bool {
+    if multiplexer_client() {
+        return matches!(background, Color::Rgb(..));
+    }
     ORIGINAL_BACKGROUND.get().is_some()
         && matches!(
             live_override_plan(true, background),
@@ -486,20 +609,137 @@ fn cursor_reset_sequence() -> &'static str {
     "\x1b]112\x1b\\"
 }
 
+/// Whether this session runs as a pane inside a terminal multiplexer.
+///
+/// The multiplexers name themselves in the environment: tmux exports
+/// `TMUX` for every pane, GNU screen `STY`, zellij `ZELLIJ`; tmux and
+/// screen also type the pane's `TERM` with their own prefix. Any one
+/// spelling is evidence enough; none needs a query or a subprocess to
+/// settle. The verdict is computed once into a static so the
+/// fatal-signal writer can read it without touching the environment
+/// from a handler.
+#[cfg(not(test))]
+fn multiplexer_client() -> bool {
+    *MULTIPLEXER_CLIENT.get_or_init(|| {
+        multiplexer_client_of(
+            &[
+                std::env::var_os("TMUX"),
+                std::env::var_os("STY"),
+                std::env::var_os("ZELLIJ"),
+            ],
+            std::env::var_os("TERM").as_deref(),
+        )
+    })
+}
+
+/// The suite's verdict: a direct terminal unless a test opts into the
+/// pane side.
+///
+/// Pins must not depend on the shell the suite runs in — a developer's
+/// own session may well sit inside tmux — so the environment is never
+/// read under test; a test that walks the pane side sets the override
+/// through [`set_multiplexed_for_tests`] under the test lock.
+#[cfg(test)]
+fn multiplexer_client() -> bool {
+    MULTIPLEXER_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) == 1
+}
+
+/// The verdict a test pins the multiplexer question to: the suite's
+/// resting answer is a direct terminal, and a test walking the pane
+/// side opts in for the length of its body. The value holds for the
+/// rest of the test process, so tests that set it hold the test lock.
+#[cfg(test)]
+static MULTIPLEXER_TEST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Pin the multiplexer verdict for the rest of the test process.
+///
+/// The override replaces the environment read the cfg(test)
+/// [`multiplexer_client`] performs, so a pin does not depend on the
+/// shell the suite runs in: `Some(true)` settles the pane side, and
+/// `None` — the suite's resting answer — or `Some(false)` settle a
+/// direct terminal. The verdict is one process-wide answer while the
+/// suite runs in parallel, so every test that sets it holds
+/// [`MULTIPLEXER_TEST_LOCK`] for its whole body; the value stands
+/// until another pinned test replaces it.
+#[cfg(test)]
+pub(crate) fn set_multiplexed_for_tests(verdict: Option<bool>) {
+    let code = u8::from(verdict == Some(true));
+    MULTIPLEXER_TEST_OVERRIDE.store(code, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Serializes the tests that pin the multiplexer verdict.
+///
+/// The verdict is one process-wide answer, and the suite runs in
+/// parallel: a test walking the direct side while another flips to the
+/// pane side would pin whichever answer landed last. Every test that
+/// sets the override holds this lock for its whole body, so the two
+/// sides never interleave.
+#[cfg(test)]
+pub(crate) static MULTIPLEXER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The pure half of [`multiplexer_client`]: the same verdict over
+/// supplied spellings.
+///
+/// Split from the environment reader so the decision itself is
+/// pinnable without a process-wide environment write — any non-empty
+/// multiplexer variable, or a `TERM` beginning `tmux` or `screen`,
+/// settles multiplexed; anything else direct.
+fn multiplexer_client_of(
+    multiplexers: &[Option<std::ffi::OsString>; 3],
+    term: Option<&std::ffi::OsStr>,
+) -> bool {
+    multiplexers
+        .iter()
+        .any(|spelling| spelling.as_ref().is_some_and(|value| !value.is_empty()))
+        || term.is_some_and(|typed| {
+            let typed = typed.as_encoded_bytes();
+            typed.starts_with(b"tmux") || typed.starts_with(b"screen")
+        })
+}
+
+/// The multiplexer verdict, settled once per process.
+///
+/// Read by the cursor-color writers — the one OSC family that is
+/// client-shared even on a multiplexer that scopes the background
+/// per pane: tmux forwards a pane's OSC 12 to the client terminal on
+/// every redraw that touches the cursor's pane, so a tinted pane
+/// repaints the client's cursor — the cursor every other pane draws —
+/// dozens of times a minute. A multiplexed session therefore never
+/// writes the tint at all, and the reset rides the same gate.
+#[cfg(not(test))]
+static MULTIPLEXER_CLIENT: OnceLock<bool> = OnceLock::new();
+
+/// Whether this session runs as a pane inside a terminal multiplexer.
+///
+/// The settled verdict for the frame: a multiplexed pane cannot lean
+/// on the terminal's default background the way a direct terminal can
+/// — the multiplexer hands runs of default cells to the client as the
+/// client's own default — so the display reads this to decide whether
+/// the frame must paint its canvas under every cell itself.
+#[must_use]
+pub fn multiplexed_pane() -> bool {
+    multiplexer_client()
+}
+
 /// Tint the terminal cursor to a palette's accent color.
 ///
 /// One-way like the background override's live half and riding the
 /// same proof: only a session whose terminal answered the background
 /// query sends it, because a terminal that stayed silent about OSC 11
-/// has said nothing that recommends OSC 12 either. Best effort by
-/// design — the tint is cosmetic, so a failed write is accepted in
-/// silence — and a non-`Rgb` accent (the paintless vocabulary's
-/// `Reset`) is a no-op: the cursor keeps the terminal's own color.
+/// has said nothing that recommends OSC 12 either. A pane inside a
+/// multiplexer sends neither: the cursor color is client-shared state
+/// there — tmux re-emits a pane's OSC 12 to the client on every
+/// redraw the cursor's pane takes, tinting the cursor every other
+/// pane draws — so the tint is a multiplexed session's one cosmetic
+/// that must stay home. Best effort by design — the tint is
+/// cosmetic, so a failed write is accepted in silence — and a
+/// non-`Rgb` accent (the paintless vocabulary's `Reset`) is a no-op:
+/// the cursor keeps the terminal's own color.
 pub fn set_cursor_color(color: Color) {
     let Color::Rgb(red, green, blue) = color else {
         return;
     };
-    if ORIGINAL_BACKGROUND.get().is_none() {
+    if ORIGINAL_BACKGROUND.get().is_none() || multiplexer_client() {
         return;
     }
     let mut stdout = io::stdout();
@@ -528,6 +768,8 @@ const SYNCHRONIZED_OUTPUT_END: &str = "\x1b[?2026l";
 /// ignores the marker and renders as it always did, so the window
 /// costs nothing.
 pub fn begin_synchronized_output() {
+    #[cfg(test)]
+    SYNCHRONIZED_WINDOW_BALANCE.fetch_add(1, Ordering::Relaxed);
     let mut stdout = io::stdout();
     drop(write!(stdout, "{SYNCHRONIZED_OUTPUT_BEGIN}"));
     drop(stdout.flush());
@@ -546,6 +788,7 @@ pub(crate) fn theme_burst_bytes(
     original: Option<(u8, u8, u8)>,
     background: Color,
     primary: Color,
+    cursor_shared: bool,
 ) -> String {
     let channels = match (original, live_override_plan(original.is_some(), background)) {
         (_, LiveOverridePlan::Write) => match background {
@@ -558,10 +801,12 @@ pub(crate) fn theme_burst_bytes(
     let mut burst = String::new();
     if let Some((red, green, blue)) = channels {
         burst.push_str(&background_sequence((red, green, blue)));
-        if background == Color::Reset {
-            burst.push_str(cursor_reset_sequence());
-        } else if let Color::Rgb(red, green, blue) = primary {
-            burst.push_str(&cursor_sequence((red, green, blue)));
+        if !cursor_shared {
+            if background == Color::Reset {
+                burst.push_str(cursor_reset_sequence());
+            } else if let Color::Rgb(red, green, blue) = primary {
+                burst.push_str(&cursor_sequence((red, green, blue)));
+            }
         }
     }
     burst.push_str(SYNCHRONIZED_OUTPUT_END);
@@ -579,18 +824,45 @@ pub(crate) fn theme_burst_bytes(
 /// stream the way separate writes did, and the cells that painted
 /// earliest in the diff never trail the canvas by a whole region.
 pub fn finish_theme_burst(background: Color, primary: Color) {
-    let closer = theme_burst_bytes(ORIGINAL_BACKGROUND.get().copied(), background, primary);
+    #[cfg(test)]
+    SYNCHRONIZED_WINDOW_BALANCE.fetch_sub(1, Ordering::Relaxed);
+    let original = ORIGINAL_BACKGROUND.get().copied();
+    let closer = theme_burst_bytes(original, background, primary, multiplexer_client());
+    let lands_canvas = matches!(
+        live_override_plan(original.is_some(), background),
+        LiveOverridePlan::Write
+    );
+    CANVAS_INSTALLED.store(lands_canvas, Ordering::SeqCst);
     let mut stdout = io::stdout();
     drop(write!(stdout, "{closer}"));
     drop(stdout.flush());
 }
 
+/// The synchronized-output window balance, for tests that pin the
+/// markers' pairing.
+///
+/// Every [`begin_synchronized_output`] increments and every
+/// [`finish_theme_burst`] decrements, so a walk that leaves this where
+/// it found it opened every window it closed — the pairing
+/// [`theme_burst_bytes`] documents. Test-only: nothing outside the
+/// test build reads it.
+#[cfg(test)]
+pub(crate) static SYNCHRONIZED_WINDOW_BALANCE: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
 /// Give the terminal its own cursor color back.
 ///
-/// Unconditional on the exit paths: on a session that never tinted,
-/// the OSC 112 reset returns the cursor to the default it already
-/// had, so no bookkeeping decides whether to send it.
+/// Sent only on exit paths whose session could have tinted: the
+/// tint rides a captured original background
+/// ([`set_cursor_color`] writes nothing without one) on a terminal
+/// that is not a multiplexer pane, so the reset rides the same
+/// gates — and a session that never captured, or a pane whose
+/// client-shared cursor the tint would have touched, sends neither
+/// byte, leaving the cursor exactly as it found it.
 pub fn reset_cursor_color() {
+    if multiplexer_client() {
+        return;
+    }
     let mut stdout = io::stdout();
     drop(write!(stdout, "{}", cursor_reset_sequence()));
     drop(stdout.flush());
@@ -657,7 +929,7 @@ enum QueryReply {
 /// the failed reply attempt — a one-shot window, bounded well under
 /// half a second, that is accepted rather than bridged.
 #[cfg(unix)]
-fn query_default_background() -> QueryReply {
+fn query_default_background(input_wait: std::time::Duration) -> QueryReply {
     use std::time::Duration;
     use std::time::Instant;
 
@@ -677,7 +949,7 @@ fn query_default_background() -> QueryReply {
     // bytes that had not yet arrived.
     const REPLY_FINISH_DEADLINE: Duration = Duration::from_millis(200);
 
-    if stdin_ready(Duration::ZERO) {
+    if stdin_ready(input_wait) {
         return QueryReply::NotAsked;
     }
     let mut stdout = io::stdout();
@@ -773,183 +1045,36 @@ fn splash_colors() -> dch_config::SplashColors {
 /// Whether the session's truecolor escapes reach the terminal as
 /// themselves.
 ///
-/// Outside tmux they always do — the process writes its colors to the
-/// terminal it stands on. Behind tmux, they reach the client when the
-/// client carries the RGB feature; without it, tmux re-encodes every
-/// direct color into the pane's palette, per color and with no eye for
-/// the pair a cell paints, which mangles a dithered two-color art.
-/// The session asks tmux itself — `display-message` against the pane,
-/// the same server the clipboard transport talks to — which features
-/// the attached client carries.
-///
-/// The polarity of ignorance is truecolor: a session that cannot get
-/// tmux's answer keeps emitting direct colors, exactly as sessions
-/// always have — a missing binary, a dead socket, or an empty answer
-/// (no client attached, a tmux too old to know the format) is no
-/// evidence of conversion, and downgrading a session whose colors were
-/// arriving fine is its own regression. Only an explicit feature list
-/// without the `RGB` token — tmux naming this client as one that
-/// cannot take direct colors — settles the downgrade to the palette
-/// rendition. Decided once per process, on the first reader.
+/// A direct terminal always takes them — the process writes its colors
+/// to the terminal it stands on. So does a pane inside a multiplexer
+/// whose client carries the RGB feature: the multiplexer forwards
+/// direct colors verbatim, and a client that lacks the feature keeps
+/// the hues in its own approximation — the one mapping every terminal
+/// applies to a photograph of a night. Only a multiplexer that
+/// re-encodes for a client it knows as 256-color collapses the art per
+/// color onto the grey ramp, and a pane can never know which clients
+/// are attached; so the original art is the default everywhere, and
+/// the palette rendition — fixed indexes the multiplexer passes
+/// through verbatim, authored in the greys that are the honest nearest
+/// entries for a night this dark — is the user's explicit opt-in for a
+/// tmux whose clients are known 256-color. Decided once per process,
+/// on the first reader; [`dch_config::SplashColors`] overrides the
+/// choice in either direction.
 pub fn truecolor_warranted() -> bool {
     static WARRANTED: OnceLock<bool> = OnceLock::new();
-    *WARRANTED.get_or_init(|| {
-        use dch_config::SplashColors;
-        let mode = splash_colors();
-        match mode {
-            SplashColors::Auto => {
-                let in_tmux = std::env::var_os("TMUX").is_some_and(|value| !value.is_empty());
-                splash_warrant(mode, in_tmux, tmux_client_report().as_ref())
-            }
-            SplashColors::Truecolor | SplashColors::Palette => splash_warrant(mode, false, None),
-        }
-    })
-}
-
-/// The tmux client's own report for this pane: its feature list and
-/// its terminal name, one query, cached for the process.
-///
-/// `None` when there is no pane id to target, no tmux to ask, or no
-/// success to read — each a shape where tmux has said nothing.
-fn tmux_client_report() -> Option<(String, String)> {
-    static REPORT: OnceLock<Option<(String, String)>> = OnceLock::new();
-    REPORT
-        .get_or_init(|| {
-            use std::process::Command;
-            let pane = std::env::var_os("TMUX_PANE")?;
-            let output = Command::new("tmux")
-                .args(["display-message", "-p", "-t"])
-                .arg(&pane)
-                .arg("#{client_termfeatures}|#{client_termname}")
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if echoed_format(&text) {
-                return None;
-            }
-            let (features, termname) = text.split_once('|')?;
-            Some((features.trim().to_string(), termname.trim().to_string()))
-        })
-        .clone()
-}
-
-/// Whether a tmux reply is the format string echoed back, not an
-/// answer.
-///
-/// tmux older than a format variable prints it literally
-/// (`#{client_termfeatures}`), which would otherwise parse as a
-/// feature list naming nothing — the exact shape that withdraws
-/// truecolor. The `#{` spelling never appears in a real answer.
-fn echoed_format(text: &str) -> bool {
-    text.contains("#{")
-}
-
-/// Whether a tmux client-features list carries the RGB feature.
-///
-/// The list is comma-separated (`focus,clipboard,RGB,title`); the
-/// token match keeps a hypothetical feature whose name merely contains
-/// the letters from vouching for truecolor.
-fn features_carry_rgb(features: &str) -> bool {
-    features.split(',').any(|token| token.trim() == "RGB")
-}
-
-/// The warrant from tmux's answer, purely.
-///
-/// The decision table behind [`truecolor_warranted`]: outside tmux is
-/// always warranted; inside, an absent or empty answer keeps
-/// truecolor, and only a feature list that says something and does
-/// not name RGB withdraws it.
-fn warrant_from(in_tmux: bool, report: Option<&(String, String)>) -> bool {
-    if !in_tmux {
-        return true;
-    }
-    match report {
-        None => true,
-        Some((features, _)) => features.trim().is_empty() || features_carry_rgb(features),
-    }
+    *WARRANTED.get_or_init(|| splash_warrant(splash_colors()))
 }
 
 /// The truecolor verdict for one splash-colors mode, purely.
 ///
-/// The decision table behind [`truecolor_warranted`]'s match: a
-/// forced mode answers outright — `truecolor` keeps the original
-/// art and `palette` the fixed vocabulary, whatever tmux's client
-/// would have answered — and only `auto` defers to the tmux table
-/// [`warrant_from`] holds. Separated from the process-wide caches
-/// so every arm pins without a terminal or a test-ordering.
-fn splash_warrant(
-    mode: dch_config::SplashColors,
-    in_tmux: bool,
-    report: Option<&(String, String)>,
-) -> bool {
-    use dch_config::SplashColors;
-    match mode {
-        SplashColors::Truecolor => true,
-        SplashColors::Palette => false,
-        SplashColors::Auto => warrant_from(in_tmux, report),
-    }
-}
-
-/// The one-row notice naming the setting that restores truecolor,
-/// when the palette rendition engaged.
-///
-/// `None` everywhere the rendition did not engage — outside tmux, or
-/// behind a client whose answer carries RGB, or where tmux said
-/// nothing at all. Where it engages, the notice names the
-/// `terminal-features` line for this pane's own client terminal, so
-/// the fix is one paste into `~/.tmux.conf` and one reattach away.
-#[must_use = "the notice exists to be shown; dropping it silences the one hint that truecolor is a config line away"]
-pub fn tmux_color_notice() -> Option<String> {
-    use dch_config::SplashColors;
-    let mode = splash_colors();
-    match mode {
-        SplashColors::Auto => {
-            let in_tmux = std::env::var_os("TMUX").is_some_and(|value| !value.is_empty());
-            splash_notice_from(mode, in_tmux, tmux_client_report().as_ref())
-        }
-        SplashColors::Truecolor | SplashColors::Palette => splash_notice_from(mode, false, None),
-    }
-}
-
-/// The palette-engagement notice for one splash-colors mode, purely.
-///
-/// The mode half of [`tmux_color_notice`]'s decision: a forced mode
-/// is the user's choice — no advice to give, whatever tmux answers —
-/// and only `auto` runs the engagement table [`color_notice_from`]
-/// holds. Separated from the process-wide caches so the forced skip
-/// pins without arming them.
-fn splash_notice_from(
-    mode: dch_config::SplashColors,
-    in_tmux: bool,
-    report: Option<&(String, String)>,
-) -> Option<String> {
-    use dch_config::SplashColors;
-    if !matches!(mode, SplashColors::Auto) {
-        return None;
-    }
-    color_notice_from(in_tmux, report)
-}
-
-/// The notice text from tmux's answer, purely.
-///
-/// The decision table behind [`tmux_color_notice`], separated so the
-/// polarity of ignorance pins without a terminal.
-fn color_notice_from(in_tmux: bool, report: Option<&(String, String)>) -> Option<String> {
-    let (features, termname) = report?;
-    if !in_tmux || features.trim().is_empty() || features_carry_rgb(features) {
-        return None;
-    }
-    let term = if termname.is_empty() {
-        "*"
-    } else {
-        termname.as_str()
-    };
-    Some(format!(
-        "tmux converts colors to 256 — `set -as terminal-features ',{term}:RGB'` restores truecolor"
-    ))
+/// The decision table behind [`truecolor_warranted`]: `truecolor` and
+/// `auto` both keep the original art — the default is the photograph
+/// as authored, wherever the session sits — and only `palette` takes
+/// the fixed vocabulary, the user's opt-in for a multiplexer whose
+/// clients re-encode. Separated from the process-wide cache so every
+/// arm pins without a terminal or a test-ordering.
+fn splash_warrant(mode: dch_config::SplashColors) -> bool {
+    !matches!(mode, dch_config::SplashColors::Palette)
 }
 
 /// Read up to `buf.len()` raw bytes from the terminal's input.
@@ -1116,9 +1241,12 @@ fn capture_original_termios() {
 /// when one was captured, then every mode the session stood up stood
 /// back down, then the alternate screen left — but assembled once,
 /// here, from crossterm's own serializers, so the handler never
-/// formats or locks at signal time.
+/// formats or locks at signal time. The cursor reset rides the
+/// tint's own gates: without a capture nothing of the cursor family
+/// was ever written, and a multiplexed pane — whose shared client
+/// cursor the tint would repaint — writes none of it either.
 #[cfg(unix)]
-fn signal_restore_bytes(original: Option<(u8, u8, u8)>) -> Vec<u8> {
+fn signal_restore_bytes(original: Option<(u8, u8, u8)>, cursor_shared: bool) -> Vec<u8> {
     use crossterm::Command as _;
 
     /// Append one command's serialized ANSI form.
@@ -1134,8 +1262,10 @@ fn signal_restore_bytes(original: Option<(u8, u8, u8)>) -> Vec<u8> {
     let mut bytes = String::new();
     if let Some(channels) = original {
         bytes.push_str(&background_sequence(channels));
+        if !cursor_shared {
+            bytes.push_str(cursor_reset_sequence());
+        }
     }
-    bytes.push_str(cursor_reset_sequence());
     pushed(DisableMouseCapture.write_ansi(&mut bytes));
     pushed(DisableBracketedPaste.write_ansi(&mut bytes));
     pushed(DisableFocusChange.write_ansi(&mut bytes));
@@ -1359,7 +1489,9 @@ fn published_restore_bytes() -> Option<&'static [u8]> {
 #[cfg(unix)]
 fn refresh_signal_restore_bytes(original: (u8, u8, u8)) {
     if SIGNAL_RESTORE_ARMED.load(Ordering::SeqCst) {
-        publish_restore_bytes(signal_restore_bytes(Some(original)).into_boxed_slice());
+        publish_restore_bytes(
+            signal_restore_bytes(Some(original), multiplexer_client()).into_boxed_slice(),
+        );
     }
 }
 
@@ -1384,7 +1516,8 @@ pub fn arm_fatal_signal_restore() {
         return;
     }
     publish_restore_bytes(
-        signal_restore_bytes(ORIGINAL_BACKGROUND.get().copied()).into_boxed_slice(),
+        signal_restore_bytes(ORIGINAL_BACKGROUND.get().copied(), multiplexer_client())
+            .into_boxed_slice(),
     );
     // SAFETY: the two calls only register this module's handler and
     // record the actions they displaced.
@@ -1456,13 +1589,16 @@ fn mark_signal_restore_deaf() {}
 /// best-effort, then stands every mode down while raw mode still
 /// mutes the line discipline's echo: mouse capture off, bracketed
 /// paste off, keyboard-enhancement pops, cursor shape back, and the
-/// alternate screen left. With reporting off, any input the session's
-/// last moments queued — a wheel burst scrolling as the display
-/// settled, a paste still in flight — is discarded from the input
-/// queue so the shell never echoes it as escape-sequence garbage;
-/// only then does raw mode come off, last, so no input can arrive
-/// between the echo waking up and the modes that generate it being
-/// gone. All attempts always run and are combined; the raw-mode
+/// alternate screen left. The cursor-color reset rides the tint's
+/// own gates — a session that captured nothing, or a multiplexed
+/// pane whose client-shared cursor the tint would repaint, writes
+/// neither, leaving the cursor untouched. With reporting off, any input the
+/// session's last moments queued — a wheel burst scrolling as the
+/// display settled, a paste still in flight — is discarded from the
+/// input queue so the shell never echoes it as escape-sequence
+/// garbage; only then does raw mode come off, last, so no input can
+/// arrive between the echo waking up and the modes that generate it
+/// being gone. All attempts always run and are combined; the raw-mode
 /// error, when present, is the one returned. Safe to call repeatedly
 /// and safe when the terminal was never initialized — the escape
 /// sequences are ignored by a terminal not in those modes.
@@ -1472,12 +1608,7 @@ fn mark_signal_restore_deaf() {}
 /// rejected by the underlying terminal.
 pub fn restore_terminal() -> io::Result<()> {
     mark_signal_restore_deaf();
-    if let Some(original) = ORIGINAL_BACKGROUND.get() {
-        let mut stdout = io::stdout();
-        drop(write!(stdout, "{}", background_sequence(*original)));
-        drop(stdout.flush());
-    }
-    reset_cursor_color();
+    restore_captured_canvas();
     let modes_result = execute!(
         io::stdout(),
         DisableMouseCapture,
@@ -1497,6 +1628,26 @@ pub fn restore_terminal() -> io::Result<()> {
         stdout.flush()
     })();
     raw_result.and(modes_result).and(modify_result)
+}
+
+/// Give the terminal back its own captured background and cursor.
+///
+/// The restore the exit path performs and the startup retry's
+/// fallback share: with an original captured, the background returns
+/// and the cursor tint — which only ever rode a capture — resets
+/// through its own gates. A session that captured nothing writes
+/// nothing here, and a pane keeps the client's shared cursor
+/// untouched. Unpaired with [`begin_synchronized_output`]: the
+/// callers of this restore owe no burst, so the window markers stay
+/// paired wherever they were.
+pub(crate) fn restore_captured_canvas() {
+    if let Some(original) = ORIGINAL_BACKGROUND.get() {
+        let mut stdout = io::stdout();
+        drop(write!(stdout, "{}", background_sequence(*original)));
+        drop(stdout.flush());
+        CANVAS_INSTALLED.store(false, Ordering::SeqCst);
+        reset_cursor_color();
+    }
 }
 
 /// Discard input bytes still queued against the standard-input
@@ -1619,132 +1770,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_rgb_feature_is_a_token_not_a_substring() {
-        // The features list tmux answers with is comma-separated; only
-        // the whole token vouches for truecolor, so a name carrying
-        // the letters inside it does not.
-        assert!(features_carry_rgb("RGB"));
-        assert!(features_carry_rgb("focus,clipboard,RGB,title"));
-        assert!(features_carry_rgb(" 256, RGB ,overline "));
-        assert!(!features_carry_rgb("focus,title"));
-        assert!(!features_carry_rgb(""));
-        assert!(!features_carry_rgb("RGBHALVES"));
-        assert!(!features_carry_rgb("truecolor"));
-    }
-
-    #[test]
-    fn an_echoed_format_is_no_answer() {
-        // A tmux too old to know the format variables prints them
-        // literally; that echo must read as silence — truecolor — not
-        // as a client with no features.
-        assert!(echoed_format("#{client_termfeatures}|#{client_termname}"));
-        assert!(!echoed_format("focus,title|xterm-256color"));
-        assert!(!echoed_format(""));
-    }
-
-    #[test]
-    fn the_polarity_of_ignorance_is_truecolor() {
-        // The decision table: outside tmux always warrants; inside, a
-        // missing or empty answer keeps truecolor — the long-standing
-        // behavior — and only tmux naming features without RGB
-        // withdraws it.
-        assert!(warrant_from(false, None), "outside tmux, no ask needed");
+    fn the_original_art_stands_unless_the_palette_is_chosen() {
+        // The mode table: `truecolor` and `auto` both keep the original
+        // photograph — a multiplexer forwards direct colors verbatim to
+        // a client with the RGB feature, and a client without it keeps
+        // the hues in its own approximation — and only an explicit
+        // `palette` takes the fixed vocabulary, the opt-in for a tmux
+        // whose clients are known 256-color and re-encode per color.
         assert!(
-            warrant_from(true, None),
-            "no answer from tmux keeps truecolor"
+            splash_warrant(dch_config::SplashColors::Auto),
+            "auto keeps the original art"
         );
         assert!(
-            warrant_from(true, Some(&(String::new(), "xterm-256color".into()))),
-            "an empty feature list is no evidence of conversion"
+            splash_warrant(dch_config::SplashColors::Truecolor),
+            "a forced truecolor session keeps the original art"
         );
         assert!(
-            warrant_from(true, Some(&("focus,RGB,title".into(), "alacritty".into()))),
-            "the RGB token warrants"
-        );
-        assert!(
-            !warrant_from(true, Some(&("focus,title".into(), "xterm-256color".into()))),
-            "features named without RGB withdraws"
-        );
-    }
-
-    #[test]
-    fn the_notice_names_the_fix_only_where_the_downgrade_engaged() {
-        assert_eq!(
-            color_notice_from(false, Some(&("focus".into(), "alacritty".into()))),
-            None,
-            "outside tmux there is nothing to restore"
-        );
-        assert_eq!(
-            color_notice_from(true, None),
-            None,
-            "no answer engaged no downgrade"
-        );
-        assert_eq!(
-            color_notice_from(true, Some(&("focus,RGB".into(), "alacritty".into()))),
-            None,
-            "an RGB client needs no advice"
-        );
-        let notice =
-            color_notice_from(true, Some(&("focus,title".into(), "xterm-256color".into())))
-                .unwrap_or_default();
-        assert!(
-            notice.contains("set -as terminal-features ',xterm-256color:RGB'"),
-            "the notice names this client's own line: {notice}"
-        );
-        let unnamed =
-            color_notice_from(true, Some(&("focus".into(), String::new()))).unwrap_or_default();
-        assert!(
-            unnamed.contains("',*:RGB'"),
-            "a nameless client gets the every-terminal spelling: {unnamed}"
-        );
-    }
-
-    #[test]
-    fn the_forced_splash_color_modes_decide_without_asking_tmux() {
-        // The mode table's three arms, over the one answer that would
-        // downgrade an auto session: a forced mode answers outright —
-        // the user's override, not a detection — so even a client
-        // naming features without RGB keeps truecolor art under
-        // `truecolor` and takes the palette rendition under `palette`,
-        // while `auto` alone consults the tmux table.
-        let no_rgb = Some(&("focus,title".to_string(), "xterm-256color".to_string()));
-        assert!(
-            splash_warrant(dch_config::SplashColors::Truecolor, true, no_rgb),
-            "a forced truecolor session paints the original art whatever tmux said"
-        );
-        assert!(
-            !splash_warrant(dch_config::SplashColors::Palette, false, None),
-            "a forced palette session takes the fixed vocabulary even outside tmux"
-        );
-        assert!(
-            !splash_warrant(dch_config::SplashColors::Auto, true, no_rgb),
-            "auto alone downgrades on tmux's explicit no"
-        );
-        assert!(
-            splash_warrant(dch_config::SplashColors::Auto, false, no_rgb),
-            "auto outside tmux stays truecolor"
-        );
-    }
-
-    #[test]
-    fn a_forced_splash_color_mode_offers_no_notice() {
-        // The advice names the config line that restores truecolor —
-        // counsel for a downgrade the session chose for itself. A
-        // forced mode is the user's choice, so no answer tmux gives
-        // turns into advice; only `auto` naming its own downgrade
-        // earns the notice.
-        let no_rgb = Some(&("focus,title".to_string(), "xterm-256color".to_string()));
-        assert!(
-            splash_notice_from(dch_config::SplashColors::Truecolor, true, no_rgb).is_none(),
-            "a forced truecolor session gets no advice"
-        );
-        assert!(
-            splash_notice_from(dch_config::SplashColors::Palette, true, no_rgb).is_none(),
-            "a forced palette session gets no advice — it asked for the palette"
-        );
-        assert!(
-            splash_notice_from(dch_config::SplashColors::Auto, true, no_rgb).is_some(),
-            "an auto session that downgraded still hears the fix"
+            !splash_warrant(dch_config::SplashColors::Palette),
+            "a forced palette session takes the fixed vocabulary"
         );
     }
 
@@ -1763,7 +1806,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     /// Reads one signal's current disposition record.
     #[cfg(unix)]
     fn current_disposition(signal: libc::c_int) -> libc::sigaction {
@@ -1832,7 +1874,11 @@ mod tests {
             next_ask_warranted(verdict),
             "a later switch may ask again — the terminal never refused"
         );
-        let outcome = query_and_install(ratatui::style::Color::Reset);
+        let outcome = query_and_install(
+            ratatui::style::Color::Reset,
+            false,
+            std::time::Duration::ZERO,
+        );
         assert!(
             !outcome.installed,
             "a non-Rgb background has nothing to install"
@@ -1936,9 +1982,9 @@ mod tests {
     fn the_cursor_tint_and_reset_are_the_osc_12_family() {
         // The cursor tint rides the same OSC family as the background
         // override — 12 where the background is 11 — and resets through
-        // 112, the no-query restore: resetting needs no captured
-        // original, because it returns the cursor to the terminal's own
-        // default, which an untinted session already had.
+        // 112, the parameterless shape. The byte itself needs no
+        // captured original; whether it is ever sent does — see the
+        // signal-restore pin below for the gate.
         assert_eq!(
             cursor_sequence((0x28, 0x2a, 0x36)),
             "\x1b]12;rgb:28/2a/36\x1b\\",
@@ -1951,22 +1997,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_multiplexer_verdict_reads_the_panes_own_spellings() {
+        // The cursor tint stays home in a pane: tmux re-emits a pane's
+        // OSC 12 to the client on every redraw the cursor's pane
+        // takes, tinting the cursor every other pane draws — so the
+        // verdict that gates it reads exactly the spellings a
+        // multiplexer leaves in the pane. Any non-empty TMUX, STY, or
+        // ZELLIJ settles it; so does a TERM typed with tmux's or
+        // screen's prefix. An empty variable is no evidence, and a
+        // plain terminal settles direct.
+        let some = |value: &str| Some(std::ffi::OsString::from(value));
+        let none = || None;
+        let plain = Some(std::ffi::OsStr::new("xterm-256color"));
+        assert!(
+            multiplexer_client_of(&[some("/tmp/tmux-0/default,1,0"), none(), none()], plain),
+            "a non-empty TMUX settles multiplexed whatever TERM says"
+        );
+        assert!(
+            multiplexer_client_of(&[none(), some("12345"), none()], plain),
+            "GNU screen's STY settles multiplexed"
+        );
+        assert!(
+            multiplexer_client_of(&[none(), none(), some("0")], plain),
+            "zellij's ZELLIJ settles multiplexed"
+        );
+        assert!(
+            multiplexer_client_of(
+                &[none(), none(), none()],
+                Some(std::ffi::OsStr::new("tmux-256color"))
+            ),
+            "a tmux-typed TERM settles multiplexed on its own"
+        );
+        assert!(
+            multiplexer_client_of(
+                &[none(), none(), none()],
+                Some(std::ffi::OsStr::new("screen"))
+            ),
+            "a screen-typed TERM settles multiplexed on its own"
+        );
+        assert!(
+            !multiplexer_client_of(&[some(""), none(), none()], plain),
+            "an emptied TMUX is no evidence"
+        );
+        assert!(
+            !multiplexer_client_of(&[none(), none(), none()], plain),
+            "a plain terminal with no multiplexer variable settles direct"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_signal_restore_bytes_carry_the_full_teardown() {
-        let with_background = signal_restore_bytes(Some((0x28, 0x2a, 0x36)));
+        let with_background = signal_restore_bytes(Some((0x28, 0x2a, 0x36)), false);
         assert!(
             with_background.starts_with(b"\x1b]11;rgb:28/2a/36\x1b\\"),
             "the original background leads: {:?}",
             String::from_utf8_lossy(&with_background)
         );
-        let without_background = signal_restore_bytes(None);
+        assert!(
+            with_background.windows(5).any(|w| w == b"\x1b]112"),
+            "a captured original on a direct terminal could have tinted, so the cursor resets: {:?}",
+            String::from_utf8_lossy(&with_background)
+        );
+        let without_background = signal_restore_bytes(None, false);
         assert!(
             !without_background.windows(5).any(|w| w == b"\x1b]11;"),
             "no background override was captured, none goes back: {:?}",
             String::from_utf8_lossy(&without_background)
         );
-        for bytes in [&with_background, &without_background] {
+        assert!(
+            !without_background.windows(5).any(|w| w == b"\x1b]112"),
+            "without a capture nothing of the cursor family was written, \
+             so the client-shared cursor is never reset — the multiplexed \
+             pane's contract: {:?}",
+            String::from_utf8_lossy(&without_background)
+        );
+        let pane_with_background = signal_restore_bytes(Some((0x28, 0x2a, 0x36)), true);
+        assert!(
+            pane_with_background.starts_with(b"\x1b]11;rgb:28/2a/36\x1b\\"),
+            "the pane still returns the background it captured: {:?}",
+            String::from_utf8_lossy(&pane_with_background)
+        );
+        assert!(
+            !pane_with_background.windows(5).any(|w| w == b"\x1b]112"),
+            "a multiplexed pane never tinted the client-shared cursor, \
+             so the handler resets nothing of the cursor family: {:?}",
+            String::from_utf8_lossy(&pane_with_background)
+        );
+        for bytes in [&with_background, &without_background, &pane_with_background] {
             assert!(
                 bytes.windows(8).any(|w| w == b"\x1b[?1049l"),
                 "the alternate screen exit must be in the byte string"
@@ -2123,32 +2242,66 @@ mod write_only_warranted_pins {
 
     #[test]
     fn the_write_gate_mirrors_the_plan_without_capturing() {
-        // The predicate is the write's own gate answered purely: with a
-        // captured original it follows the plan for every canvas shape,
-        // and in this test process — where no query ever captured an
-        // original — it must decline everything, exactly as the write
-        // itself does, so a caller may defer to the flush on its word.
-        let captured = ORIGINAL_BACKGROUND.get().is_some();
-        let lands = |background| {
-            matches!(
-                live_override_plan(true, background),
-                LiveOverridePlan::Write | LiveOverridePlan::RestoreOriginal
-            )
-        };
+        // The predicate's two halves, each asserted as fact rather
+        // than recomputed from the implementation's own expression.
+        // The plan's truth table first — the write consults it
+        // verbatim — then the gate's composition on the two seats a
+        // process can settle without a capture: this test process
+        // never captured an original (nothing in-process can set the
+        // OnceLock), so a direct seat declines every shape — the
+        // capture is the write's whole warrant — and a pane answers
+        // by its palette alone. The captured arms stay in the pty
+        // scenarios, which run real queries against the real OnceLock.
+        let _verdict = MULTIPLEXER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let rgb = Color::Rgb(1, 2, 3);
-        assert_eq!(write_only_warranted(rgb), captured && lands(rgb));
         let indexed = Color::Indexed(8);
-        assert_eq!(write_only_warranted(indexed), captured && lands(indexed));
-        // No capture, no write — the OnceLock stays unset in tests so
-        // every shape declines, the same answer the theme burst's
-        // canvas write gives for an uncaptured terminal.
-        if ORIGINAL_BACKGROUND.get().is_none() {
-            assert!(
-                !write_only_warranted(rgb),
-                "an uncaptured terminal declines a write"
-            );
-            assert!(!write_only_warranted(Color::Reset));
-        }
+        assert!(
+            matches!(live_override_plan(true, rgb), LiveOverridePlan::Write),
+            "a captured original under an Rgb canvas plans the write"
+        );
+        assert!(
+            matches!(
+                live_override_plan(true, Color::Reset),
+                LiveOverridePlan::RestoreOriginal
+            ),
+            "a captured original under the paintless canvas plans the restore"
+        );
+        assert!(
+            matches!(live_override_plan(true, indexed), LiveOverridePlan::Decline),
+            "an indexed canvas plans nothing: the write takes Rgb or Reset alone"
+        );
+        assert!(
+            matches!(live_override_plan(false, rgb), LiveOverridePlan::Decline),
+            "without a capture even an Rgb canvas plans nothing"
+        );
+        set_multiplexed_for_tests(Some(false));
+        assert!(
+            !write_only_warranted(rgb),
+            "an uncaptured terminal declines a write"
+        );
+        assert!(
+            !write_only_warranted(indexed),
+            "an indexed canvas is never the terminal's to take"
+        );
+        assert!(
+            !write_only_warranted(Color::Reset),
+            "an uncaptured terminal took nothing it could restore"
+        );
+        // A pane answers by its palette alone: it writes no terminal
+        // default and the frame paints the canvas, so an Rgb palette is
+        // always paintable there and the paintless one still defers.
+        set_multiplexed_for_tests(Some(true));
+        assert!(
+            write_only_warranted(rgb),
+            "a pane paints an Rgb palette without an exchange"
+        );
+        assert!(
+            !write_only_warranted(Color::Reset),
+            "the paintless palette defers even in a pane"
+        );
+        set_multiplexed_for_tests(None);
     }
 }
 
@@ -2175,7 +2328,12 @@ mod synchronized_output_pins {
         // the burst's end, never as a head start the composer's rows
         // would trail.
         let original = Some((16, 16, 16));
-        let burst = theme_burst_bytes(original, Color::Rgb(40, 40, 40), Color::Rgb(177, 98, 134));
+        let burst = theme_burst_bytes(
+            original,
+            Color::Rgb(40, 40, 40),
+            Color::Rgb(177, 98, 134),
+            false,
+        );
         assert!(burst.starts_with("\x1b]11;rgb:28/28/28\x1b\\"));
         assert!(burst.contains("\x1b]12;rgb:b1/62/86\x1b\\"));
         assert!(burst.ends_with(SYNCHRONIZED_OUTPUT_END));
@@ -2185,15 +2343,33 @@ mod synchronized_output_pins {
 
         // Captured terminal, paintless palette: the terminal's own
         // canvas restored, its cursor reset, and the close.
-        let reset = theme_burst_bytes(original, Color::Reset, Color::Rgb(1, 2, 3));
+        let reset = theme_burst_bytes(original, Color::Reset, Color::Rgb(1, 2, 3), false);
         assert!(reset.starts_with("\x1b]11;rgb:10/10/10\x1b\\"));
         assert!(reset.contains("\x1b]112\x1b\\"));
         assert!(reset.ends_with(SYNCHRONIZED_OUTPUT_END));
 
         // Uncaptured terminal: neither write is warranted — the close
         // alone, so the window markers always pair.
-        let declined = theme_burst_bytes(None, Color::Rgb(40, 40, 40), Color::Rgb(1, 2, 3));
+        let declined = theme_burst_bytes(None, Color::Rgb(40, 40, 40), Color::Rgb(1, 2, 3), false);
         assert_eq!(declined, SYNCHRONIZED_OUTPUT_END);
+
+        // A pane inside a multiplexer writes the canvas half and none
+        // of the cursor family: tmux re-emits a pane's OSC 12 to the
+        // client on every redraw the cursor's pane takes, tinting the
+        // cursor every other pane draws, so the tint and its reset
+        // stay home. One OSC (opener and ST) plus the CSI close.
+        let pane_burst = theme_burst_bytes(
+            original,
+            Color::Rgb(40, 40, 40),
+            Color::Rgb(177, 98, 134),
+            true,
+        );
+        assert!(pane_burst.starts_with("\x1b]11;rgb:28/28/28\x1b\\"));
+        assert!(!pane_burst.contains("\x1b]12;"));
+        assert_eq!(pane_burst.matches('\x1b').count(), 3);
+        let pane_reset = theme_burst_bytes(original, Color::Reset, Color::Rgb(1, 2, 3), true);
+        assert!(pane_reset.starts_with("\x1b]11;rgb:10/10/10\x1b\\"));
+        assert!(!pane_reset.contains("\x1b]112"));
     }
 }
 

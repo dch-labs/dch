@@ -135,15 +135,19 @@ fn content_text(content: &ToolContent) -> String {
 
 /// Strip what a terminal would re-interpret, keeping the text.
 ///
-/// Tool output can carry ANSI escape sequences and stray control
-/// characters — colors and cursor moves from a child program, bytes
-/// read out of a binary file. Rendered as cell symbols they reach
-/// the terminal verbatim and re-execute mid-frame, corrupting the
-/// layout in ways the app's frame diff can no longer match, so
-/// stale characters survive every later repaint. The sanitizer
-/// drops escape sequences whole, keeps line breaks, expands tabs,
-/// and removes the remaining control characters.
-fn sanitize_for_display(text: &str) -> String {
+/// Provider and tool output can carry ANSI escape sequences and stray
+/// control characters — colors and cursor moves from a child program,
+/// an HTML error page's CRLF pairs, bytes read out of a binary file.
+/// Rendered as cell symbols they reach the terminal verbatim and
+/// re-execute mid-frame, corrupting the layout in ways the app's
+/// frame diff can no longer match, so stale characters survive every
+/// later repaint. The sanitizer drops escape sequences whole, keeps
+/// line breaks, expands tabs, and removes the remaining control
+/// characters. The capture path and the plaintext wrap funnel
+/// ([`crate::app::notices::plain_wrapped_lines_styled`]) both run
+/// their text through it, so every plaintext row a frame paints
+/// shares this contract.
+pub(crate) fn sanitize_for_display(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {

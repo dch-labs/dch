@@ -41,7 +41,8 @@ pub mod todo_view;
 pub mod tool_capture;
 pub mod tool_render;
 
-pub use app::{CopyAnswer, TuiApp};
+pub use app::TuiApp;
+pub use app::clipboard::CopyAnswer;
 pub use commands::{Command, CommandSpec, CompletionSources, Parsed};
 pub use events::TerminalEvents;
 pub use guidance::Guidance;

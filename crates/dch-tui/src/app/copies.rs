@@ -2,13 +2,13 @@
 //! clipboard transports and their deadlines, and the notices each
 //! transport's verdict posts.
 
-use super::CopyAnswer;
 use super::TuiApp;
-use super::{
-    Arc, COPY_DEADLINE, CopyOutcomes, CopyVerdict, PoisonError, clipboard_env,
-    configured_copy_command, host_transports, next_attempt, run_process_transports,
-    transport_answer,
+use super::clipboard::CopyAnswer;
+use super::clipboard::{
+    CopyOutcomes, CopyVerdict, clipboard_env, configured_copy_command, fenced_process_writes,
+    host_transports, next_attempt, transport_answer, transport_commands,
 };
+use super::{Arc, PoisonError};
 use crate::message::ContentBlock;
 use crate::message::TuiMessage;
 
@@ -52,6 +52,7 @@ impl TuiApp {
     /// lands its confirmation on the notice row, like every path.
     pub(in crate::app) fn copy_selection_now(&mut self) {
         let covered = self
+            .pointer
             .selection
             .as_ref()
             .map(|selection| self.selection_text(selection));
@@ -74,9 +75,9 @@ impl TuiApp {
     /// with the same attempt's verdict — never with one older than
     /// what a newer copy already posted.
     pub(in crate::app) fn copy_selection_and_notice(&mut self, text: &str) {
-        let attempt = next_attempt(&self.copy_attempts);
-        let answer = (self.copier)(attempt, text);
-        self.posted_copy_attempt = attempt;
+        let attempt = next_attempt(&self.copy.copy_attempts);
+        let answer = (self.copy.copier)(attempt, text);
+        self.copy.posted_copy_attempt = attempt;
         let wording = copy_answer_notice(answer);
         if !wording.is_empty() {
             self.post_notice(wording.to_string());
@@ -90,13 +91,13 @@ impl TuiApp {
     /// path a text selection uses. Returns whether the click consumed
     /// itself here, so the caller can treat a bar click as handled.
     pub(in crate::app) fn copy_session_id_at(&mut self, column: u16, row: u16) -> bool {
-        let Some((span_row, start, end)) = self.session_id_span.get() else {
+        let Some((span_row, start, end)) = self.host.session_id_span.get() else {
             return false;
         };
         if row != span_row || column < start || column >= end {
             return false;
         }
-        if let Some(id) = self.session_id.clone() {
+        if let Some(id) = self.host.session_id.clone() {
             self.copy_selection_and_notice(&id);
         }
         true
@@ -137,16 +138,22 @@ pub(in crate::app) fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str 
 /// and every process transport moves to a background task bounded by
 /// one shared kill deadline, so a hanging helper or a child that
 /// never reads its stdin cannot freeze input and rendering. The
-/// caller-stamped `attempt` rides onto the verdict unchanged. The
-/// transports' verdict lands as a follow-up notice through the render
-/// wake this pings; until then the returned escape result is all the
-/// caller can honestly claim. Failures stay silent per attempt: a
-/// copy that cannot be delivered is a nuisance, not an error worth
-/// interrupting a session for.
+/// transports' jobs run through the ordered lane: each takes its
+/// turn under the process-wide write lock, a turn granted after a
+/// newer copy has started is declined outright, and a copy already
+/// superseded before it queues never runs — a slow older helper
+/// cannot land its text over a newer copy's delivery, whichever of
+/// the two finished first. The caller-stamped `attempt` rides onto
+/// the verdict unchanged. The transports' verdict lands as a
+/// follow-up notice through the render wake this pings; until then
+/// the returned escape result is all the caller can honestly claim.
+/// Failures stay silent per attempt: a copy that cannot be delivered
+/// is a nuisance, not an error worth interrupting a session for.
 pub(in crate::app) fn copy_via_transports(
     custom: Option<&str>,
     attempt: u64,
     text: &str,
+    attempts: &Arc<std::sync::atomic::AtomicU64>,
     outcomes: &CopyOutcomes,
     wake: &Arc<event_listener::Event>,
 ) -> CopyAnswer {
@@ -161,9 +168,11 @@ pub(in crate::app) fn copy_via_transports(
     }
     let outcomes = Arc::clone(outcomes);
     let wake = Arc::clone(wake);
+    let attempts = Arc::clone(attempts);
     let text = text.to_string();
     let job = move || {
-        let verified = run_process_transports(command_line.as_deref(), &text, COPY_DEADLINE);
+        let commands = transport_commands(command_line.as_deref());
+        let verified = fenced_process_writes(attempt, &attempts, commands, &text);
         let mut slot = outcomes.lock().unwrap_or_else(PoisonError::into_inner);
         slot.push(CopyVerdict {
             attempt,

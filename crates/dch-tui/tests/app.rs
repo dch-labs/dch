@@ -46,7 +46,12 @@ fn config_with_strip_top() -> DchConfig {
 }
 
 fn app() -> TuiApp {
-    TuiApp::new(config_with_theme("dracula"))
+    let mut app = TuiApp::new(config_with_theme("dracula"));
+    // The suite pins the direct seat: a developer's shell may sit
+    // inside tmux, and a pane would ground its own canvas where these
+    // pins expect the terminal's default to show through.
+    app.set_terminal_seat(false);
+    app
 }
 
 fn docked_app() -> TuiApp {
@@ -115,6 +120,10 @@ fn wheel_event(kind: MouseEventKind) -> Event {
 }
 
 fn render_to_buffer(app: &mut TuiApp, width: u16, height: u16) -> Terminal<TestBackend> {
+    // The suite pins the direct seat: a developer's shell may sit
+    // inside tmux, and a pane would ground its own canvas where these
+    // pins expect the terminal's default to show through.
+    app.set_terminal_seat(false);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
     terminal
@@ -634,6 +643,40 @@ fn ctrl_c_ctrl_c_under_a_run_is_one_cancel_and_exit_action() {
     assert!(!app.is_quitting(), "nothing fires from stale intent");
 }
 #[test]
+fn ctrl_c_ctrl_c_after_a_rebuild_cancels_the_live_signal() {
+    // A runner rebuild — `/model`, `/resume`, a provider switch —
+    // swaps the shared cancel cell; the boxed canceller installed at
+    // startup still names the startup runner's signal. The
+    // confirming press must cancel the signal the live runner reads,
+    // not only the stale handle the closure captured.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let live = Arc::new(loopctl::cancel::CancelSignal::new());
+    kept.adopt_runner_handles(Arc::clone(&live), None);
+    let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&cancels);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock().expect("sink").push(());
+    }));
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+    assert!(
+        live.is_cancelled(),
+        "the confirming press cancels the signal the rebuild installed"
+    );
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        1,
+        "the installed sink still sees the fire"
+    );
+}
+#[test]
 fn the_ladder_press_raises_the_shutdown_flag_before_the_cancel() {
     // The exit's own cancel releases the driver's next claim: the
     // run resolves cancelled, and the driver reads the shutdown
@@ -721,11 +764,11 @@ fn the_esc_cancel_leaves_the_shutdown_flag_alone() {
 fn esc_esc_cancels_the_run_with_the_popup_standing() {
     // The state machine the scratch scaffold this pin replaced once
     // probed with a bare panic: a run holds and the composer carries
-    // a `/theme` browse with its popup standing. The first Esc
-    // belongs to the popup — the whole command clears and nothing is
-    // armed — and only the next two bare presses walk the cancel
-    // ladder (arm, then fire). The popup adds one rung in front of
-    // the cancel; it never widens Esc into an instant stop.
+    // a `/theme` browse with its popup standing. Esc walks one rung
+    // per press — the popup closes alone, the drafted command
+    // clears, then the cancel ladder arms and fires. The popup adds
+    // rungs in front of the cancel; it never widens Esc into an
+    // instant stop.
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
@@ -746,14 +789,33 @@ fn esc_esc_cancels_the_run_with_the_popup_standing() {
         "the popup stands over the drafted browse: {browsed:?}"
     );
 
-    // First Esc: the popup's own rung — clear, never arm.
+    // First Esc: the popup's own rung — it closes alone, the drafted
+    // command stays, and nothing is armed.
     app.handle_event(&plain(KeyCode::Esc));
     assert_eq!(*cancels.lock().expect("sink"), 0, "one Esc cancels nothing");
-    let cleared = row_texts(&render_to_buffer(&mut app, 80, 24));
+    let dismissed = row_texts(&render_to_buffer(&mut app, 80, 24));
     assert!(
-        !cleared.iter().any(|row| row.contains("nord")),
-        "the popup left with the draft: {cleared:?}"
+        !dismissed.iter().any(|row| row.contains("nord")),
+        "the popup left on the first press: {dismissed:?}"
     );
+    assert!(
+        dismissed.iter().any(|row| row.contains("/theme")),
+        "the drafted command survives the popup's dismissal: {dismissed:?}"
+    );
+    assert!(
+        !dismissed.iter().any(|row| row.contains("press Esc again")),
+        "the dismissal neither arms nor announces the cancel: {dismissed:?}"
+    );
+
+    // Second Esc: the draft's own rung — the composer clears, still
+    // without arming anything.
+    app.handle_event(&plain(KeyCode::Esc));
+    assert_eq!(
+        *cancels.lock().expect("sink"),
+        0,
+        "the draft's clear raises nothing"
+    );
+    let cleared = row_texts(&render_to_buffer(&mut app, 80, 24));
     assert!(
         !cleared.iter().any(|row| row.contains("/theme")),
         "the whole command left the composer: {cleared:?}"
@@ -763,7 +825,7 @@ fn esc_esc_cancels_the_run_with_the_popup_standing() {
         "the clear neither arms nor announces the cancel: {cleared:?}"
     );
 
-    // Second Esc: arms, and says so on the notice row.
+    // Third Esc: arms, and says so on the notice row.
     app.handle_event(&plain(KeyCode::Esc));
     assert_eq!(
         *cancels.lock().expect("sink"),
@@ -778,12 +840,12 @@ fn esc_esc_cancels_the_run_with_the_popup_standing() {
         "the armed state names its next press: {armed:?}"
     );
 
-    // Third Esc: fires the cancel and the session stands.
+    // Fourth Esc: fires the cancel and the session stands.
     app.handle_event(&plain(KeyCode::Esc));
     assert_eq!(
         *cancels.lock().expect("sink"),
         1,
-        "the third press lands the cancel"
+        "the fourth press lands the cancel"
     );
     assert!(!app.is_quitting(), "a cancel is not an exit");
 }
@@ -2113,6 +2175,109 @@ fn a_turn_end_hook_fires_for_surfaced_errors() {
                 TuiMessage::Error { text, .. } if text == "provider unreachable"
             )),
         "the snapshot carries the failure"
+    );
+}
+
+#[test]
+fn the_error_block_separates_from_the_tool_footer_it_lands_beneath() {
+    // Session 1fab4451's shape: a long tool call completes, then the
+    // next model request dies. The error block must open on rows of
+    // its own — a spacer between the tool's duration footer and the
+    // failure, then a header naming the request's own facts — so the
+    // failure reads as the model request's, never the tool's.
+    let now = chrono::Utc::now();
+    let mut app = app();
+    app.seed_messages(vec![
+        TuiMessage::User {
+            text: "run the suite".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        },
+        TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                call_id: "call-1".to_string(),
+                name: "Bash".to_string(),
+                input_preview: "cargo test".to_string(),
+                success: true,
+                elapsed_secs: 203.0,
+                output_preview: "test result: ok".to_string(),
+                retained_input: String::new(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        },
+        TuiMessage::Error {
+            text: "API error: stream (stream failed before completing after 4 attempts: \
+HTTP error: HTTP 502: <html><head><title>502 Bad Gateway</title></head>\
+<hr><center>alibaba-ga</center></html>) and fallback failed: HTTP error: \
+HTTP 502: upstream reset"
+                .to_string(),
+            timestamp: now,
+        },
+    ]);
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
+    let footer = rows
+        .iter()
+        .position(|row| row.contains("3m23s"))
+        .expect("the tool's elapsed footer renders");
+    let spacer = rows.get(footer.saturating_add(1)).map(String::as_str);
+    assert!(
+        spacer.is_some_and(|row| row.trim().is_empty()),
+        "a blank row separates the tool's footer from the error block: {spacer:?}"
+    );
+    let header = &rows[footer.saturating_add(2)];
+    assert!(
+        header.contains("✗ model request failed"),
+        "the block opens on a header of its own: {header:?}"
+    );
+    assert!(
+        header.contains("4 attempts") && header.contains("HTTP 502"),
+        "the header carries the request's own facts: {header:?}"
+    );
+}
+
+#[test]
+fn a_persisted_raw_error_row_bakes_clean_on_resume() {
+    // Transcripts written before any composition-side fix store the
+    // failure verbatim — `role: "error"`, the raw Display text with
+    // its CRLF pairs and HTML body. A resume must parse that row back
+    // and bake it clean: no control byte reaches a cell, and the
+    // restored pane still gets the header presentation.
+    let raw = "API error: stream (stream failed before completing after 4 attempts: \
+HTTP error: HTTP 502: <html>\r\n<head><title>502 Bad Gateway</title></head>\r\n\
+<body bgcolor=\"white\">\r\n<center><h1>502 Bad Gateway</h1></center>\r\n\
+<hr><center>alibaba-ga</center>\r\n</body>\r\n</html>\r\n) \
+and fallback failed: HTTP error: HTTP 502: upstream reset";
+    let stored = serde_json::json!({
+        "role": "error",
+        "text": raw,
+        "timestamp": "2026-11-22T02:09:19Z",
+    })
+    .to_string();
+    let parsed: TuiMessage = serde_json::from_str(&stored).expect("the persisted row parses");
+    assert!(matches!(parsed, TuiMessage::Error { .. }));
+    let mut app = app();
+    app.seed_messages(vec![parsed]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let buffer = terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let symbol = buffer[(x, y)].symbol();
+            assert!(
+                !symbol.chars().any(char::is_control),
+                "cell ({x}, {y}) carries a control byte: {symbol:?}"
+            );
+        }
+    }
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("✗ model request failed"),
+        "the restored raw row bakes the header presentation: {flat:?}"
+    );
+    assert!(
+        flat.contains("4 attempts") && flat.contains("HTTP 502"),
+        "the restored row's facts parse out of the stored text: {flat:?}"
     );
 }
 
@@ -4829,6 +4994,95 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
 }
 
 #[test]
+fn a_seated_pane_grounds_its_canvas_and_keeps_its_surfaces() {
+    // The pane twin of the one-layer pin above: inside a multiplexer
+    // the frame cannot lean on the terminal default — the client's
+    // own background would show through it — so the grounding walk
+    // paints the canvas under every cell the widgets left default.
+    // Position by position: a conversation row carries the canvas
+    // where the direct seat leaves the default, the composer body
+    // keeps its surface fill over it, and the status bar still paints
+    // its own row. The render is driven directly because the shared
+    // helper pins the direct seat this pin deliberately leaves.
+    let mut app = docked_app();
+    app.set_terminal_seat(true);
+    let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let composer = composer_chunk(40, 14, 4);
+    assert_eq!(
+        buffer[(5, composer.y.saturating_sub(2))].bg,
+        app.theme.ui.background,
+        "the conversation pane paints its canvas where the direct seat leaves the \
+         terminal default — a client's own background cannot show through"
+    );
+    assert_eq!(
+        buffer[(1, composer.y)].bg,
+        app.theme.ui.surface,
+        "the composer body keeps its surface fill over the grounded canvas"
+    );
+    assert_eq!(
+        buffer[(0, 13)].bg,
+        app.theme.ui.status_bar_bg,
+        "the status bar paints its own row over the grounded canvas"
+    );
+}
+
+#[test]
+fn the_scrolled_error_block_renders_its_header_and_wrapped_detail() {
+    // The 502 shape from session 1fab4451: an API error with an HTML
+    // edge body bakes into the conversation with its header naming
+    // the attempts, the status, and the gateway tag, and the detail
+    // wraps as clean rows — no control bytes from the provider's
+    // page riding into the cells.
+    let now = chrono::Utc::now();
+    let mut app = app();
+    app.seed_messages(vec![
+        TuiMessage::User {
+            text: "run the suite".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        },
+        TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                call_id: "call-1".to_string(),
+                name: "Bash".to_string(),
+                input_preview: "cargo test".to_string(),
+                success: true,
+                elapsed_secs: 203.0,
+                output_preview: "test result: ok".to_string(),
+                retained_input: String::new(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        },
+        TuiMessage::Error {
+            text: "API error: stream (stream failed before completing after 4 attempts: \
+HTTP error: HTTP 502: <html><head><title>502 Bad Gateway</title></head>\
+<hr><center>alibaba-ga</center></html>) and fallback failed: HTTP error: \
+HTTP 502: upstream reset"
+                .to_string(),
+            timestamp: now,
+        },
+    ]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let header = rows
+        .iter()
+        .find(|row| row.contains("model request failed"))
+        .expect("the error block's header renders");
+    assert!(
+        header.contains("4 attempts") && header.contains("HTTP 502"),
+        "the header names the failure's facts: {header:?}"
+    );
+    assert!(
+        header.contains("alibaba-ga"),
+        "the sanitized gateway tag rides the header: {header:?}"
+    );
+}
+
+#[test]
 fn the_state_tag_claims_the_identity_row_s_right_edge() {
     // The composer's state — submissions queued behind the driver,
     // or the caret's line over the buffer's total — closes the
@@ -6591,6 +6845,10 @@ fn permission_app(
     }
     app.set_permission_requests(rx);
     app.poll_permission_requests();
+    // An approval answers the ask the frame has drawn: render once so
+    // the staged requests are on screen and answerable, exactly as
+    // the run loop would have them.
+    drop(render_to_buffer(&mut app, 80, 24));
     (app, tx, receivers)
 }
 
@@ -8603,6 +8861,9 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
         .expect("receiver alive");
     app.set_permission_requests(requests_rx);
     app.poll_permission_requests();
+    // The frame that shows the ask: the click and the press that
+    // follow answer what the user saw.
+    drop(render_to_buffer(&mut app, 80, 25));
 
     assert!(app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -8727,6 +8988,8 @@ fn control_chords_stay_inert_behind_a_pending_prompt() {
     );
     assert_eq!(app.input(), "draft", "no chord edited the draft");
 
+    // The frame that shows the ask: the user answers what they saw.
+    drop(render_to_buffer(&mut app, 80, 25));
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply_rx.blocking_recv(),
@@ -9982,6 +10245,9 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
             .expect("receiver alive");
         app.set_permission_requests(requests_rx);
         app.poll_permission_requests();
+        // The frame that shows the ask: the user answers what they
+        // saw, and the render gate arms their press.
+        drop(render_to_buffer(app, 80, 25));
     };
     let click_the_composer = |app: &mut TuiApp| {
         app.handle_event(&mouse_event(
@@ -11010,7 +11276,8 @@ fn the_exit_echo_marks_its_rows_unsent() {
         queue.push("the words no turn took".to_string());
     }
     let before = app.conversation().len();
-    app.echo_waiting_prompts_at_exit(app.waiting_prompt_texts_at_exit());
+    let unclaimed = app.waiting_prompt_texts_at_exit();
+    app.echo_waiting_prompts_at_exit(unclaimed);
     let echoed = app.conversation().get(before..).unwrap_or_default();
     assert_eq!(echoed.len(), 1, "the waiting prompt echoes exactly one row");
     assert!(
@@ -14260,6 +14527,9 @@ fn a_permissions_repair_clears_the_marker_and_reseeds_the_config_rules() {
     app.set_permission_memory(memory);
     let cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::<dch_permissions::Rule>::new()));
     app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&cell)));
+    // The listing the repair binds to: the user reviews the standing
+    // damage before clearing it.
+    app.run_command(Command::Permissions { forget: None });
     app.run_command(Command::Permissions {
         forget: Some("repair".to_string()),
     });

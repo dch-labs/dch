@@ -15,6 +15,7 @@ use dch_tui::TuiObserverState;
 use tokio::sync::mpsc;
 
 use super::commands::apply_session_command;
+use super::commands::post_session_notice;
 use super::corrections::{
     apply_correction_cut, exit_owns_cancel, pull_corrected_wording, pull_pending_correction,
     rescue_correction_text, rescue_stranded_corrections,
@@ -80,6 +81,73 @@ fn post_run_error(state: &TuiObserverState, err: &loopctl::error::LoopError) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(err.to_string());
     state.render_notify.notify(1);
+}
+
+/// The notice a rate-limit escalation posts beside its error row.
+///
+/// `None` for every failure but the one whose next step is the
+/// user's. An escalation means the retry ladder is spent, so the
+/// advice says how long to wait: the provider's own window when its
+/// last hint named one, a minute or two when it named none — an
+/// immediate retry re-runs the same dead ladder. The fallback
+/// sentence rides only when a fallback model is actually armed, and
+/// states what the breaker really does: it decides where the turns
+/// that follow run. The error row keeps the provider's facts
+/// verbatim; the notice carries the part no payload spells: what to
+/// do next.
+fn rate_limit_escalation_notice(
+    err: &loopctl::error::LoopError,
+    fallback_armed: bool,
+) -> Option<String> {
+    let loopctl::error::LoopError::RateLimitEscalation {
+        attempts,
+        retry_after,
+    } = err
+    else {
+        return None;
+    };
+    let facts = match retry_after {
+        Some(window) => format!("the provider's last hint said {}s", window.as_secs()),
+        None => "the provider sent no Retry-After".to_string(),
+    };
+    let advice = match retry_after {
+        Some(window) => format!(
+            "Resume after the provider's {}-second window closes: an earlier retry \
+             re-runs the same ladder.",
+            window.as_secs()
+        ),
+        None => "Wait a minute or two before resuming: an immediate retry re-runs the \
+             same ladder."
+            .to_string(),
+    };
+    let fallback = if fallback_armed {
+        " The failure rides the model's breaker; with a fallback model configured, \
+         the breaker decides where the turns that follow run."
+    } else {
+        ""
+    };
+    Some(format!(
+        "rate-limited after {attempts} retries — {facts}. {advice}{fallback}"
+    ))
+}
+
+/// Land a failed turn where the session reads it.
+///
+/// The verbatim error row the transcript keeps, plus — for the one
+/// failure whose remedy lives outside the session — the notice that
+/// names it, on the lane the transient notice row reads. The row and
+/// the notice land together or the row lands alone, and nothing else
+/// changes.
+fn land_run_error(
+    state: &TuiObserverState,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    err: &loopctl::error::LoopError,
+    fallback_armed: bool,
+) {
+    post_run_error(state, err);
+    if let Some(text) = rate_limit_escalation_notice(err, fallback_armed) {
+        post_session_notice(session_tx, text);
+    }
 }
 
 /// The run-scoped CLI statements a mid-session path must keep honouring.
@@ -312,11 +380,17 @@ fn cut_superseded_turn(
     id: u64,
     interrupted: bool,
 ) {
-    let superseded = last_claim
-        .take()
-        .filter(|(claimed, _, _)| *claimed == id)
-        .map(|(_, before, claimed)| (before, std::sync::Arc::clone(&claimed)));
-    if let Some((before, claimed)) = superseded {
+    let superseded = if last_claim
+        .as_ref()
+        .is_some_and(|(claimed, _, _)| *claimed == id)
+    {
+        last_claim.take()
+    } else {
+        None
+    };
+    if let Some((before, claimed)) =
+        superseded.map(|(_, before, claimed)| (before, std::sync::Arc::clone(&claimed)))
+    {
         apply_correction_cut(runner, state, before, interrupted, &claimed);
     }
 }
@@ -507,7 +581,12 @@ pub(crate) async fn run_driver_loop(
             if let Some(cancelled_for) = correction {
                 interrupted_for = Some(cancelled_for);
             } else {
-                post_run_error(&context.state, err);
+                land_run_error(
+                    &context.state,
+                    &session_tx,
+                    err,
+                    context.config.api.fallback_model.is_some(),
+                );
             }
         }
     }
@@ -588,6 +667,212 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn an_escalation_notice_names_the_facts_and_the_next_step() {
+        // The hintless escalation: the notice carries the payload's
+        // facts — four retries, no Retry-After — and advice that
+        // matches them: a generic minute-or-two, because the provider
+        // named no window. With a fallback model armed, the routing
+        // sentence rides along and holds whoever the breaker is
+        // currently serving: it decides, it does not promise a
+        // destination.
+        let notice = rate_limit_escalation_notice(
+            &loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 4,
+                retry_after: None,
+            },
+            true,
+        )
+        .expect("an escalation earns its notice");
+        assert!(
+            notice.contains("4 retries")
+                && notice.contains("no Retry-After")
+                && notice.contains("Wait a minute or two")
+                && notice.contains("breaker decides")
+                && notice.contains("fallback model"),
+            "the notice names the facts, the honest routing, and the next step: {notice}"
+        );
+        // Without a fallback model the routing promise is absent — a
+        // session with nowhere to reroute is told nothing false.
+        let bare = rate_limit_escalation_notice(
+            &loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 4,
+                retry_after: None,
+            },
+            false,
+        )
+        .expect("the notice itself does not depend on the fallback");
+        assert!(
+            !bare.contains("fallback"),
+            "no fallback armed, no routing claimed: {bare}"
+        );
+        // A hinted escalation takes its advice from the hint: the wait
+        // is the provider's own window, in seconds, never the generic
+        // minute-or-two.
+        let hinted = rate_limit_escalation_notice(
+            &loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 3,
+                retry_after: Some(std::time::Duration::from_secs(3600)),
+            },
+            false,
+        )
+        .expect("a hinted escalation earns its notice too");
+        assert!(
+            hinted.contains("3 retries")
+                && hinted.contains("3600s")
+                && hinted.contains("3600-second window")
+                && !hinted.contains("minute or two"),
+            "the hint's own window is the advice: {hinted}"
+        );
+        // Every other failure stays wordless: only the escalation's
+        // remedy lives outside the session.
+        assert!(
+            rate_limit_escalation_notice(&loopctl::error::LoopError::Cancelled, true).is_none(),
+            "a cancel owes no advice"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escalating_failure_lands_the_error_row_and_the_notice_together() {
+        // The wired arm's pairing, driven through the seam itself: an
+        // escalation writes the verbatim error row the transcript
+        // keeps and posts the actionable notice the session shows,
+        // while a plain failure writes the row alone — no notice a
+        // user could mistake for advice.
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        land_run_error(
+            &state,
+            &session_tx,
+            &loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 4,
+                retry_after: None,
+            },
+            true,
+        );
+        {
+            let errors = state.errors.lock().unwrap();
+            assert_eq!(errors.len(), 1, "the verbatim error row lands");
+            assert!(
+                errors[0].contains("Rate-limit escalation"),
+                "the row keeps the provider's facts verbatim: {:?}",
+                errors[0]
+            );
+        }
+        let SessionUpdate::Notice { text } = session_rx.try_recv().expect("the notice is posted")
+        else {
+            panic!("the escalation's update is a notice");
+        };
+        assert!(
+            text.contains("Wait a minute or two"),
+            "the posted notice is the actionable one: {text}"
+        );
+        assert!(
+            session_rx.try_recv().is_err(),
+            "one escalation posts one notice"
+        );
+
+        let (_, plain_state) = TuiObserverState::new().into_observer();
+        let (plain_tx, mut plain_rx) = mpsc::unbounded_channel();
+        land_run_error(
+            &plain_state,
+            &plain_tx,
+            &loopctl::error::LoopError::Cancelled,
+            false,
+        );
+        assert_eq!(
+            plain_state.errors.lock().unwrap().len(),
+            1,
+            "a plain failure still records its row"
+        );
+        assert!(
+            plain_rx.try_recv().is_err(),
+            "a plain failure posts no notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escalated_run_posts_the_notice_because_the_config_arms_a_fallback() {
+        // The loop derives the notice's routing sentence from
+        // `api.fallback_model` itself, not from a caller's guess: a
+        // throttled endpoint — 429s without `Retry-After`, answered on
+        // every attempt — with a fallback configured must reach the
+        // session channel as exactly one notice carrying the breaker
+        // sentence.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback throttle");
+        let port = listener
+            .local_addr()
+            .expect("the throttle has an address")
+            .port();
+        let _server = std::thread::spawn(move || {
+            for accepted in listener.incoming() {
+                let Ok(mut stream) = accepted else {
+                    continue;
+                };
+                let mut probe = [0_u8; 512];
+                let _read = std::io::Read::read(&mut stream, &mut probe);
+                let body = "{\"error\":{\"message\":\"rate limit exceeded\"}}";
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _written = std::io::Write::write_all(&mut stream, response.as_bytes());
+                let _flushed = std::io::Write::flush(&mut stream);
+            }
+        });
+        let mut config = unreachable_config();
+        config.api.base_url = format!("http://127.0.0.1:{port}");
+        config.api.fallback_model = Some("test-fallback".to_string());
+        config.runner.rate_limit_delay_secs = 1;
+        let dir = tempfile::tempdir().expect("runner tempdir");
+        let runner = dch_loop::Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("a runner against the loopback throttle");
+        let (observer, state) = TuiObserverState::new().into_observer();
+        drop(observer);
+        let (tx, rx) = mpsc::unbounded_channel();
+        queue_prompt(&state, &tx, "do a thing");
+        drop(tx);
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        state.adopt_runner_handles(runner.cancel_signal(), None);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_driver_loop(
+                runner,
+                rx,
+                DriverContext {
+                    config: config.clone(),
+                    config_base: Arc::new(config),
+                    workdir: dir.path().to_path_buf(),
+                    sessions_root: crate::session::sessions_dir(),
+                    state: state.clone(),
+                    shutting_down: shutdown_flag(false),
+                    lanes: InteractiveLanes::detached(),
+                    overrides: RunOverrides::default(),
+                },
+                parked_transcript(),
+                session_tx,
+            ),
+        )
+        .await
+        .expect("the throttled run resolves the loop");
+        let SessionUpdate::Notice { text } = session_rx
+            .try_recv()
+            .expect("the wired loop posts the notice")
+        else {
+            panic!("the escalation's update is a notice");
+        };
+        assert!(
+            text.contains("breaker decides"),
+            "the routing sentence rides because the config armed the fallback: {text}"
+        );
+        assert!(
+            session_rx.try_recv().is_err(),
+            "one escalation posts one notice"
+        );
+    }
 
     #[tokio::test]
     async fn a_failing_run_routes_its_error_into_the_shared_buffer() {

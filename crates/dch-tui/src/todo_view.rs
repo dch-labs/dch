@@ -517,16 +517,9 @@ pub(crate) fn render_rows(
                 )
             }
         };
-        // The subject wraps under its icon; the icon's style carries
-        // the row's state, and the subject keeps the row's register.
-        let mut wrapped = crate::app::plain_wrapped_lines_styled(&row.subject, wrap, subject_style);
+        let mut wrapped =
+            crate::app::notices::plain_wrapped_lines_styled(&row.subject, wrap, subject_style);
         if let Some(first) = wrapped.first_mut() {
-            // The wrapped line carries the subject's register as its
-            // base style, and patch semantics smear a base modifier
-            // onto every span laid over the line — the checkbox
-            // included. The first line's spans are rebuilt explicit,
-            // so the icon keeps its own plain register beside the
-            // struck words.
             let carried = first
                 .spans
                 .pop()

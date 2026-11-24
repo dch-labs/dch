@@ -358,6 +358,10 @@ fn a_queue_title_names_the_waiting_section_and_leaves_with_it() {
 /// theme it is no fill at all. Reading the colors off the rendered
 /// cells is the only way to pin any of that.
 fn painted_rows(app: &mut TuiApp, width: u16, height: u16) -> Vec<Vec<(String, Color, Color)>> {
+    // The suite pins the direct seat: a developer's shell may sit
+    // inside tmux, and a pane would ground its own canvas where these
+    // pins expect the terminal's default to show through.
+    app.set_terminal_seat(false);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
     let buffer = terminal.backend().buffer();
@@ -1150,9 +1154,20 @@ fn the_composer_greys_out_while_the_section_holds_the_keys() {
         .filter(|row| row.first().is_some_and(|(_, _, bg)| *bg == dim))
         .count();
     assert_eq!(
-        dim_edges, 5,
-        "the section's focus greys the composer's edge out — four edge rows, \
-         plus the badge whose traded secondary is dracula's dim twin"
+        dim_edges, 4,
+        "the section's focus greys the composer's edge out — four edge rows \
+         at the composer's own column; the badge sits at the section's \
+         inset now, off this column, and joins the count below"
+    );
+    let badge_row = greyed.iter().any(|row| {
+        row.iter()
+            .enumerate()
+            .any(|(column, (symbol, _, bg))| symbol == "Q" && *bg == dim && column >= 2)
+    });
+    assert!(
+        badge_row,
+        "the badge whose traded secondary is dracula's dim twin still \
+         carries the fill — at the section's inset, not column zero"
     );
     assert!(
         !app.composer_caret_visible(),

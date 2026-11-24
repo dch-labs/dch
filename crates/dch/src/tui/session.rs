@@ -273,9 +273,6 @@ pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Resu
     app.set_working_dir(&workdir);
     app.set_config_persist_dir(Some(dch_config::config_dir()));
     app.set_git_branch(git_branch(&workdir));
-    if let Some(notice) = dch_tui::terminal::tmux_color_notice() {
-        app.post_notice(notice);
-    }
     let (saver, _session_id, resumed_machine) =
         launch_identity(&mut app, control, &runner, args, flag_mode, model, &workdir);
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
@@ -340,6 +337,7 @@ pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Resu
     questions.abort();
     cancel_the_live_runner(&state);
     tear_down_driver_bounded(driver).await;
+    app.drain_late_graduations_at_exit();
     app.echo_rescued_corrections_at_exit();
     drop(app);
     signal_bridge.stop().await;

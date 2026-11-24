@@ -258,13 +258,15 @@ pub enum PathStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SplashColors {
-    /// Truecolor wherever it can reach the screen, the palette
-    /// rendition only where a tmux client would have it converted.
+    /// The original art everywhere; the palette rendition only on
+    /// request.
     ///
-    /// The default: the session asks tmux, when it sits behind one,
-    /// whether the attached client carries the RGB feature, and
-    /// downgrades only on tmux's explicit no — an unanswered ask keeps
-    /// truecolor.
+    /// The default: a multiplexer forwards direct colors verbatim to
+    /// every client with the RGB feature, and a client without it keeps
+    /// the hues in its own approximation — so the photograph is painted
+    /// as authored wherever the session sits. The palette rendition is
+    /// the explicit `palette` choice, for a tmux whose clients it knows
+    /// as 256-color and re-encodes per color onto the grey ramp.
     #[default]
     Auto,
 
@@ -1310,6 +1312,24 @@ pub struct RunnerConfig {
     /// `[runner] turn_timeout_secs`.
     pub turn_timeout_secs: u64,
 
+    /// Seconds to wait before the first rate-limit retry, and the floor
+    /// the retry ladder doubles from.
+    ///
+    /// The stream handler meets a 429/503 two ways: a server-sent
+    /// `Retry-After` is honoured when present, and a hintless hit — the
+    /// shape quota-windowed providers like GLM send — sleeps this long
+    /// first, then doubles per consecutive hit up to the ladder's cap.
+    /// The stock 5-second floor is tuned for transient bursts, not for
+    /// quota windows that run minutes: a hintless ladder floors at
+    /// 5 + 10 + 20 before escalating, so a plan throttled for a minute
+    /// dies while the window is still open. Fifteen turns the same
+    /// ladder into 15 + 30 + 60, long enough to outlast the shorter
+    /// windows without stretching a transient blip past notice.
+    /// Values below `1` fail the load: a zero floor would retry a
+    /// throttled endpoint immediately. Loaded from
+    /// `[runner] rate_limit_delay_secs`.
+    pub rate_limit_delay_secs: u64,
+
     /// Whether to auto-compact the conversation when it grows large.
     ///
     /// When true, the session compacts itself once it crosses
@@ -1619,6 +1639,7 @@ impl Default for RunnerConfig {
         Self {
             max_turns: 200,
             turn_timeout_secs: 300,
+            rate_limit_delay_secs: 15,
             auto_compact: true,
             compact_threshold: 80,
             compactor: CompactorSelection::Qa,
@@ -2049,6 +2070,14 @@ impl DchConfig {
                 self.runner.turn_timeout_secs, TURN_TIMEOUT_FLOOR_SECS
             )));
         }
+        if self.runner.rate_limit_delay_secs < 1 {
+            return Err(DchConfigError::Invalid(format!(
+                "rate_limit_delay_secs = {} is below the 1-second floor: a zero floor \
+                 would retry a throttled endpoint immediately, before the burst the \
+                 provider is throttling has begun to clear",
+                self.runner.rate_limit_delay_secs
+            )));
+        }
         let cap = self.runner.max_tool_output_chars;
         if cap != 0 && self.runner.read_max_bytes > cap {
             return Err(DchConfigError::Invalid(format!(
@@ -2432,6 +2461,42 @@ mod tests {
                     if message.contains("turn_timeout_secs = 119") && message.contains("120")
             ),
             "the rejection names the value and the floor: {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_default_rate_limit_floor_outlasts_a_short_quota_window() {
+        // The knob's default is the lever the ladder needs: fifteen
+        // seconds floors the hintless ramp at 15 + 30 + 60, where the
+        // stock five floors it at 5 + 10 + 20 — the difference between
+        // riding out a short quota window and escalating inside it.
+        assert_eq!(
+            DchConfig::default().runner.rate_limit_delay_secs,
+            15,
+            "the default floor is fifteen seconds"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_an_immediate_rate_limit_retry() {
+        let err = DchConfig::from_toml_str("[runner]\nrate_limit_delay_secs = 0\n").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DchConfigError::Invalid(message)
+                    if message.contains("rate_limit_delay_secs = 0")
+                        && message.contains("1-second floor")
+            ),
+            "the rejection names the value and the floor: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_loads_a_tuned_rate_limit_floor() {
+        let config = DchConfig::from_toml_str("[runner]\nrate_limit_delay_secs = 30\n").unwrap();
+        assert_eq!(
+            config.runner.rate_limit_delay_secs, 30,
+            "a tuned floor loads verbatim — the knob the quota window asks for"
         );
     }
 
