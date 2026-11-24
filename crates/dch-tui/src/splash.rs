@@ -23,9 +23,10 @@
 //! the night's blues sit far darker than the palette's darkest blue,
 //! so their nearest entries are the grey ramp, and the rendition is a
 //! grey night — authored, indexed, and passed through a multiplexer
-//! verbatim. It is the opt-in (`splash-colors = palette`) for a tmux
-//! whose clients it knows as 256-color and re-encodes per color, which
-//! would collapse the truecolor art the same way, minus the control.
+//! verbatim. It is the opt-in (`display.splash_colors = "palette"`)
+//! for a tmux whose clients it knows as 256-color and re-encodes per
+//! color, which would collapse the truecolor art the same way, minus
+//! the control.
 //! [`crate::terminal::truecolor_warranted`] draws the line; the
 //! choice is made once per process.
 

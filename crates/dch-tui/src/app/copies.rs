@@ -1,5 +1,5 @@
 //! The copy servo: selection, answer, and session-id copies, the
-//! clipboard transports and their deadlines, and the notices each
+//! transport scheduler that orders them, and the notices each
 //! transport's verdict posts.
 
 use super::TuiApp;
@@ -142,8 +142,10 @@ pub(in crate::app) fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str 
 /// turn under the process-wide write lock, a turn granted after a
 /// newer copy has started is declined outright, and a copy already
 /// superseded before it queues never runs — a slow older helper
-/// cannot land its text over a newer copy's delivery, whichever of
-/// the two finished first. The caller-stamped `attempt` rides onto
+/// cannot land its text over a newer copy's transport delivery; an
+/// escape-only copy made after the helper was dropped writes outside
+/// the lane and stands on its own. The caller-stamped `attempt` rides
+/// onto
 /// the verdict unchanged. The transports' verdict lands as a
 /// follow-up notice through the render wake this pings; until then
 /// the returned escape result is all the caller can honestly claim.

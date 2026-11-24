@@ -107,12 +107,15 @@ impl TuiApp {
     /// follows the most recent claim however it settled — a turn that
     /// already landed and still stands as the newest claim is taken out
     /// and the fix runs in its place, no cancel needed.
-    /// With no driver (or a channel nobody listens to) there is no turn
-    /// to cut and nothing to run it, so the corrected wording goes into
-    /// the transcript the way any prompt does when this app is standing
-    /// alone. Those words are a saved prompt's body, so the fallback
-    /// delivers them literally — the command they happen to spell is the
-    /// user's words, never a dispatch. The named turn in flight is
+    /// With no driver there is no turn to cut and nothing to run it, so
+    /// the corrected wording goes into the transcript the way any
+    /// prompt does when this app is standing alone; with a driver whose
+    /// channel has gone silent the send is refused, and the words come
+    /// back the way submit's own refusal returns them — a notice row
+    /// and the composer holding them again. The words are a saved
+    /// prompt's body, so the no-driver fallback delivers them
+    /// literally — the command they happen to spell is the user's
+    /// words, never a dispatch. The named turn in flight is
     /// stopped, not waited out: the correction is sent first and the
     /// runner's cancel raised beside it, so a superseded turn stops
     /// spending its run on wording the user has already replaced — the
@@ -300,9 +303,10 @@ pub(crate) struct ComposerState {
 impl ComposerState {
     /// Build the composer with a fresh editor and no geometry.
     ///
-    /// The editor starts empty with no history; the wrap width and
-    /// pane view stay unset until the first frame renders and records
-    /// them, and no wrap is cached before one exists.
+    /// The editor starts empty with no history; the wrap width
+    /// starts at a neutral standing default the first frame replaces
+    /// with the measured one, the pane view stays unset until a frame
+    /// records it, and no wrap is cached before one exists.
     pub(crate) fn new() -> Self {
         Self {
             input: InputEditor::new(),
@@ -683,7 +687,7 @@ mod tests {
         );
     }
 }
-/// Ticks per caret blink phase.
+/// One caret blink phase.
 ///
 /// Half a second on, half a second off — the cadence editors settle
 /// on when they own the blink themselves. The terminal's own
@@ -848,9 +852,10 @@ pub(crate) fn relativize(dir: &Path, home: &Path) -> Option<String> {
 
 /// Copy `word` with its first character uppercased.
 ///
-/// The status bar's effort label shows the configured level's own
-/// spelling with a leading capital — `low` renders `(Low)` — whatever
-/// case the config file carried; the rest of the word is untouched.
+/// The composer identity row's effort label shows the configured
+/// level's own spelling with a leading capital — `low` renders
+/// `(Low)` — whatever case the config file carried; the rest of the
+/// word is untouched.
 pub(crate) fn capitalize_first(word: &str) -> String {
     let mut chars = word.chars();
     match chars.next() {

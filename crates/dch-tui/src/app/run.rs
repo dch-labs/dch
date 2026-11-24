@@ -226,9 +226,9 @@ pub(crate) const FRAME_REPORT_SECONDS: std::time::Duration = std::time::Duration
 
 /// The frame lane's per-second counters.
 ///
-/// Reset each time a second's line is logged; the second opens on the
-/// first draw measured into it, so a lane that never draws reports
-/// zeros honestly.
+/// Reset each time a second's line is logged; each reopened window
+/// opens at the draw that closed the last, and a lane that never
+/// draws logs nothing at all.
 #[derive(Default)]
 pub(crate) struct FrameStats {
     /// Animation-lane wakes this second.

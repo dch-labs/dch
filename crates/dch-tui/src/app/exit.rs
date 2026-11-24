@@ -190,7 +190,9 @@ impl TuiApp {
         if !cancelled_now && self.exit.partial_reply.is_none() {
             return;
         }
-        drop(terminal.draw(|frame| self.render(frame)));
+        if let Err(err) = terminal.draw(|frame| self.render(frame)) {
+            tracing::warn!("the exit settle's final frame did not paint: {err}");
+        }
         self.drain_shared_state();
         let graduated_from = self.exit.partial_reply_since.min(self.conversation.len());
         let graduated = self
@@ -247,6 +249,7 @@ impl TuiApp {
                 .any(|message| matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled"))
         });
         if !record_landed {
+            self.exit.stop_record_written = true;
             self.conversation.push(TuiMessage::Error {
                 text: "Agent cancelled".to_string(),
                 timestamp: chrono::Utc::now(),
@@ -281,7 +284,23 @@ impl TuiApp {
     /// carries is never repeated, the extension that streamed past
     /// the capture still lands as its own row, and every other
     /// straggler, tools included, lands untouched.
+    ///
+    /// The cancel record keeps its one-row shape here too: the
+    /// settle writes its own record when the driver has not yet
+    /// resolved the stop, and the driver's resolution — its own
+    /// publication of the same cancelled row — arrives in the error
+    /// lane during the teardown; when the settle already wrote the
+    /// record, that twin is dropped with the same discipline the
+    /// retained reasoning prefix is.
     pub fn drain_late_graduations_at_exit(&mut self) {
+        if self.exit.stop_record_written {
+            let mut errors = self
+                .state
+                .errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            errors.retain(|text| text != "Agent cancelled");
+        }
         if let Some(retained) = self.exit.kept_reasoning.as_deref() {
             let mut graduations = self
                 .state
@@ -507,13 +526,24 @@ pub(crate) struct ExitState {
     /// still lands. `None` whenever the snapshot is not kept whole: a
     /// graduated reply carries its reasoning where it landed.
     pub(crate) kept_reasoning: Option<String>,
+
+    /// Whether the stop's settle wrote its own cancel record.
+    ///
+    /// Set when the deterministic write ran — the driver had not
+    /// yet resolved the stop at the settle's drain, so the settle
+    /// owed the row itself. The driver's resolution still lands
+    /// during the teardown, publishing the same cancelled record
+    /// into the error lane; the late drain drops that twin beside
+    /// it, keeping the one-record invariant the settle's own guard
+    /// keeps before it.
+    pub(crate) stop_record_written: bool,
 }
 /// The quit lifecycle's two halves.
 ///
 /// Exit is Ctrl+C pressed twice on an empty buffer: the first
 /// arms, the second confirms and requests the exit. The press
 /// that clears a non-empty buffer arms nothing — clearing is not
-/// consenting — and any other key or mouse press disarms, so the
+/// consenting — and any other key or mouse event disarms, so the
 /// chord never fires from stale intent.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct QuitState {
@@ -750,6 +780,50 @@ mod tests {
         assert_eq!(
             records, 2,
             "the earlier row stands and this stop writes its own record"
+        );
+    }
+
+    #[test]
+    fn a_drained_cancelled_record_does_not_twin_the_settles_own() {
+        // The teardown window: the settle wrote its own record because
+        // the driver had not yet resolved the stop, and the driver's
+        // resolution publishes the same cancelled row into the error
+        // lane after it. The late drain drops that twin — one stop,
+        // one record — while an unrelated late error still lands.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.state.agent_running.store(true, Ordering::SeqCst);
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        assert!(
+            cancel_record_landed(&app),
+            "fixture premise: the settle owed the record itself"
+        );
+        {
+            let mut errors = app
+                .state
+                .errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            errors.push(loopctl::error::LoopError::Cancelled.to_string());
+            errors.push("a late unrelated failure".to_string());
+        }
+        app.drain_late_graduations_at_exit();
+        let records = app
+            .conversation
+            .iter()
+            .filter(|message| {
+                matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled")
+            })
+            .count();
+        assert_eq!(
+            records, 1,
+            "the driver's late publication of the same stop adds no twin record"
+        );
+        assert!(
+            app.conversation
+                .iter()
+                .any(|message| matches!(message, TuiMessage::Error { text, .. } if text == "a late unrelated failure")),
+            "an unrelated late error still lands beside the kept record"
         );
     }
 

@@ -5030,10 +5030,10 @@ fn a_seated_pane_grounds_its_canvas_and_keeps_its_surfaces() {
 
 #[test]
 fn the_scrolled_error_block_renders_its_header_and_wrapped_detail() {
-    // The 502 shape from session 1fab4451: an API error with an HTML
+    // A provider's HTML error page: an API error with an HTML
     // edge body bakes into the conversation with its header naming
     // the attempts, the status, and the gateway tag, and the detail
-    // wraps as clean rows — no control bytes from the provider's
+    // wraps as clean rows — no escape debris from the provider's
     // page riding into the cells.
     let now = chrono::Utc::now();
     let mut app = app();
@@ -5059,7 +5059,7 @@ fn the_scrolled_error_block_renders_its_header_and_wrapped_detail() {
         },
         TuiMessage::Error {
             text: "API error: stream (stream failed before completing after 4 attempts: \
-HTTP error: HTTP 502: <html><head><title>502 Bad Gateway</title></head>\
+HTTP error: HTTP 502: <html><head><title>502 Bad Gateway\u{1b}[2J</title></head>\
 <hr><center>alibaba-ga</center></html>) and fallback failed: HTTP error: \
 HTTP 502: upstream reset"
                 .to_string(),
@@ -5079,6 +5079,21 @@ HTTP 502: upstream reset"
     assert!(
         header.contains("alibaba-ga"),
         "the sanitized gateway tag rides the header: {header:?}"
+    );
+    let detail_rows = rows
+        .iter()
+        .filter(|row| row.contains("502 Bad Gateway") || row.contains("upstream reset"))
+        .collect::<Vec<_>>();
+    assert!(
+        !detail_rows.is_empty(),
+        "the provider's page renders as visible detail rows beneath the header"
+    );
+    assert!(
+        detail_rows
+            .iter()
+            .all(|row| row.chars().all(|glyph| !glyph.is_control()) && row.chars().count() <= 80),
+        "the detail wraps as clean rows — no control bytes from the provider's page, \
+         nothing past the pane: {detail_rows:?}"
     );
 }
 
@@ -6965,7 +6980,7 @@ fn a_permission_sheet_strips_the_clusters_the_screen_cannot_size() {
 
 #[test]
 fn a_sheet_tells_selector_differing_commands_apart() {
-    // Findings B and C: two commands differing only by a composition
+    // Two commands differing only by a composition
     // input must never share one preview — the approval runs the
     // original, so the sheet has to show which one it holds. The
     // preview renders the removed input as a visible escape while no

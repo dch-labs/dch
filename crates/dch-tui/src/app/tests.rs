@@ -1521,6 +1521,248 @@ fn backtab_from_a_bare_stem_applies_the_last_row() {
 }
 
 #[test]
+fn backtab_over_a_stale_cycle_applies_the_last_row() {
+    // A cycle left standing by a mutation that is not a keystroke is
+    // stale, not holding the line: the first reverse press treats it
+    // as no cycle at all and lands on the last row — the same
+    // contract the clean-path pin states for the bare stem.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    assert!(candidates.len() >= 2, "themes offer more than one");
+    let first = candidates.first().cloned().unwrap_or_default();
+    let last = candidates.last().cloned().unwrap_or_default();
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {first}"),
+        "fixture premise: the forward press applied the first row"
+    );
+    // A paste-shaped mutation — no key wrapper runs — leaves the
+    // cycle parked against a line it no longer holds.
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {last}"),
+        "the stale cycle is treated as none: the first reverse press lands on the last row"
+    );
+}
+
+#[test]
+fn a_paste_that_drifts_the_browse_retires_the_preview() {
+    // Paste is the one composer-mutating entry point the key wrapper
+    // never sees: a '/theme' browse the pasted text drifts away from
+    // must retire on the paste itself, or the screen keeps the
+    // previewed palette until some later key press spends the
+    // restore.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let original = app.theme.clone();
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert!(
+        app.browse.theme_before_browse.is_some(),
+        "fixture premise: the browse parked the session's own palette"
+    );
+    assert_ne!(
+        app.theme.name, original.name,
+        "fixture premise: the landed row previewed another palette"
+    );
+    assert!(app.handle_event(&crossterm::event::Event::Paste("x".to_string())));
+    assert!(
+        app.browse.theme_before_browse.is_none(),
+        "the drifted browse retired on the paste itself"
+    );
+    assert_eq!(
+        app.theme.name, original.name,
+        "the session's own palette came back with the retirement"
+    );
+}
+
+#[test]
+fn the_cancel_arm_dies_with_the_run_it_was_armed_against() {
+    // The queued-claim window: the driver ends one run and starts the
+    // next with no yield between the two flag stores, so the running
+    // flag is back up before any drain could read it down. The run's
+    // end rides the graduation the drain processes regardless of the
+    // flag, and the arm retires there — the next run's first Esc arms
+    // afresh instead of firing a cancel one press old.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let fired = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let count = std::rc::Rc::clone(&fired);
+    app.set_run_canceller(Box::new(move || count.set(count.get().saturating_add(1))));
+    app.state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(
+        app.exit.cancel_arm,
+        "fixture premise: the first Esc armed the ladder"
+    );
+    // Run A ends and B starts back to back: the end rides the
+    // graduation lane while the running flag never falls.
+    app.state
+        .graduations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(crate::observer::Graduation::RunEnded {
+            duration_ms: 1,
+            success: true,
+        });
+    app.drain_shared_state();
+    assert!(
+        !app.exit.cancel_arm,
+        "the arm retired with the run whose end the drain processed"
+    );
+    assert_eq!(fired.get(), 0, "no cancel fired on the way out");
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert_eq!(
+        fired.get(),
+        0,
+        "the next run's first Esc arms, never fires a cancel one press old"
+    );
+    assert!(
+        app.exit.cancel_arm,
+        "it arms the ladder afresh against the run in flight"
+    );
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert_eq!(fired.get(), 1, "and the second press is the cancel");
+}
+
+#[test]
+fn any_mouse_press_stands_the_quit_chord_down() {
+    // The chord must never fire from stale intent: a right-button
+    // press between the presses disarms it the same way a left press
+    // or a key does.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.quit.arm();
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(!app.quit.armed, "the right press spent the arm");
+}
+
+#[test]
+fn a_render_invalidation_resets_the_frozen_stream_whole() {
+    // The freeze's cached half: rows frozen under the palette that
+    // stood when they settled. A render invalidation drops the frozen
+    // prefix with the bake — or the cached half would keep serving
+    // the old colors until the stream's next delta or its graduation.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    *app.state
+        .streaming_text
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        "settled block one\n\nlive tail".to_string();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    assert!(
+        app.freeze.frozen_upto > 0,
+        "fixture premise: a block settled into the freeze"
+    );
+    app.invalidate_conversation_renders();
+    assert!(
+        app.freeze.frozen_lines.is_empty() && app.freeze.frozen_upto == 0,
+        "the invalidation drops the frozen prefix with the bake"
+    );
+}
+
+#[test]
+fn enter_over_a_bare_theme_browse_names_the_highlighted_row() {
+    // The browse's commit path: Enter over a bare '/theme ' stem —
+    // the popup standing, a row highlighted by the walk — names that
+    // row in the composer and submits it, so the session lands on
+    // the browsed choice rather than whatever the draft spelled.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let original = app.theme.clone();
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    let second = candidates.get(1).cloned().unwrap_or_default();
+    assert!(
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        "the walk applies and previews the landed row"
+    );
+    assert_ne!(
+        app.theme.name, original.name,
+        "fixture premise: the walk previewed another palette"
+    );
+    // Back to the bare stem the Enter arm reads, browse still standing.
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&second).map_or(second.clone(), |theme| theme.name.to_string()),
+        "the highlighted row's palette is the one the session committed"
+    );
+    assert!(
+        app.browse.theme_before_browse.is_none(),
+        "the commit retired the browse"
+    );
+}
+
+#[test]
+fn a_stood_down_strip_erases_the_row_it_last_painted() {
+    // The strip's exit discipline: a frame that paints nothing must
+    // still spend the frame clearing its row, because the frame
+    // buffer is cumulative — without the clear the last painted bar
+    // lingers into the frames that follow. The glow style paints one
+    // unambiguous full-width rule, so its row's fate is the pin. The
+    // dedicated first row is the honest seat for it: at the default
+    // placement the composer's hairline repaints the spacer the moment
+    // the strip stands down, which would mask a lingering bar, while
+    // nothing else paints the top row.
+    let config = dch_config::DchConfig {
+        display: dch_config::DisplayConfig {
+            strip_style: StripStyle::Glow,
+            strip_position: StripPosition::Top,
+            ..dch_config::DisplayConfig::default()
+        },
+        ..dch_config::DchConfig::default()
+    };
+    let mut app = TuiApp::new(config);
+    app.state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let strip_row = (0..buffer.area().height).find(|row| {
+        let cells: Vec<&str> = (0..buffer.area().width)
+            .filter_map(|column| {
+                buffer
+                    .cell(ratatui::layout::Position::new(column, *row))
+                    .map(ratatui::buffer::Cell::symbol)
+            })
+            .collect();
+        cells.len() == usize::from(buffer.area().width)
+            && cells
+                .iter()
+                .all(|symbol| *symbol == "\u{2500}" || *symbol == " ")
+            && cells.iter().filter(|symbol| **symbol == "\u{2500}").count() >= 40
+    });
+    let Some(row) = strip_row else {
+        panic!("the running strip painted its bar");
+    };
+    app.state
+        .agent_running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let cleared = (0..buffer.area().width).all(|column| {
+        buffer
+            .cell(ratatui::layout::Position::new(column, row))
+            .is_some_and(|cell| cell.symbol() == " ")
+    });
+    assert!(
+        cleared,
+        "the stood-down strip erased the bar its last painted frame left"
+    );
+}
+
+#[test]
 fn arrows_walk_the_suggestion_popup_and_preview_the_landed_row() {
     let mut app = TuiApp::new(dch_config::DchConfig::default());
     app.composer.input.set_text("/theme ".to_string());
@@ -1920,7 +2162,7 @@ fn the_flipped_highlight_covers_exactly_the_swept_cells() {
 
 #[test]
 fn the_identity_row_picker_and_completion_paint_the_stripped_projection() {
-    // Round 5's three surfaces on one welcome draw: the composer
+    // Three surfaces on one welcome draw: the composer
     // identity row (a free-form config model rides it), the
     // session picker's model column, and the completion popup's
     // candidate values. All paint the projection; the picker's
@@ -2393,7 +2635,7 @@ fn context_bar_readout_rounds_from_the_true_ratio() {
 }
 
 #[test]
-fn a_drained_verdict_replaces_the_notice_wording() {
+fn an_unconfirmed_drained_verdict_leaves_the_posted_wording_standing() {
     let mut app = TuiApp::new(dch_config::DchConfig::default());
     app.post_notice("selection copied".to_string());
     let mut slot = app.copy.copy_outcomes.lock().expect("the outcomes slot");
@@ -3876,13 +4118,14 @@ fn a_steer_of_an_open_edit_delivers_the_saved_words_literally() {
 }
 
 #[test]
-fn a_correction_the_channel_refuses_is_delivered_literally() {
-    // The gone-arm of an edit commit: the run claimed the prompt while
-    // its body stood in the composer, and the correction has no driver
-    // left to take it. The corrected wording is still a saved prompt's
-    // body, so the channel-less fallback delivers the words rather than
-    // parsing them: a body spelling `/clear` cannot clear the session
-    // in the very act of being corrected.
+fn a_correction_with_no_driver_is_delivered_literally() {
+    // The gone-arm of an edit commit on a host with no driver: the
+    // run claimed the prompt while its body stood in the composer,
+    // and nothing is left to take the correction. The corrected
+    // wording is still a saved prompt's body, so the driver-less
+    // fallback delivers the words rather than parsing them: a body
+    // spelling `/clear` cannot clear the session in the very act of
+    // being corrected.
     use crate::message::TuiMessage;
     let mut subject = app();
     subject.push_message(TuiMessage::System {
@@ -3921,10 +4164,66 @@ fn a_correction_the_channel_refuses_is_delivered_literally() {
 }
 
 #[test]
+fn a_correction_the_refused_channel_hands_back_to_the_composer() {
+    // The refused-send arm: a driver whose channel has gone silent
+    // takes nothing, so the corrected words come back the way every
+    // refused submit returns them — a notice naming the dead driver,
+    // the words in the composer, and no transcript row for a turn
+    // that never started.
+    use crate::message::TuiMessage;
+    let mut subject = app();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    subject.host.submit_tx = Some(tx);
+    drop(rx);
+    subject.push_message(TuiMessage::System {
+        text: "a row the session keeps".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let id = subject.push_queued("the prompt that went out".to_string());
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 0;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)));
+    subject
+        .composer
+        .input
+        .set_text("the corrected wording".to_string());
+    let _claimed = subject.remove_queued(id);
+    assert_eq!(
+        subject.queue_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(true),
+        "the save chord reaches the open edit"
+    );
+    assert_eq!(
+        subject.queued_len(),
+        0,
+        "the refused send re-queued nothing"
+    );
+    assert!(
+        subject.conversation.iter().all(|message| !matches!(
+            message,
+            TuiMessage::User { text, .. } if text == "the corrected wording"
+        )),
+        "no transcript row for words that never left"
+    );
+    assert_eq!(
+        subject.composer.input.text(),
+        "the corrected wording",
+        "the words come back to the composer"
+    );
+    assert!(
+        subject
+            .notice_text()
+            .as_deref()
+            .is_some_and(|notice| notice.contains("the driver has gone")),
+        "the notice names the dead driver"
+    );
+}
+
+#[test]
 fn the_cost_command_agrees_with_the_bar_at_an_odd_window() {
-    // S1's contract, pinned at the number: `/cost` reads the same
-    // snapshot the context bar draws from and rounds it the same way,
-    // so the two figures a user can see side by side never disagree.
+    // `/cost` reads the same snapshot the context bar draws from and
+    // rounds it the same way, so the two figures a user can see side by
+    // side never disagree.
     // The window is odd on purpose — an even split needs no rounding
     // and would hide the half-up the two computations must share — and
     // the usage crosses the window, the overshoot case where the old
@@ -3965,10 +4264,10 @@ fn the_cost_command_agrees_with_the_bar_at_an_odd_window() {
 
 #[test]
 fn a_live_model_switch_that_fails_its_save_says_it_stands_live() {
-    // S2's wording, pinned: a model switch is live the moment the
-    // loop takes it, so a failed config save must not claim the value
-    // "was never applied" — the restart-class phrasing every other
-    // key's failure carries. The save is made to fail against a path
+    // A model switch is live the moment the loop takes it, so a failed
+    // config save must not claim the value "was never applied" — the
+    // restart-class phrasing every other key's failure carries. The save
+    // is made to fail against a path
     // a file already occupies, and the notice names the truth: the
     // switch is live, the save is what failed.
     let mut subject = app();
@@ -3984,10 +4283,9 @@ fn a_live_model_switch_that_fails_its_save_says_it_stands_live() {
 
 #[test]
 fn an_empty_session_catalog_answers_with_a_notice() {
-    // S4's empty-catalog reply, pinned: `/sessions` against a catalog
-    // with nothing in it says so on the notice row — the user asked
-    // and deserves an answer, not a blank screen — and seats no
-    // picker there is nothing to seat.
+    // `/sessions` against a catalog with nothing in it says so on the
+    // notice row — the user asked and deserves an answer, not a blank
+    // screen — and seats no picker there is nothing to seat.
     let mut subject = app();
     subject.open_session_picker(Vec::new());
     assert_eq!(

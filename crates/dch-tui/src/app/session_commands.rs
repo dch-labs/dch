@@ -605,10 +605,12 @@ impl TuiApp {
     /// Push a just-changed value into whatever panel state reads it live.
     ///
     /// Only display-classed values have panel state to refresh — the
-    /// theme, the verbosity, the caret display, and the diff layout —
-    /// and their handlers re-bake the caches or re-render the rendered
-    /// exactly as the interactive controls would; every other key falls
-    /// through untouched, its effect waiting on the next start.
+    /// theme, the verbosity, and the diff layout have handlers that
+    /// re-bake the caches exactly as the interactive controls would;
+    /// caret display and path style are read from the config every
+    /// frame, so they need no arm and take effect at once; every other
+    /// key falls through untouched, its effect waiting on the next
+    /// start.
     fn apply_live_config(&mut self, key: &str) {
         match key {
             "theme" => {
@@ -1143,9 +1145,7 @@ impl TuiApp {
             .remove("permission_mode");
         self.compaction_summary_owed.clear();
         self.plan.latest_todos.clear();
-        self.conversation.clear();
-        self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
-        self.pointer.selection = None;
+        self.replace_conversation_with(Vec::new());
         self.queue.handed = None;
         self.state
             .queued
@@ -1332,13 +1332,14 @@ impl TuiApp {
     /// line — but the cache discipline is one: the generation bump
     /// pierces the render guard (or the merged cache would keep serving
     /// the old rendering until an unrelated event rebaked), the rebake
-    /// empties the bake, and the live-stamp reset forces the streaming
-    /// rows to re-render (or they would keep the old rendering until
-    /// their next delta).
+    /// empties the bake, and the freeze resets whole — the frozen
+    /// prefix and the live segment both — or the cached half would
+    /// keep serving the old rendering until the stream's next delta
+    /// or its graduation.
     pub(crate) fn invalidate_conversation_renders(&mut self) {
         self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
         self.bake.rebake_whole();
-        self.freeze.live_stamp = 0;
+        let _ = self.freeze.reset();
     }
 }
 
@@ -1832,7 +1833,7 @@ mod tests {
 
     #[test]
     fn a_preset_selection_waits_for_repair_and_takes_effect_at_it() {
-        // The round-4 damage interaction, end to end: a healthy swap
+        // The damage interaction, end to end: a healthy swap
         // joins the new preset's rules at once; under a standing
         // damage verdict the swap records the selection and holds —
         // the config layer stays tightened, so the new preset's rules
@@ -2258,6 +2259,120 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_on_a_driverless_host_drops_the_expansions_with_the_conversation() {
+        // The sibling wholesale replacement: `/clear` on a host with no
+        // driver has no adoption reply to drop the position-keyed state
+        // later, so the clear itself must — a thinking section expanded
+        // at m1b0 in the cleared conversation must not greet the new
+        // conversation's block at that position already open, and the
+        // bake must restart from the empty transcript rather than
+        // splice the cleared rows under whatever lands next.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let now = chrono::Utc::now();
+        app.push_message(TuiMessage::User {
+            text: "the cleared conversation's prompt".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        });
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![crate::message::ContentBlock::Thinking {
+                text: "the cleared turn thought".to_string(),
+                redacted: false,
+                duration_ms: 0,
+            }],
+            timestamp: now,
+            duration_ms: None,
+        });
+        app.expansion.expanded_thinking.insert("m1b0".to_string());
+        app.expansion.expanded_compactions.insert("m0".to_string());
+        assert!(
+            app.host.submit_tx.is_none(),
+            "fixture premise: no driver answers the clear"
+        );
+        let out = command_output(&mut app, "/clear");
+        assert!(out.contains("session cleared"), "the clear ran: {out:?}");
+        assert!(
+            app.conversation.is_empty(),
+            "the conversation cleared on the spot"
+        );
+        assert!(
+            app.expansion.expanded_thinking.is_empty()
+                && app.expansion.expanded_compactions.is_empty(),
+            "the position-keyed expansions died with the rows they named"
+        );
+        assert_eq!(
+            app.bake.conversation_baked_through, 0,
+            "the bake restarted from the empty transcript"
+        );
+    }
+
+    #[test]
+    fn the_model_picker_walks_enter_switches_and_esc_closes() {
+        // The model picker's contract, the session picker's own
+        // shape: the arrows walk the configured entries, Enter
+        // switches the session onto the walked-to model and closes
+        // the sheet, and Esc closes it switching nothing.
+        let config = dch_config::DchConfig {
+            models: vec![
+                dch_config::ModelProfile {
+                    model: "first-model".to_string(),
+                    ..dch_config::ModelProfile::default()
+                },
+                dch_config::ModelProfile {
+                    model: "second-model".to_string(),
+                    ..dch_config::ModelProfile::default()
+                },
+            ],
+            ..dch_config::DchConfig::default()
+        };
+        let mut app = TuiApp::new(config);
+        command_output(&mut app, "/models");
+        assert!(
+            app.pickers.model_picker.is_some(),
+            "the configured entries open the picker"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.set_submit_tx(tx);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            app.handle_key(down),
+            "the arrows are the picker's while it stands"
+        );
+        assert!(app.handle_key(enter), "Enter takes the row");
+        assert!(
+            app.pickers.model_picker.is_none(),
+            "switching closes the picker"
+        );
+        let sent = rx
+            .try_recv()
+            .expect("Enter handed the row to the switch lane");
+        let crate::queue::Submission::Command { command } = sent else {
+            panic!("the picker's Enter sends a command, got {sent:?}")
+        };
+        let SessionCommand::Model { name } = command else {
+            panic!("the chosen row travels as a model switch, got {command:?}")
+        };
+        assert_eq!(
+            name, "second-model",
+            "the walked-to row is the one that switches"
+        );
+        command_output(&mut app, "/models");
+        assert!(app.pickers.model_picker.is_some());
+        assert!(app.handle_key(esc), "Esc is the picker's");
+        assert!(
+            app.pickers.model_picker.is_none(),
+            "Esc closes the picker switching nothing"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the Esc closed the sheet without spending a switch"
+        );
+    }
+
+    #[test]
     fn the_session_picker_walks_and_enter_resumes_the_chosen_row() {
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         let rows = vec![
@@ -2589,7 +2704,7 @@ mod tests {
         // serializes the live config, which `/preset` mutated; without
         // the reset the session-scoped selection would ride the save
         // into a file the swap promised never to touch, and outlive the
-        // process the spec says it dies with.
+        // process the command's own doc says the selection dies with.
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dch_config::DchConfig::from_toml_str(concat!(
             "[permissions.presets.rust-dev]\n",
@@ -2634,6 +2749,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
             .expect("the dir refuses staging");
+        // Permission bits do not bind a root runner: the save would
+        // succeed and the fixture would prove nothing, so the probe
+        // stands the pin down where it cannot bind — and says so, so a
+        // vacuous pass is visible in the log.
+        if std::fs::write(dir.path().join("root-probe"), b"x").is_ok() {
+            eprintln!(
+                "a_failed_persist_names_the_class_honestly: skipped — permission bits do not \
+                 bind a root runner"
+            );
+            return;
+        }
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         app.set_config_persist_dir(Some(dir.path().to_path_buf()));
         let out = command_output(&mut app, "/set max_turns 50");
@@ -2704,10 +2830,10 @@ mod tests {
 
     #[test]
     fn set_of_a_bricking_value_is_refused_whole() {
-        // The command-level half of the bricking fix: `/set
-        // turn_timeout_secs 60` is refused at the field gate with the
-        // loader's floor named, the config keeps its value, and the file
-        // is never written — the next start stays possible.
+        // The command-level gate on values the loader would refuse:
+        // `/set turn_timeout_secs 60` is refused at the field gate with
+        // the loader's floor named, the config keeps its value, and the
+        // file is never written — the next start stays possible.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         app.set_config_persist_dir(Some(dir.path().to_path_buf()));

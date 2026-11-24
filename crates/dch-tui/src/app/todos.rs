@@ -443,8 +443,10 @@ pub(crate) struct PlanState {
     /// The conversation's per-update block accents exactly these
     /// rows: the ids whose status moved in that call, against the
     /// snapshot the previous call left. Bounded with the transcript
-    /// itself; the map rides in memory only — a resumed session
-    /// accents nothing, which reads correctly as "no deltas known".
+    /// itself; the map rides in memory only — a fresh session carries
+    /// no deltas, and the resume path re-derives its accents from the
+    /// seeding walk, which records each restored update's deltas
+    /// against the snapshot before it.
     pub(crate) todo_changes: HashMap<String, HashMap<String, todo_view::TodoStatus>>,
 
     /// The rows the newest todo update changed, for the plan section.
@@ -482,11 +484,11 @@ pub(crate) struct PlanState {
     ///
     /// The layout computes the section's rows from the same render the
     /// frame draws, so it is the one place that already knows whether
-    /// the cap ate anything; the cell carries that answer across the
-    /// `&self` render into the key press that cycles the posture.
-    /// Fresh until the first frame renders — `false` reads as "the cap
-    /// cut nothing", which is at worst one skipped posture step before
-    /// the first frame draws.
+    /// the cap ate anything; the cell carries that answer to the chord
+    /// hint the identity row names — whether to offer the grow chord —
+    /// while the posture cycle measures fresh at its own press. Fresh
+    /// until the first frame renders — `false` reads as "the cap cut
+    /// nothing" until one proves otherwise.
     pub(crate) plan_cut: std::cell::Cell<bool>,
 
     /// The pinned section's scroll: how many entries the window skips.
@@ -733,7 +735,8 @@ pub(crate) enum PlanView {
     /// naming the rest and the chord that shows them.
     Capped,
 
-    /// The whole list — the section grows to whatever the plan holds,
+    /// Opened to the whole list up to the screen's height — taller
+    /// plans cap with the ellipsis, and the wheel walks the rest —
     /// because opening it is a deliberate act with the cost in plain
     /// sight.
     Full,

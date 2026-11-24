@@ -15,9 +15,11 @@ A terminal-based agentic coding assistant written in Rust, built on the
   natively for the fixed 256-color palette, is the explicit
   `display.splash_colors = "palette"` opt-in for a tmux whose clients
   it knows as 256-color — an honest grey night, since the fjord is
-  darker than any blue that palette carries. The art's outer columns
-  dissolve into the theme's canvas, so the photograph's dark margins
-  never read as a strip of mismatched background beside it. Inside a
+  darker than any blue that palette carries. On seats where the
+  theme's canvas is in force the art's outer columns dissolve into
+  it, so the photograph's dark margins never read as a strip of
+  mismatched background beside it; a transparent or deferred session
+  keeps the margins as authored. Inside a
   multiplexer dch writes no background or cursor color sequence at
   all — none of the terminal-state exchange reaches the client from a
   pane — and paints its canvas under its own cells.

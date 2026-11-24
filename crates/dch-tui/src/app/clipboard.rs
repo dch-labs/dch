@@ -160,11 +160,11 @@ pub(crate) struct CopyState {
 impl CopyState {
     /// Build the pipeline with its default transport copier.
     ///
-    /// The outcomes slot, the attempt counter, and the wake the
-    /// background transports ping are allocated here and shared with
-    /// the closure, so a copy scheduled through the seam and the
-    /// verdict drained by the frame read the same state however often
-    /// the seam itself is later replaced.
+    /// The outcomes slot and the attempt counter are allocated here
+    /// and shared with the closure, and the wake the background
+    /// transports ping arrives with them — so a copy scheduled
+    /// through the seam and the verdict drained by the frame read the
+    /// same state however often the seam itself is later replaced.
     pub(crate) fn new(custom: Option<String>, wake: Arc<event_listener::Event>) -> Self {
         let copy_outcomes: CopyOutcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let copier_outcomes = Arc::clone(&copy_outcomes);
@@ -211,10 +211,14 @@ impl CopyState {
 ///
 /// One counter per app, shared with the copier: the read-modify-write
 /// is a single atomic step, so copies stamping concurrently always
-/// take distinct ids, and the first stamp is 1.
+/// take distinct ids, and the first stamp is 1. The stamp is
+/// `SeqCst` to match the strength the lane's fences load with: the
+/// lane's own unlock-to-lock handoff already orders a newer stamp
+/// ahead of any older job's second check, so both sides of that edge
+/// carry the same ordering rather than one side assuming it.
 pub(crate) fn next_attempt(counter: &std::sync::atomic::AtomicU64) -> u64 {
     counter
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         .saturating_add(1)
 }
 
@@ -508,8 +512,10 @@ pub(crate) fn fenced_process_writes(
 /// passes — the worst case is one bounded wait, never an open-ended
 /// one. A copy verifies only when both the child exited successfully
 /// inside the deadline and the stdin write completed: a helper that
-/// exits zero without consuming its input has not delivered the
-/// text. Returns whether the transport verified.
+/// exits zero without consuming an input larger than the kernel's
+/// pipe buffer has not delivered the text — a payload that fits the
+/// buffer may complete its write without any read at all. Returns
+/// whether the transport verified.
 pub(crate) fn run_bounded(
     mut command: std::process::Command,
     text: &str,
@@ -1195,13 +1201,12 @@ mod tests {
 
     #[test]
     fn a_repair_after_the_verdict_cleared_says_nothing_to_repair() {
-        // The round-4 lifecycle case's door half: the verdict repair
-        // is keyed to can clear without the command — a `/clear`
-        // rotation and a resume into a healthy session both adopt a
-        // fresh memory. Against a cleared verdict the door must
-        // answer "nothing to repair", because the driver re-seeded
-        // the config layer beside the adoption and no posture
-        // stands.
+        // The verdict's other exit: the damage posture can clear
+        // without the command — a `/clear` rotation and a resume into
+        // a healthy session both adopt a fresh memory. Against a
+        // cleared verdict the door must answer "nothing to repair",
+        // because the driver re-seeded the config layer beside the
+        // adoption and no posture stands.
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         let memory = crate::queue::PermissionMemory::default();
         memory.mark_damaged();
@@ -1259,6 +1264,58 @@ mod tests {
         assert_eq!(
             window, 131_072,
             "the engine's own measure survives the verdict — the config's fallback does not replace it"
+        );
+    }
+
+    #[test]
+    fn a_provider_update_replaces_the_api_section_whole() {
+        // The panel's no-accretion rule, pinned: a provider verdict
+        // lands only the [api] section — the wire fields first, the
+        // entry's layer over the base after — and the display-side
+        // state a /theme change rewired is not the selection's to
+        // touch. A name no entry declares keeps the base bundle under
+        // the bare name, and a protocol the vocabulary rejects leaves
+        // the wire fields standing on the base's own kind.
+        let base = dch_config::DchConfig {
+            models: vec![dch_config::ModelProfile {
+                model: "elsewhere".to_string(),
+                ..dch_config::ModelProfile::default()
+            }],
+            ..dch_config::DchConfig::default()
+        };
+        let mut app = TuiApp::new(base);
+        // A display value the base never stated, the way a `/theme`
+        // change leaves the live config: a regression that replaced
+        // the whole config with the base would drop it, and the
+        // default-on-default comparison could not see that.
+        app.config.display.theme = "nord".to_string();
+        app.apply_session_update(SessionUpdate::Provider {
+            model: "elsewhere".to_string(),
+            base_url: "http://wire/v1".to_string(),
+            api_type: "anthropic".to_string(),
+        });
+        assert_eq!(app.config.api.model, "elsewhere");
+        assert_eq!(app.config.api.base_url, "http://wire/v1");
+        assert_eq!(
+            app.config.api.api_type,
+            dch_config::ApiType::Anthropic,
+            "the wire's protocol parsed and landed"
+        );
+        assert_eq!(
+            app.config.display.theme, "nord",
+            "only the [api] section moved — the live display stands"
+        );
+        app.apply_session_update(SessionUpdate::Provider {
+            model: "undeclared".to_string(),
+            base_url: "http://second/v1".to_string(),
+            api_type: "not-a-protocol".to_string(),
+        });
+        assert_eq!(app.config.api.model, "undeclared");
+        assert_eq!(app.config.api.base_url, "http://second/v1");
+        assert_eq!(
+            app.config.api.api_type,
+            dch_config::DchConfig::default().api.api_type,
+            "the unparsable protocol inherits the base's own kind, never the last selection's"
         );
     }
 

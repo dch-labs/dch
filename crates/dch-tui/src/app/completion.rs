@@ -15,10 +15,11 @@ impl TuiApp {
     /// Up and Down belong to the popup while it stands, and stepping
     /// applies the row it lands on into the composer — the same act a
     /// Tab press performs — so the highlighted row and the drafted
-    /// line are always the same choice. Enter needs no arm of its own
-    /// here: the row the arrows chose is already the composer's text,
-    /// so Enter falls through to the editor and submits what stands.
-    /// Everything else falls through to the editor untouched.
+    /// line are always the same choice. Enter has one arm of its own:
+    /// over a standing theme browse it names the highlighted row in
+    /// the composer before the key continues, so the submit carries
+    /// the browsed choice. Everything else falls through to the
+    /// editor untouched.
     pub(crate) fn completion_key(&mut self, key: KeyEvent) -> Option<bool> {
         if !self.completion_popup_live() {
             return None;
@@ -41,8 +42,9 @@ impl TuiApp {
     ///
     /// The popup's Enter arm reads this to decide whether the standing
     /// highlight represents the user's browsing choice — a theme the
-    /// palette is currently previewing that differs from the session's
-    /// own — so Enter can name it in the composer before submitting.
+    /// palette is currently previewing because the browse parked the
+    /// session's own to show it — so Enter can name it in the composer
+    /// before submitting.
     fn previewed_a_theme(&self) -> bool {
         self.browse.theme_before_browse.is_some()
             && self
@@ -84,11 +86,11 @@ impl TuiApp {
     ///
     /// A leading-slash line with more than nothing to offer, minus the
     /// sole candidate already fully spelled, minus a popup the user
-    /// dismissed with Esc at this exact draft (any edit re-arms it —
-    /// the stamp changes with the text). A cycle the keys are walking
-    /// overrides all of that: its own list stands, so stepping through
-    /// candidates with Tab or the arrows never collapses the popup to
-    /// the word just applied.
+    /// dismissed with Esc at this exact draft (any editor mutation
+    /// re-arms it — the stamp moves with the text and the caret
+    /// alike). A cycle the keys are walking overrides all of that:
+    /// its own list stands, so stepping through candidates with Tab or
+    /// the arrows never collapses the popup to the word just applied.
     pub(crate) fn popup_candidates(&self) -> Option<(String, Vec<String>)> {
         if self.completion.completion_dismissed == Some(self.composer.input.stamp()) {
             return None;
@@ -294,9 +296,10 @@ impl TuiApp {
     /// One Esc closes only the popup — the draft it stood over stays,
     /// so dismissing the menu never costs the half-typed line; the
     /// next Esc, with no popup standing, is the one that clears the
-    /// draft. While a run holds, Esc keeps its cancel-arm meaning
-    /// instead — this runs only on the idle branch. An empty composer
-    /// returns the key unhandled rather than claiming it.
+    /// draft. Under a run the popup and the draft still come first —
+    /// the same innermost order the idle branch takes — and only a
+    /// bare composer hands the press to the cancel ladder. An empty
+    /// composer returns the key unhandled rather than claiming it.
     pub(crate) fn esc_clears_or_dismisses(&mut self) -> bool {
         if self.completion_popup_live() {
             self.completion.completion_dismissed = Some(self.composer.input.stamp());
@@ -342,6 +345,7 @@ impl TuiApp {
             .as_ref()
             .map_or(0, |c| c.window_start);
         let mut carried_bare = false;
+        let mut held_the_line = false;
         let (mut prefix, mut candidates, mut index) = match self.completion.completion.clone() {
             Some(cycle) => {
                 if CompletionState::cycle_holds_the_line(&cycle, &line) {
@@ -356,6 +360,7 @@ impl TuiApp {
                             .unwrap_or(0)
                     };
                     carried_bare = cycle.bare;
+                    held_the_line = true;
                     (cycle.prefix, cycle.candidates, next)
                 } else {
                     self.fresh_completion(&line)
@@ -363,7 +368,7 @@ impl TuiApp {
             }
             None => self.fresh_completion(&line),
         };
-        if reverse && self.completion.completion.is_none() {
+        if reverse && !held_the_line {
             index = index.max(candidates.len().saturating_sub(1));
         }
         if !line.ends_with(' ')

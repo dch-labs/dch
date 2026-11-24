@@ -19,8 +19,9 @@ impl TuiApp {
     /// `/permissions` — the rules in force, the way to drop one or
     /// all, and the damage marker's one door out.
     ///
-    /// Bare lists configured and remembered rules, the gate's precedence
-    /// order in the listing's own order. `forget <n>` takes the numbered
+    /// Bare lists configured and remembered rules — config and
+    /// preset rows first, remembered allows then denies — numbered
+    /// for forget. `forget <n>` takes the numbered
     /// remembered rule out of the memory and out of the session's
     /// permissions file in one motion, so that work asks again the next
     /// time; `forget all` is the same motion over every remembered rule

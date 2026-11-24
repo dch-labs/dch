@@ -1013,9 +1013,11 @@ fn read_reply_byte(deadline: std::time::Instant) -> Option<u8> {
 /// The session's `splash_colors` choice, installed at app
 /// construction.
 ///
-/// `Auto` leaves the decision to the tmux table below; the forced
-/// modes are the user's override — the session that knows its own
-/// terminal best — and skip both the ask and the notice.
+/// `Auto` and `Truecolor` keep the original art — the choice is
+/// made once per process and never asked of the terminal; `Palette`
+/// takes the fixed vocabulary. The forced modes are the user's
+/// override — the session that knows its own terminal best — with no
+/// ask to skip and no notice to post.
 static SPLASH_COLORS: OnceLock<dch_config::SplashColors> = OnceLock::new();
 
 /// Record the configured splash color mode, before the first render.

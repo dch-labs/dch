@@ -1123,11 +1123,10 @@ pub struct DisplayConfig {
 
     /// Which color vocabulary the welcome splash paints in.
     ///
-    /// `auto` (the default) shows the original truecolors everywhere
-    /// they can reach the screen and falls back to the fixed-palette
-    /// rendition only behind a tmux client tmux itself names as one it
-    /// would convert; `truecolor` and `palette` force one rendition
-    /// unconditionally. See [`SplashColors`].
+    /// `auto` (the default) keeps the original truecolors everywhere
+    /// they can reach the screen; `truecolor` and `palette` force one
+    /// rendition unconditionally — the palette is an explicit opt-in,
+    /// never an automatic downgrade. See [`SplashColors`].
     pub splash_colors: SplashColors,
 
     /// Let the TUI capture the mouse.

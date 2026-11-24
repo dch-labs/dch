@@ -197,10 +197,13 @@ pub(crate) async fn apply_manual_compaction(
 /// forward, the observer state is shared (the same buffers the display
 /// drains), and every wire the session's build installed rides the same
 /// assembler the first build used. An empty api type inherits the
-/// running protocol; a spelled one must name a protocol the config
-/// knows, or the switch is refused whole rather than half-moving the
-/// endpoint. The context's config takes the settings the rebuild
-/// installed, so later rebuilds build on them.
+/// running protocol, and an empty base URL the live endpoint — the
+/// panel's absent marker for an entry that stated only the other
+/// half — so the two halves of an unstated entry resolve alike from
+/// the session that runs now; a spelled api type must name a protocol
+/// the config knows, or the switch is refused whole rather than
+/// half-moving the endpoint. The context's config takes the settings
+/// the rebuild installed, so later rebuilds build on them.
 pub(crate) async fn switch_provider(
     runner: &mut dch_loop::Runner,
     transcript: &TranscriptHandle,
@@ -224,7 +227,11 @@ pub(crate) async fn switch_provider(
     };
     let mut config = context.config_base.as_ref().clone();
     config.api.model = model;
-    config.api.base_url = base_url;
+    config.api.base_url = if base_url.is_empty() {
+        context.config.api.base_url.clone()
+    } else {
+        base_url
+    };
     config.api.api_type = protocol;
     let selected = config.api.model.clone();
     if config.select_model(Some(&selected)).is_err() {
@@ -1633,6 +1640,51 @@ mod tests {
             context.config.api.reasoning_effort.as_deref(),
             Some("low"),
             "the flag's dial survives the provider switch onto the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_switch_without_a_base_url_keeps_the_live_endpoint() {
+        // The panel's absent marker: an entry that overrode only the
+        // protocol sends an empty base_url, and the switch inherits
+        // the endpoint the session already runs on — the same
+        // convention the api_type half of the payload carries, or
+        // the client would rebuild against an empty URL.
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut base = unreachable_config();
+        base.models = vec![dch_config::ModelProfile {
+            model: "elsewhere".to_string(),
+            ..dch_config::ModelProfile::default()
+        }];
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(base),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: crate::session::sessions_dir(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        context.config.api.base_url = "http://127.0.0.1:9/v1".to_string();
+        let transcript = parked_transcript();
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::SwitchProvider {
+                model: "elsewhere".to_string(),
+                base_url: String::new(),
+                api_type: "openai".to_string(),
+            },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context.config.api.base_url, "http://127.0.0.1:9/v1",
+            "the absent marker inherits the live endpoint rather than emptying it"
         );
     }
 

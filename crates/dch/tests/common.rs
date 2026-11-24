@@ -54,8 +54,10 @@ struct CannedResponse {
 /// A canned provider endpoint on an ephemeral local port.
 ///
 /// Serves one response body per accepted connection, in the order they
-/// were scripted, and records every request body it receives — the
-/// recordings are how tests assert on what the model was shown (tool
+/// were scripted, and records every provider-turn request body it
+/// receives — session-title requests are answered from the canned
+/// title and withheld from the recording — the recordings are how
+/// tests assert on what the model was shown (tool
 /// results, resumed history, block messages) without touching the
 /// engine's internals. Each response closes the connection, so the
 /// provider client's keep-alive pool never couples two scripted turns
@@ -67,7 +69,8 @@ pub struct CannedServer {
     /// provider client dials this server and nothing else.
     port: u16,
 
-    /// Every request body received so far, in arrival order.
+    /// Every provider-turn request body received so far, in arrival
+    /// order.
     ///
     /// Shared with the accept thread, which appends as requests land;
     /// tests snapshot it to assert on what the model was shown.
@@ -1561,6 +1564,7 @@ fn connect_bounded(host: &str, port: u16) -> Option<TcpStream> {
 /// caller treats as "not listed here". Chunked transfer encoding —
 /// what Ollama actually answers with — is stripped before the body
 /// returns.
+///
 /// Issue one small POST and return its 200 body, dechunked if needed.
 ///
 /// The Ollama control endpoints (`/api/show` among them) take the

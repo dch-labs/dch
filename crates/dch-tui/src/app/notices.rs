@@ -144,9 +144,11 @@ impl TuiApp {
     ///
     /// Builds the block's verbosity-shaped summary line(s) and, when
     /// the call carries retained expansion data, prepends the fold
-    /// marker and appends the expanded detail. Every row the block
-    /// produced is registered under the call's id, so a press on any
-    /// of them resolves back to the call it belongs to.
+    /// marker and appends the expanded detail. Every row a block
+    /// with retained detail produced is registered under the call's
+    /// id, so a press on any of them resolves back to the call it
+    /// belongs to; an evicted block renders plain summary rows no
+    /// press resolves.
     pub(crate) fn push_tool_block_lines(
         &self,
         block: &ContentBlock,
@@ -512,8 +514,10 @@ pub(crate) struct ToolLane {
     /// The first attempt of an episode pushes a `System` row and
     /// records its index; later attempts of the same episode rewrite
     /// that row in place, so one rough patch reads as one line that
-    /// counts up. Rows are never removed, so the recorded indices
-    /// stay stable for the session's lifetime.
+    /// counts up. Stale entries are inert rather than absent:
+    /// episode ids come from a monotonic counter, so a retry that
+    /// lands after a clear always carries a fresh id and never
+    /// re-reads an index the clear orphaned.
     pub(crate) retry_row_index: HashMap<u64, usize>,
 }
 
@@ -575,8 +579,9 @@ fn expansion_lines(
 /// How many live thinking body lines render at most.
 ///
 /// The expanded live body keeps its trailing lines, bounding the
-/// per-frame wrap cost of an unbounded reasoning dump; the graduated
-/// block keeps everything.
+/// rendered rows an unbounded reasoning dump paints — the wrap
+/// itself still walks the whole body under the thinking lock; the
+/// graduated block keeps everything.
 const LIVE_THINKING_BODY_CAP: usize = 500;
 
 /// The placeholder shown for withheld reasoning.
@@ -621,7 +626,8 @@ pub(crate) fn marked_compaction_summary(history: &[loopctl::message::Message]) -
 /// inside the budget, the same measure every column fit keeps.
 /// `None` when the summary holds no content line at all.
 fn summary_preview_line(summary: &str, width: usize) -> Option<String> {
-    let line = summary
+    let clean = crate::tool_capture::sanitize_for_display(summary);
+    let line = clean
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with("## "))?;
@@ -704,7 +710,8 @@ pub(crate) fn compaction_notice_lines(
         if let Some(summary) = summary.as_deref().filter(|text| !text.is_empty()) {
             lines.push(Line::styled(String::new(), dim));
             let limit = usize::from(width).saturating_sub(2).max(1);
-            for source_line in summary.lines() {
+            let clean = crate::tool_capture::sanitize_for_display(summary);
+            for source_line in clean.lines() {
                 let trimmed = source_line.trim();
                 if trimmed.is_empty() {
                     lines.push(Line::styled(String::new(), dim));
@@ -1407,6 +1414,104 @@ mod tests {
     }
 
     #[test]
+    fn a_crafted_compaction_summary_bakes_clean_into_its_rows() {
+        // The pass's own words are producer-controlled prose. A
+        // summary carrying escape sequences must reach the rows as
+        // the words alone — the collapsed preview and the expanded
+        // body both. The pin reads the debris the old code left: the
+        // terminal drops the escape byte itself, so what painted was
+        // the sequence's parameter bytes beside the words, and the
+        // rows' width was measured on them.
+        let mut app = app();
+        app.push_message(TuiMessage::Compacted {
+            tokens_before: 16_686,
+            tokens_after: 4_231,
+            reason: "threshold".to_string(),
+            evicted: 7,
+            duration_ms: 312,
+            compactor: Some("qa".to_string()),
+            compression_ratio: Some(3.9),
+            // The OSC carries its BEL terminator: an unterminated
+            // string sequence rightly runs to the end of the text.
+            summary: Some("kept \u{1b}[2J the ledger\nand \u{1b}]11;?\u{07} this too".to_string()),
+            timestamp: chrono::Utc::now(),
+        });
+        for expanded in [false, true] {
+            app.expansion.expanded_compactions.clear();
+            if expanded {
+                app.expansion.expanded_compactions.insert("m0".to_string());
+            }
+            // The click's own half: the expansion repaints through a
+            // generation bump, or the bake keeps serving collapsed rows.
+            app.bake.conversation_generation = app.bake.conversation_generation.saturating_add(1);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+                .expect("terminal");
+            terminal.draw(|frame| app.render(frame)).expect("draw");
+            let painted = buffer_text(terminal.backend().buffer());
+            assert!(
+                !painted.contains("[2J") && !painted.contains("]11;?"),
+                "no escape parameter bytes paint as debris in the {} rows: {painted:?}",
+                if expanded { "expanded" } else { "collapsed" }
+            );
+            assert!(
+                painted.contains("kept") && painted.contains("the ledger"),
+                "the words on either side of the sequence stand: {painted:?}"
+            );
+            if expanded {
+                assert!(
+                    painted.contains("this too"),
+                    "the second line's words stand too: {painted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lone_carriage_return_in_a_summary_splits_before_the_preview_measures() {
+        // A lone carriage return inside a source line: the sanitizer
+        // folds it into a line break, so sanitizing after the split
+        // handed one "line" an embedded newline — the terminal then
+        // dropped the byte and glued the two halves into one word.
+        // Sanitizing the whole summary first makes the fold a real
+        // split: the preview reads the first half alone, and the
+        // expanded body shows the halves on their own rows.
+        let mut app = app();
+        app.push_message(TuiMessage::Compacted {
+            tokens_before: 16_686,
+            tokens_after: 4_231,
+            reason: "threshold".to_string(),
+            evicted: 7,
+            duration_ms: 312,
+            compactor: None,
+            compression_ratio: None,
+            summary: Some("head\rfoot".to_string()),
+            timestamp: chrono::Utc::now(),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let collapsed = buffer_text(terminal.backend().buffer());
+        assert!(
+            collapsed.contains("head") && !collapsed.contains("headfoot"),
+            "the collapsed preview reads the first half alone, never the glued pair: {collapsed:?}"
+        );
+        app.expansion.expanded_compactions.insert("m0".to_string());
+        app.bake.conversation_generation = app.bake.conversation_generation.saturating_add(1);
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let expanded = buffer_text(terminal.backend().buffer());
+        let head_row = expanded
+            .lines()
+            .any(|row| row.contains("head") && !row.contains("foot"));
+        let foot_row = expanded
+            .lines()
+            .any(|row| row.contains("foot") && !row.contains("head"));
+        assert!(
+            head_row && foot_row,
+            "the expanded body shows the halves on their own rows: {expanded:?}"
+        );
+    }
+
+    #[test]
     fn a_compaction_notice_renders_collapsed_and_expands_to_its_details() {
         let mut app = app();
         app.push_message(TuiMessage::Compacted {
@@ -1941,11 +2046,11 @@ mod tests {
 
     #[test]
     fn the_session_502_bakes_into_a_spacer_a_header_and_clean_rows() {
-        // The exact failure text session 1fab4451 recorded — CRLF
-        // pairs and the edge's HTML body included. The block must open
-        // on a row of its own, name the failure's facts in a header,
-        // and produce nothing a terminal would re-execute: every row
-        // control-character-free and bounded by the wrap width.
+        // A provider's HTML error page with CRLF pairs — the edge's
+        // body included. The block must open on a row of its own, name
+        // the failure's facts in a header, and leave none of the page's
+        // escape sequences behind: every row free of them and bounded
+        // by the wrap width.
         let raw = "API error: stream (stream failed before completing after 4 attempts: \
 HTTP error: HTTP 502: <html>\r\n<head><title>502 Bad Gateway</title></head>\r\n\
 <body bgcolor=\"white\">\r\n<center><h1>502 Bad Gateway</h1></center>\r\n\
