@@ -643,6 +643,40 @@ fn ctrl_c_ctrl_c_under_a_run_is_one_cancel_and_exit_action() {
     assert!(!app.is_quitting(), "nothing fires from stale intent");
 }
 #[test]
+fn ctrl_c_ctrl_c_after_a_rebuild_cancels_the_live_signal() {
+    // A runner rebuild — `/model`, `/resume`, a provider switch —
+    // swaps the shared cancel cell; the boxed canceller installed at
+    // startup still names the startup runner's signal. The
+    // confirming press must cancel the signal the live runner reads,
+    // not only the stale handle the closure captured.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let live = Arc::new(loopctl::cancel::CancelSignal::new());
+    kept.adopt_runner_handles(Arc::clone(&live), None);
+    let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&cancels);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock().expect("sink").push(());
+    }));
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+    assert!(
+        live.is_cancelled(),
+        "the confirming press cancels the signal the rebuild installed"
+    );
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        1,
+        "the installed sink still sees the fire"
+    );
+}
+#[test]
 fn the_ladder_press_raises_the_shutdown_flag_before_the_cancel() {
     // The exit's own cancel releases the driver's next claim: the
     // run resolves cancelled, and the driver reads the shutdown

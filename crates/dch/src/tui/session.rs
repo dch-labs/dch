@@ -337,6 +337,7 @@ pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Resu
     questions.abort();
     cancel_the_live_runner(&state);
     tear_down_driver_bounded(driver).await;
+    app.drain_late_graduations_at_exit();
     app.echo_rescued_corrections_at_exit();
     drop(app);
     signal_bridge.stop().await;

@@ -478,8 +478,8 @@ mod tests {
     fn a_wide_pane_seats_the_rung_its_width_deserves() {
         // The width governs: a pane wide enough for the w75 rung seats
         // it even when the pane is shorter than that, as long as the
-        // group still has its floor of room — the old proportional
-        // height budget used to shrink the picture on panes like this.
+        // group still has its floor of room — the seat never shrinks
+        // the picture on a wide, short pane.
         let subject = app();
         let area = ratatui::layout::Rect::new(0, 0, 120, 32);
         let shape = subject.welcome_shape(area).expect("a shape");
@@ -720,18 +720,21 @@ pub(crate) struct WelcomeShape {
     /// maximum so the block stays compact on wide terminals.
     pub(crate) block_width: u16,
 
-    /// The rows the splash band spends, art height or zero.
+    /// The rows the splash band spends: a seated rung's whole height,
+    /// or zero.
     ///
-    /// Zero when no scale fits; otherwise the rows the pane's height
-    /// allows of the chosen rung — the band's one row of spending,
-    /// trimmed never below the greeting's needs.
+    /// The picker seats only a rung whose whole height fits the pane's
+    /// row budget, so the band is exactly that rung's height or empty
+    /// — a rung that does not fit gives way to a smaller scale rather
+    /// than being trimmed.
     pub(crate) band_height: u16,
 
-    /// The rung rows the welcome shows, after the height trim.
+    /// The rung rows the welcome shows: the seated rung entire, or
+    /// zero.
     ///
-    /// A short pane shows fewer of the rung's rows — a shorter slice
-    /// of the same-wide fjord — so the art's width never follows the
-    /// pane's height.
+    /// The picker seats a rung whole or not at all, so no pane sees a
+    /// shorter slice of the fjord: the shown rows are the rung's full
+    /// height, and the art's height never follows the pane.
     pub(crate) rows_shown: u16,
 
     /// The rung rows cropped away above: always zero.

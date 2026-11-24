@@ -734,25 +734,31 @@ mod tests {
 
     #[test]
     fn a_superseded_copy_cannot_write_over_a_newer_one() {
-        // The reviewer's interleaving, made deterministic: the first
-        // copy holds the lane inside its own slow helper — proven by
-        // the marker that helper's first command writes, a command the
-        // lane itself orders before the sleep — while the second copy
-        // parks behind it, proven scheduled by its marker and not
-        // declined by its unfinished handle. Attempt three publishes
-        // while the second is parked; when the first's turn ends, the
-        // second's decline can only come from the check the lane
-        // grants, and the complete record is exactly the first and the
-        // newest: the overtaken copy's turn arrives superseded and
-        // writes nothing, and the newest copy's text is the last write
-        // the clipboard takes.
+        // The interleaving, made deterministic on signals
+        // rather than timers: the first copy holds the lane inside its
+        // own helper — proven by the marker that helper's first
+        // command writes, a command the lane itself orders before the
+        // wait — and goes on waiting, bounded well under the
+        // transport deadline, for a release file only the test
+        // creates, after both parked-worker proofs have run. While it
+        // waits, a correct implementation cannot finish a parked
+        // worker, so the `!is_finished` asserts cannot see a release
+        // the timing caused; attempt three publishes while the second
+        // is parked; and when the test releases the lane, the second's
+        // decline can only come from the check the lane grants. The
+        // complete record is exactly the first and the newest: the
+        // overtaken copy's turn arrives superseded and writes nothing,
+        // and the newest copy's text is the last write the clipboard
+        // takes.
         let dir = tempfile::tempdir().expect("pin dir");
         let out = dir.path().join("clipboard");
         let held = dir.path().join("one-holds-the-lane");
+        let release = dir.path().join("release-the-lane");
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         let one = {
             let out = out.clone();
             let held = held.clone();
+            let release = release.clone();
             let attempts = Arc::clone(&attempts);
             std::thread::spawn(move || {
                 let mut marker = std::process::Command::new("sh");
@@ -761,8 +767,21 @@ mod tests {
                     .arg("printf x > \"$1\"")
                     .arg("sh")
                     .arg(&held);
-                let mut chain = vec![marker];
-                chain.extend(appending_chain(&out, "one", "sleep 0.2; "));
+                // A bounded vigil — one hundred 10 ms looks, about a
+                // second, comfortably under the 1.5 s transport
+                // deadline — so a test that forgets to release fails
+                // the copy rather than wedging the lane past its turn.
+                let mut wait_for_release = std::process::Command::new("sh");
+                wait_for_release
+                    .arg("-c")
+                    .arg(
+                        "i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; \
+                         i=$((i+1)); done",
+                    )
+                    .arg("sh")
+                    .arg(&release);
+                let mut chain = vec![marker, wait_for_release];
+                chain.extend(appending_chain(&out, "one", ""));
                 fenced_process_writes(1, &attempts, chain, "")
             })
         };
@@ -795,6 +814,7 @@ mod tests {
             wait_parked_at_the_lane(&job, &scheduled);
             job
         };
+        std::fs::write(&release, b"x").expect("the lane is released");
         for job in [one, queued, newest] {
             job.join().expect("job finishes");
         }

@@ -90,15 +90,11 @@ fn a_tmux_pane_asks_nothing_and_writes_no_terminal_state() {
         "no cursor tint from a pane: {startup:?}"
     );
     submit(&mut session, "/theme github_light");
-    std::thread::sleep(Duration::from_millis(900));
-    let switched = session.snapshot();
+    let switched = await_raw(&session, "48;2;255;255;255m", Duration::from_secs(5));
+    let tail = &switched[startup.len().min(switched.len())..];
     assert!(
-        !switched.contains("\x1b]11;rgb:"),
-        "the switch writes no default either: {switched:?}"
-    );
-    assert!(
-        !switched.contains("\x1b]12;"),
-        "no cursor tint on the switch: {switched:?}"
+        !tail.contains("\x1b]11;rgb:") && !tail.contains("\x1b]12;"),
+        "the switch repaints the canvas on the cells and writes no default, no cursor tint: {tail:?}"
     );
     let (_, drained) = session.quit_and_read(Duration::from_secs(20));
     assert!(

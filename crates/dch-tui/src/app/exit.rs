@@ -176,7 +176,6 @@ impl TuiApp {
         if !cancelled_now && self.exit.partial_reply.is_none() {
             return;
         }
-        let before = self.conversation.len();
         drop(terminal.draw(|frame| self.render(frame)));
         self.drain_shared_state();
         let graduated_from = self.exit.partial_reply_since.min(self.conversation.len());
@@ -219,7 +218,8 @@ impl TuiApp {
                 });
             }
         }
-        let record_landed = self.conversation.get(before..).is_some_and(|landed| {
+        let record_since = self.exit.partial_reply_since.min(self.conversation.len());
+        let record_landed = self.conversation.get(record_since..).is_some_and(|landed| {
             landed
                 .iter()
                 .any(|message| matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled"))
@@ -231,6 +231,25 @@ impl TuiApp {
             });
         }
         self.flush_turn_end();
+    }
+
+    /// Drain what the driver published after the settle's own drain.
+    ///
+    /// The exit's stop drains the shared cells once and flushes, but
+    /// the driver task lives on through its bounded teardown — up to
+    /// half a second in which a tool that completed during the
+    /// shutdown lands its graduation in the cells with no frame left
+    /// to drain it, and a graduation no frame drains never reaches the
+    /// persisted transcript. The teardown's end is the moment the
+    /// stragglers are all in: this drain runs there, ahead of the
+    /// rescued corrections' echo whose flush is among the
+    /// transcript's last, so everything the driver published before
+    /// the process leaves lands in the conversation the final persist
+    /// writes. Public because the session's teardown owns the moment
+    /// — the app's own exit path already drained, and only the host
+    /// knows when the driver after it has settled.
+    pub fn drain_late_graduations_at_exit(&mut self) {
+        self.drain_shared_state();
     }
 
     /// Snapshot the run's unfinished lanes.
@@ -580,6 +599,42 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_record_drained_before_the_settle_is_not_duplicated() {
+        // The press fires the cancel and the run loop draws one more
+        // frame before the settle runs: the driver resolves the cancel
+        // inside that window, and the ordinary frame drains the
+        // "Agent cancelled" record into the conversation. The settle's
+        // guard reads from the press's snapshot — the same window the
+        // graduation check uses — so the landed record stands alone.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half said");
+        app.snapshot_exit_state_before_cancel();
+        app.conversation.push(TuiMessage::Error {
+            text: "Agent cancelled".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+        stop_as_a_failed_turn_does(&mut app);
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        let records = app
+            .conversation
+            .iter()
+            .filter(|message| {
+                matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled")
+            })
+            .count();
+        assert_eq!(
+            records, 1,
+            "the record an ordinary frame landed stands alone beside the snapshot"
+        );
+        assert_eq!(
+            reply_texts(&app),
+            ["half said"],
+            "the press's snapshot still lands as the turn's reply row"
+        );
+    }
+
+    #[test]
     fn a_tool_only_graduation_does_not_stand_in_for_the_reply() {
         // A tool in flight graduates in the cancel's drain: its row is
         // an assistant message carrying only a tool block. That is
@@ -670,15 +725,13 @@ mod tests {
 
     #[test]
     fn a_reasoning_only_graduation_keeps_the_snapshots_words() {
-        // The failed turn's own graduation: its reasoning lands through
-        // an ordinary frame — a thinking-only row, the text cleared
-        // without graduating — between the confirming press and the
-        // stop. The old check read that row as the reply graduating and
-        // dropped the snapshot, so the words the user watched stream
-        // never reached the transcript. The stop now reads graduation
-        // by content: the snapshot's words land, its reasoning does not
-        // — the graduated row already carries it — so nothing appears
-        // twice and nothing vanishes.
+        // Graduation read by content: the failed turn's own reasoning
+        // lands through an ordinary frame — a thinking-only row, the
+        // text cleared without graduating — between the confirming
+        // press and the stop. The stop supersedes only what the landed
+        // row carries: the snapshot's words land, its reasoning does
+        // not — the graduated row already carries it — so nothing
+        // appears twice and nothing vanishes.
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         seed_partial_reply(&mut app, "half said");
         app.state
@@ -723,6 +776,50 @@ mod tests {
             thinkings,
             ["thought first"],
             "the reasoning appears once, in the row that graduated it"
+        );
+    }
+
+    #[test]
+    fn a_late_graduation_reaches_the_transcript_after_the_teardown() {
+        // The window the teardown owns: the stop drained and flushed,
+        // the driver lives on through its bounded teardown, and a tool
+        // completing in that window publishes its graduation into the
+        // shared cells with no frame left to drain it. The drain that
+        // follows the teardown lands it in the conversation the final
+        // persist writes.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half said");
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        assert!(
+            app.conversation.iter().all(|message| {
+                !matches!(message, TuiMessage::Assistant { blocks, .. }
+                    if blocks.iter().any(|block| matches!(block, ContentBlock::Tool { .. })))
+            }),
+            "before the late publication, no tool row stands"
+        );
+        // The driver's late publication, as the teardown window sees it.
+        app.state
+            .graduations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Graduation::Tool(ToolResultDisplay {
+                name: "Bash".to_string(),
+                call_id: "call_late".to_string(),
+                is_error: false,
+                duration: std::time::Duration::ZERO,
+                input_summary: "cargo test".to_string(),
+                output_preview: "done".to_string(),
+                full_input: "{}".to_string(),
+                full_output: "done".to_string(),
+            }));
+        app.drain_late_graduations_at_exit();
+        assert!(
+            app.conversation.iter().any(|message| {
+                matches!(message, TuiMessage::Assistant { blocks, .. }
+                    if blocks.iter().any(|block| matches!(block, ContentBlock::Tool { .. })))
+            }),
+            "the graduation published during the teardown reaches the transcript"
         );
     }
 

@@ -1310,9 +1310,7 @@ fn arm_fallback(primary: &str, fallback: &str) -> Result<FallbackManager, Runner
 /// defaults own (the hint-honouring policy, the escalation threshold,
 /// the first-event window) stays stock: the host's lever is the floor
 /// alone, the one number the provider's quota window — not the
-/// transport — should decide. Lifted out of the runner's construction
-/// so the handler a session runs can be read back and pinned without
-/// standing a session up.
+/// transport — should decide.
 fn stream_handler(runner: &dch_config::RunnerConfig) -> StreamHandler {
     let timeout_config = StreamTimeoutConfig {
         total_stream_timeout: std::time::Duration::from_secs(runner.turn_timeout_secs),
@@ -1625,7 +1623,7 @@ mod tests {
 
     #[test]
     fn a_floor_past_the_library_ceiling_lifts_the_cap_with_it() {
-        // The reviewer's case: a 120-second floor against the library's
+        // A 120-second floor against the library's
         // 60-second cap. Left to the stock cap, the handler would
         // refuse the config and quietly run its defaults — a 5-second
         // first retry where the host asked for 120. The cap meets the

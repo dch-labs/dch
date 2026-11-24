@@ -146,9 +146,7 @@ impl TuiApp {
                     if self.quit.armed {
                         self.exit.shutdown_flag.store(true, Ordering::SeqCst);
                         self.snapshot_exit_state_before_cancel();
-                        if let Some(cancel) = &self.exit.run_canceller {
-                            cancel();
-                        }
+                        self.fire_cancel();
                         self.post_notice("Agent cancelled".to_string());
                         self.quit.requested = true;
                     } else {

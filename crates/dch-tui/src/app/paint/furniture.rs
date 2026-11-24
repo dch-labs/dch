@@ -551,12 +551,11 @@ impl TuiApp {
     /// id is its tail, right-aligned a cell in from the right edge
     /// on the bar's row: the footer's middle, vertically centered
     /// between the air above and the numbers below. The composer's
-    /// state tag no longer rides here —
-    /// it moved to the identity row inside the composer — so the
-    /// footer is all session, no draft state. Both rows sit on the
-    /// themed bar colors, and an id without the room to clear the bar
-    /// is forgone rather than run into it. A chunk allotted no rows
-    /// renders nothing — the bar never paints a row another pane
+    /// state tag rides the identity row inside the composer, not
+    /// here — the footer is all session, no draft state. Both rows sit
+    /// on the themed bar colors, and an id without the room to clear
+    /// the bar is forgone rather than run into it. A chunk allotted no
+    /// rows renders nothing — the bar never paints a row another pane
     /// owns.
     pub(in crate::app) fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {

@@ -86,14 +86,13 @@ fn post_run_error(state: &TuiObserverState, err: &loopctl::error::LoopError) {
 /// The notice a rate-limit escalation posts beside its error row.
 ///
 /// `None` for every failure but the one whose next step is the
-/// user's. An escalation means the retry ladder is spent — the
-/// observed aftermath of both session deaths was a retry inside a
-/// minute, re-running the same dead ladder — so the advice says how
-/// long to wait: the provider's own window when its last hint named
-/// one, a minute or two when it named none. The fallback sentence
-/// rides only when a fallback model is actually armed, and says what
-/// the breaker really does — repeated failures, not the next turn,
-/// reroute the session. The error row keeps the provider's facts
+/// user's. An escalation means the retry ladder is spent, so the
+/// advice says how long to wait: the provider's own window when its
+/// last hint named one, a minute or two when it named none — an
+/// immediate retry re-runs the same dead ladder. The fallback
+/// sentence rides only when a fallback model is actually armed, and
+/// states what the breaker really does: it decides where the turns
+/// that follow run. The error row keeps the provider's facts
 /// verbatim; the notice carries the part no payload spells: what to
 /// do next.
 fn rate_limit_escalation_notice(
@@ -122,7 +121,8 @@ fn rate_limit_escalation_notice(
             .to_string(),
     };
     let fallback = if fallback_armed {
-        " Repeated rate-limiting will route the turns that follow to the fallback model."
+        " The failure rides the model's breaker; with a fallback model configured, \
+         the breaker decides where the turns that follow run."
     } else {
         ""
     };
@@ -135,10 +135,9 @@ fn rate_limit_escalation_notice(
 ///
 /// The verbatim error row the transcript keeps, plus — for the one
 /// failure whose remedy lives outside the session — the notice that
-/// names it, on the lane the transient notice row reads. Split from
-/// the driver loop's error arm so the pairing is a seam a pin can
-/// drive: the row and the notice land together or the row lands
-/// alone, and nothing else changes.
+/// names it, on the lane the transient notice row reads. The row and
+/// the notice land together or the row lands alone, and nothing else
+/// changes.
 fn land_run_error(
     state: &TuiObserverState,
     session_tx: &mpsc::UnboundedSender<SessionUpdate>,
@@ -671,13 +670,13 @@ mod tests {
 
     #[test]
     fn an_escalation_notice_names_the_facts_and_the_next_step() {
-        // The session's own shape first: the hintless escalation, the
-        // one both session deaths looked like. The notice carries the
-        // payload's facts — four retries, no Retry-After — and advice
-        // that matches them: a generic minute-or-two, because the
-        // provider named no window. With a fallback model armed, the
-        // routing sentence rides along and says what the breaker
-        // really does — repeated failures reroute, not the next turn.
+        // The hintless escalation: the notice carries the payload's
+        // facts — four retries, no Retry-After — and advice that
+        // matches them: a generic minute-or-two, because the provider
+        // named no window. With a fallback model armed, the routing
+        // sentence rides along and holds whoever the breaker is
+        // currently serving: it decides, it does not promise a
+        // destination.
         let notice = rate_limit_escalation_notice(
             &loopctl::error::LoopError::RateLimitEscalation {
                 attempts: 4,
@@ -690,7 +689,7 @@ mod tests {
             notice.contains("4 retries")
                 && notice.contains("no Retry-After")
                 && notice.contains("Wait a minute or two")
-                && notice.contains("Repeated rate-limiting")
+                && notice.contains("breaker decides")
                 && notice.contains("fallback model"),
             "the notice names the facts, the honest routing, and the next step: {notice}"
         );
@@ -709,9 +708,8 @@ mod tests {
             "no fallback armed, no routing claimed: {bare}"
         );
         // A hinted escalation takes its advice from the hint: the wait
-        // is the provider's own window, in seconds, not the generic
-        // minute-or-two — an hour-long quota window used to tell the
-        // user to come back in two minutes.
+        // is the provider's own window, in seconds, never the generic
+        // minute-or-two.
         let hinted = rate_limit_escalation_notice(
             &loopctl::error::LoopError::RateLimitEscalation {
                 attempts: 3,
@@ -791,6 +789,88 @@ mod tests {
         assert!(
             plain_rx.try_recv().is_err(),
             "a plain failure posts no notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escalated_run_posts_the_notice_because_the_config_arms_a_fallback() {
+        // The loop derives the notice's routing sentence from
+        // `api.fallback_model` itself, not from a caller's guess: a
+        // throttled endpoint — 429s without `Retry-After`, answered on
+        // every attempt — with a fallback configured must reach the
+        // session channel as exactly one notice carrying the breaker
+        // sentence.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback throttle");
+        let port = listener
+            .local_addr()
+            .expect("the throttle has an address")
+            .port();
+        let _server = std::thread::spawn(move || {
+            for accepted in listener.incoming() {
+                let Ok(mut stream) = accepted else {
+                    continue;
+                };
+                let mut probe = [0_u8; 512];
+                let _read = std::io::Read::read(&mut stream, &mut probe);
+                let body = "{\"error\":{\"message\":\"rate limit exceeded\"}}";
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _written = std::io::Write::write_all(&mut stream, response.as_bytes());
+                let _flushed = std::io::Write::flush(&mut stream);
+            }
+        });
+        let mut config = unreachable_config();
+        config.api.base_url = format!("http://127.0.0.1:{port}");
+        config.api.fallback_model = Some("test-fallback".to_string());
+        config.runner.rate_limit_delay_secs = 1;
+        let dir = tempfile::tempdir().expect("runner tempdir");
+        let runner = dch_loop::Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("a runner against the loopback throttle");
+        let (observer, state) = TuiObserverState::new().into_observer();
+        drop(observer);
+        let (tx, rx) = mpsc::unbounded_channel();
+        queue_prompt(&state, &tx, "do a thing");
+        drop(tx);
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        state.adopt_runner_handles(runner.cancel_signal(), None);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_driver_loop(
+                runner,
+                rx,
+                DriverContext {
+                    config: config.clone(),
+                    config_base: Arc::new(config),
+                    workdir: dir.path().to_path_buf(),
+                    sessions_root: crate::session::sessions_dir(),
+                    state: state.clone(),
+                    shutting_down: shutdown_flag(false),
+                    lanes: InteractiveLanes::detached(),
+                    overrides: RunOverrides::default(),
+                },
+                parked_transcript(),
+                session_tx,
+            ),
+        )
+        .await
+        .expect("the throttled run resolves the loop");
+        let SessionUpdate::Notice { text } = session_rx
+            .try_recv()
+            .expect("the wired loop posts the notice")
+        else {
+            panic!("the escalation's update is a notice");
+        };
+        assert!(
+            text.contains("breaker decides"),
+            "the routing sentence rides because the config armed the fallback: {text}"
+        );
+        assert!(
+            session_rx.try_recv().is_err(),
+            "one escalation posts one notice"
         );
     }
 
