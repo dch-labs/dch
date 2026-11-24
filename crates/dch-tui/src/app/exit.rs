@@ -469,7 +469,12 @@ pub(crate) struct ExitState {
     /// True only between the arming press and the Esc that confirms
     /// it or any other key that stands it down — cancel is a
     /// deliberate double press, so one stray Esc cannot kill a run
-    /// mid-flight.
+    /// mid-flight. The arm also dies with the run it was armed
+    /// against: the drain that lands a run's end retires it, because
+    /// a queued claim can start the next run with no key press and no
+    /// yield between the two — the running flag is back up before any
+    /// drain could read it down, and the graduation is what outlives
+    /// that flip.
     pub(crate) cancel_arm: bool,
 
     /// The unfinished lanes as they stood when the exit's cancel

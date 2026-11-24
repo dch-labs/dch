@@ -625,10 +625,9 @@ mod tests {
     fn the_review_projection_keeps_distinct_inputs_distinct() {
         // Two strings differing only by a composition input strip to
         // one preview, so a permission sheet could not tell the scopes
-        // or commands apart. The
-        // review walk renders each removed input as its escape, and
-        // the previews stay distinct while plain text passes through
-        // untouched.
+        // or commands apart. The review walk renders each removed
+        // input as its escape, and the previews stay distinct while
+        // plain text passes through untouched.
         let bare = "echo '\u{2714}'";
         let selected = "echo '\u{2714}\u{fe0f}'";
         assert_eq!(for_display(bare), for_display(selected));

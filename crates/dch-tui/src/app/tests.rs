@@ -4266,10 +4266,10 @@ fn the_cost_command_agrees_with_the_bar_at_an_odd_window() {
 fn a_live_model_switch_that_fails_its_save_says_it_stands_live() {
     // A model switch is live the moment the loop takes it, so a failed
     // config save must not claim the value "was never applied" — the
-    // restart-class phrasing every other key's failure carries. The save
-    // is made to fail against a path
-    // a file already occupies, and the notice names the truth: the
-    // switch is live, the save is what failed.
+    // restart-class phrasing every other key's failure carries. The
+    // save is made to fail against a path a file already occupies, and
+    // the notice names the truth: the switch is live, the save is what
+    // failed.
     let mut subject = app();
     let occupied = tempfile::NamedTempFile::new().expect("a file where the dir should be");
     subject.config_writes.config_persist_dir = Some(occupied.path().to_path_buf());

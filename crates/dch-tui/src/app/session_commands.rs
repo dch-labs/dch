@@ -2290,6 +2290,13 @@ mod tests {
             app.host.submit_tx.is_none(),
             "fixture premise: no driver answers the clear"
         );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert!(
+            app.bake.conversation_baked_through >= 1,
+            "fixture premise: the conversation about to be cleared rendered a warm bake"
+        );
         let out = command_output(&mut app, "/clear");
         assert!(out.contains("session cleared"), "the clear ran: {out:?}");
         assert!(

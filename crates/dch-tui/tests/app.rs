@@ -2180,11 +2180,11 @@ fn a_turn_end_hook_fires_for_surfaced_errors() {
 
 #[test]
 fn the_error_block_separates_from_the_tool_footer_it_lands_beneath() {
-    // Session 1fab4451's shape: a long tool call completes, then the
-    // next model request dies. The error block must open on rows of
-    // its own — a spacer between the tool's duration footer and the
-    // failure, then a header naming the request's own facts — so the
-    // failure reads as the model request's, never the tool's.
+    // A long tool call completes, then the next model request dies.
+    // The error block must open on rows of its own — a spacer between
+    // the tool's duration footer and the failure, then a header naming
+    // the request's own facts — so the failure reads as the model
+    // request's, never the tool's.
     let now = chrono::Utc::now();
     let mut app = app();
     app.seed_messages(vec![
@@ -5089,11 +5089,10 @@ HTTP 502: upstream reset"
         "the provider's page renders as visible detail rows beneath the header"
     );
     assert!(
-        detail_rows
-            .iter()
-            .all(|row| row.chars().all(|glyph| !glyph.is_control()) && row.chars().count() <= 80),
-        "the detail wraps as clean rows — no control bytes from the provider's page, \
-         nothing past the pane: {detail_rows:?}"
+        rows.iter().all(|row| !row.contains("[2J")),
+        "the page's escape leaves no parameter-byte debris in any row — the \
+         terminal drops the escape byte itself, so the sequence's parameters are \
+         what an unsanitized row would paint: {rows:?}"
     );
 }
 

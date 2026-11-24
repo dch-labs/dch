@@ -145,8 +145,7 @@ pub(in crate::app) fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str 
 /// cannot land its text over a newer copy's transport delivery; an
 /// escape-only copy made after the helper was dropped writes outside
 /// the lane and stands on its own. The caller-stamped `attempt` rides
-/// onto
-/// the verdict unchanged. The transports' verdict lands as a
+/// onto the verdict unchanged. The transports' verdict lands as a
 /// follow-up notice through the render wake this pings; until then
 /// the returned escape result is all the caller can honestly claim.
 /// Failures stay silent per attempt: a copy that cannot be delivered

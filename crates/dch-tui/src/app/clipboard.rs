@@ -1283,11 +1283,14 @@ mod tests {
             }],
             ..dch_config::DchConfig::default()
         };
-        let mut app = TuiApp::new(base);
-        // A display value the base never stated, the way a `/theme`
-        // change leaves the live config: a regression that replaced
-        // the whole config with the base would drop it, and the
-        // default-on-default comparison could not see that.
+        let mut app = TuiApp::new(base.clone());
+        app.set_config_base(base);
+        // A display value the installed base never stated, the way a
+        // `/theme` change leaves the live config: a regression that
+        // replaced the whole config with the base would drop it. The
+        // base is installed first on purpose — left to materialize at
+        // its first selection, the panel would snapshot the live
+        // theme into it, and the comparison could not see the drop.
         app.config.display.theme = "nord".to_string();
         app.apply_session_update(SessionUpdate::Provider {
             model: "elsewhere".to_string(),
