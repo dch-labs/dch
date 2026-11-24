@@ -639,6 +639,10 @@ impl TuiApp {
     /// A prompt open in the composer for editing belongs to the waiting
     /// section no longer: its slot is retired first, or the same words
     /// would reach the model now *and* run again from the queue later.
+    /// Retired words are a saved prompt's body, so their delivery takes
+    /// the literal path — the same words Enter would have saved into the
+    /// slot, never the command they happen to spell — while a draft typed
+    /// here steers the ordinary way.
     ///
     /// A draft of nothing but blanks is refused, exactly as Enter refuses it:
     /// the chord sends what Enter would send, and Enter sends nothing here.
@@ -657,15 +661,22 @@ impl TuiApp {
             return true;
         }
         let text = self.composer.input.text().to_string();
-        if let QueueMode::Editing { id } = self.queue.queue_mode {
+        let retired_slot = if let QueueMode::Editing { id } = self.queue.queue_mode {
             self.remove_queued(id);
             self.leave_queue_edit();
             self.clamp_queue_view();
             self.release_queue_if_empty();
-        }
+            true
+        } else {
+            false
+        };
         self.composer.input.clear();
         self.composer.input.remember(text.clone());
-        self.deliver_guidance(text);
+        if retired_slot {
+            self.deliver_guidance_literal(text);
+        } else {
+            self.deliver_guidance(text);
+        }
         true
     }
 
@@ -774,10 +785,11 @@ impl TuiApp {
     ///
     /// The literal delivery half of the submission surface: whatever
     /// the text starts with, it joins the conversation as the user's
-    /// words. Queue-originated fallbacks use this so a saved `/clear`
-    /// reaches the model as prompt text rather than clearing the
-    /// session.
-    fn submit_literal(&mut self, text: String) {
+    /// words. The queue-originated fallbacks use it — the steer of a
+    /// saved prompt and the correction whose channel refused — so a
+    /// saved `/clear` reaches the model as prompt text rather than
+    /// clearing the session.
+    pub(crate) fn submit_literal(&mut self, text: String) {
         if self.host.submit_tx.is_some() {
             let was_empty = self.queued_len() == 0;
             let idle = self.state.live_claim.load(Ordering::SeqCst) == u64::MAX

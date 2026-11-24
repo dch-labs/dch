@@ -108,13 +108,15 @@ impl TuiApp {
     /// already landed and still stands as the newest claim is taken out
     /// and the fix runs in its place, no cancel needed.
     /// With no driver (or a channel nobody listens to) there is no turn
-    /// to cut and nothing to run it, so the correction goes into the
-    /// transcript the way any prompt does when this app is standing
-    /// alone. The named turn in flight is stopped, not waited out: the
-    /// correction is sent first and the runner's cancel raised beside
-    /// it, so a superseded turn stops spending its run on wording the
-    /// user has already replaced — the driver clears the signal before
-    /// the corrected turn starts.
+    /// to cut and nothing to run it, so the corrected wording goes into
+    /// the transcript the way any prompt does when this app is standing
+    /// alone. Those words are a saved prompt's body, so the fallback
+    /// delivers them literally — the command they happen to spell is the
+    /// user's words, never a dispatch. The named turn in flight is
+    /// stopped, not waited out: the correction is sent first and the
+    /// runner's cancel raised beside it, so a superseded turn stops
+    /// spending its run on wording the user has already replaced — the
+    /// driver clears the signal before the corrected turn starts.
     pub(crate) fn correct_claimed(&mut self, id: u64, text: String) {
         let taken = self.host.submit_tx.as_ref().is_some_and(|tx| {
             tx.send(Submission::Correct {
@@ -134,7 +136,7 @@ impl TuiApp {
                 }
             }
         } else {
-            self.submit_text(text);
+            self.submit_literal(text);
         }
     }
 

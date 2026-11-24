@@ -3827,6 +3827,100 @@ fn a_refused_guide_delivers_a_slash_spelled_prompt_as_words() {
 }
 
 #[test]
+fn a_steer_of_an_open_edit_delivers_the_saved_words_literally() {
+    // The steer chord over an edit: the composer holds a saved
+    // prompt's body, so retiring its slot does not make the words the
+    // composer's own. A steer that finds nothing to steer into — the
+    // run ended before a boundary could read the words — falls back to
+    // the prompt's own turn, and that fallback delivers literally: a
+    // body spelling `/clear` reaches the conversation as the user's
+    // words, never as the command it spells.
+    use crate::message::TuiMessage;
+    let mut subject = app();
+    subject.push_message(TuiMessage::System {
+        text: "a row the session keeps".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    subject.push_queued("/clear".to_string());
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 0;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)));
+    assert!(
+        matches!(subject.queue.queue_mode, QueueMode::Editing { .. }),
+        "fixture premise: the edit stands open on the composer"
+    );
+    subject
+        .state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(subject.steer_now(), "the steer chord takes the press");
+    assert_eq!(
+        subject.queued_len(),
+        0,
+        "the retired slot's words were delivered once"
+    );
+    assert!(
+        subject.conversation.iter().any(|message| match message {
+            TuiMessage::User { text, .. } => text == "/clear",
+            _ => false,
+        }),
+        "the retired prompt's words land as the user's own"
+    );
+    assert!(
+        subject.conversation.iter().any(|message| match message {
+            TuiMessage::System { text, .. } => text == "a row the session keeps",
+            _ => false,
+        }),
+        "the command the words spelled never ran — the history stands"
+    );
+}
+
+#[test]
+fn a_correction_the_channel_refuses_is_delivered_literally() {
+    // The gone-arm of an edit commit: the run claimed the prompt while
+    // its body stood in the composer, and the correction has no driver
+    // left to take it. The corrected wording is still a saved prompt's
+    // body, so the channel-less fallback delivers the words rather than
+    // parsing them: a body spelling `/clear` cannot clear the session
+    // in the very act of being corrected.
+    use crate::message::TuiMessage;
+    let mut subject = app();
+    subject.push_message(TuiMessage::System {
+        text: "a row the session keeps".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let id = subject.push_queued("/clear".to_string());
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 0;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)));
+    let _claimed = subject.remove_queued(id);
+    assert_eq!(
+        subject.queue_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(true),
+        "the save chord reaches the open edit"
+    );
+    assert_eq!(
+        subject.queued_len(),
+        0,
+        "the claimed slot's correction was delivered, not re-queued"
+    );
+    assert!(
+        subject.conversation.iter().any(|message| match message {
+            TuiMessage::User { text, .. } => text == "/clear",
+            _ => false,
+        }),
+        "the corrected words land as the user's own"
+    );
+    assert!(
+        subject.conversation.iter().any(|message| match message {
+            TuiMessage::System { text, .. } => text == "a row the session keeps",
+            _ => false,
+        }),
+        "the command the words spelled never ran — the history stands"
+    );
+}
+
+#[test]
 fn the_cost_command_agrees_with_the_bar_at_an_odd_window() {
     // S1's contract, pinned at the number: `/cost` reads the same
     // snapshot the context bar draws from and rounds it the same way,
