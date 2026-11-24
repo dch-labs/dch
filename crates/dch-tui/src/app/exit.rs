@@ -4,6 +4,7 @@
 
 use super::TuiApp;
 use crate::message::{ContentBlock, TuiMessage};
+use crate::observer::Graduation;
 use std::sync::Arc;
 
 impl TuiApp {
@@ -114,8 +115,9 @@ impl TuiApp {
         self.flush_turn_end();
     }
 
-    /// Arm the exit's pre-cancel snapshots: the partial reply and the
-    /// waiting prompts exactly as they stand at this instant.
+    /// Arm the exit's pre-cancel snapshots: the partial reply, the
+    /// waiting prompts, and the row boundary the stop's own record
+    /// is judged from, exactly as each stands at this instant.
     ///
     /// Both captures must precede the cancel an exit fires. The
     /// failed-turn observer clears the streaming buffer without
@@ -123,9 +125,13 @@ impl TuiApp {
     /// cancel reads the wreckage rather than the words; and the
     /// driver's cancel handling can requeue a prompt the run already
     /// claimed, so a queue read after the cancel double-counts it.
-    /// Called at the moment the exit is confirmed, before any cancel
-    /// leaves the display.
+    /// The boundary is armed whatever the lanes carried — a tool-only
+    /// run snapshots no partial, and the stop still needs its own
+    /// edge to judge its record against, so an earlier turn's cancel
+    /// row cannot stand in for this stop's. Called at the moment the
+    /// exit is confirmed, before any cancel leaves the display.
     pub(crate) fn snapshot_exit_state_before_cancel(&mut self) {
+        self.exit.stop_since = Some(self.conversation.len());
         let blocks = self.capture_live_lanes();
         if !blocks.is_empty() {
             self.exit.partial_reply_since = self.conversation.len();
@@ -160,11 +166,19 @@ impl TuiApp {
     /// stopped before this moment still owes its record — the
     /// snapshot exists precisely for the press that cancelled it — so
     /// only an idle exit, with neither a run to stop nor a snapshot
-    /// to land, returns without writing.
+    /// to land, returns without writing. The record's own search
+    /// reads from the boundary the press armed — or the settle's
+    /// start, when no press armed one — rather than the reply
+    /// watermark, which a tool-only run leaves stale: only rows this
+    /// stop could have landed satisfy it, so an earlier turn's
+    /// cancel row never suppresses this stop's record while a record
+    /// the ordinary frame drained between the press and the settle
+    /// still counts and is not duplicated.
     pub fn settle_exit_stop(
         &mut self,
         terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
     ) {
+        self.exit.stop_since.get_or_insert(self.conversation.len());
         if self.exit.partial_reply.is_none() {
             let blocks = self.capture_live_lanes();
             if !blocks.is_empty() {
@@ -211,6 +225,9 @@ impl TuiApp {
                 blocks
             };
             if !kept.is_empty() {
+                self.exit.snapshot_kept_reasoning = kept
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Thinking { .. }));
                 self.conversation.push(TuiMessage::Assistant {
                     blocks: kept,
                     timestamp: chrono::Utc::now(),
@@ -218,7 +235,11 @@ impl TuiApp {
                 });
             }
         }
-        let record_since = self.exit.partial_reply_since.min(self.conversation.len());
+        let record_since = self
+            .exit
+            .stop_since
+            .unwrap_or(self.exit.partial_reply_since)
+            .min(self.conversation.len());
         let record_landed = self.conversation.get(record_since..).is_some_and(|landed| {
             landed
                 .iter()
@@ -248,7 +269,29 @@ impl TuiApp {
     /// writes. Public because the session's teardown owns the moment
     /// — the app's own exit path already drained, and only the host
     /// knows when the driver after it has settled.
+    ///
+    /// One duplicate never lands: a failed turn's end can publish
+    /// the in-flight reasoning as a thinking-only reply after the
+    /// stop already kept that same reasoning from the exit snapshot,
+    /// and the transcript owes it one row, not two — so when the
+    /// settle kept the snapshot's thinking, a thinking-only reply
+    /// graduation is dropped here while every other straggler, tools
+    /// included, still lands.
     pub fn drain_late_graduations_at_exit(&mut self) {
+        if self.exit.snapshot_kept_reasoning {
+            let mut graduations = self
+                .state
+                .graduations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            graduations.retain(|graduation| {
+                !matches!(
+                    graduation,
+                    Graduation::Reply { text, thinking }
+                        if text.is_empty() && thinking.is_some()
+                )
+            });
+        }
         self.drain_shared_state();
     }
 
@@ -418,6 +461,27 @@ pub(crate) struct ExitState {
     /// serves this copy first and reads the live queue only when no
     /// exit armed one.
     pub(crate) unclaimed_prompts: Option<Vec<String>>,
+
+    /// The conversation's length when the exit's stop began.
+    ///
+    /// Armed at the confirming press whatever the lanes carried, and
+    /// at the settle's own start when no press armed one, so the
+    /// stop's cancel record is judged from its own edge: rows before
+    /// it belong to earlier turns and cannot satisfy the stop, while
+    /// a record the ordinary frame drain landed between the press
+    /// and the settle sits past it and counts as the stop's own.
+    pub(crate) stop_since: Option<usize>,
+
+    /// Whether the stop kept the exit snapshot's reasoning.
+    ///
+    /// Set when the settle lands the ungraduated snapshot with its
+    /// thinking blocks aboard, because the teardown window's failed
+    /// turn can still publish that same reasoning as a thinking-only
+    /// reply graduation — a duplicate the late drain owes the
+    /// transcript never to write. Left false whenever the snapshot
+    /// is not kept whole: a graduated reply carries its reasoning
+    /// where it landed.
+    pub(crate) snapshot_kept_reasoning: bool,
 }
 /// The quit lifecycle's two halves.
 ///
@@ -635,6 +699,36 @@ mod tests {
     }
 
     #[test]
+    fn an_earlier_cancel_row_cannot_stand_in_for_the_stops_record() {
+        // A tool-only run leaves the lanes empty, so the press arms no
+        // partial snapshot and the reply watermark stays where an
+        // earlier era left it — before an in-app cancel row. The
+        // stop's record is judged from the boundary the press arms
+        // whatever the lanes carried: the older row cannot satisfy
+        // it, and this stop writes its own record beside it.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.conversation.push(TuiMessage::Error {
+            text: "Agent cancelled".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+        app.state.agent_running.store(true, Ordering::SeqCst);
+        app.snapshot_exit_state_before_cancel();
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        let records = app
+            .conversation
+            .iter()
+            .filter(|message| {
+                matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled")
+            })
+            .count();
+        assert_eq!(
+            records, 2,
+            "the earlier row stands and this stop writes its own record"
+        );
+    }
+
+    #[test]
     fn a_tool_only_graduation_does_not_stand_in_for_the_reply() {
         // A tool in flight graduates in the cancel's drain: its row is
         // an assistant message carrying only a tool block. That is
@@ -820,6 +914,78 @@ mod tests {
                     if blocks.iter().any(|block| matches!(block, ContentBlock::Tool { .. })))
             }),
             "the graduation published during the teardown reaches the transcript"
+        );
+    }
+
+    #[test]
+    fn a_late_reasoning_only_reply_does_not_double_the_kept_reasoning() {
+        // The teardown window's failed turn: its end publishes the
+        // in-flight reasoning as a thinking-only reply after the stop
+        // has already kept the same reasoning from the exit snapshot.
+        // The late drain drops that duplicate while its tool
+        // straggler still lands, so the transcript carries the
+        // reasoning once.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half said");
+        app.state
+            .thinking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .text = "thought first".to_string();
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        {
+            let mut late = app
+                .state
+                .graduations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            late.push(Graduation::Reply {
+                text: String::new(),
+                thinking: Some(ContentBlock::Thinking {
+                    text: "thought first".to_string(),
+                    redacted: false,
+                    duration_ms: 0,
+                }),
+            });
+            late.push(Graduation::Tool(ToolResultDisplay {
+                name: "Bash".to_string(),
+                call_id: "call_late".to_string(),
+                is_error: false,
+                duration: std::time::Duration::ZERO,
+                input_summary: "cargo test".to_string(),
+                output_preview: "done".to_string(),
+                full_input: "{}".to_string(),
+                full_output: "done".to_string(),
+            }));
+        }
+        app.drain_late_graduations_at_exit();
+        let thinkings = app
+            .conversation
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::Assistant { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .flat_map(|blocks| {
+                blocks.iter().filter_map(|block| match block {
+                    ContentBlock::Thinking { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            thinkings,
+            ["thought first"],
+            "the reasoning the snapshot kept is not written a second time"
+        );
+        assert!(
+            app.conversation.iter().any(|message| matches!(
+                message,
+                TuiMessage::Assistant { blocks, .. }
+                    if blocks.iter().any(|block| matches!(block, ContentBlock::Tool { .. }))
+            )),
+            "a late tool row still lands beside the dropped duplicate"
         );
     }
 
