@@ -225,9 +225,10 @@ impl TuiApp {
                 blocks
             };
             if !kept.is_empty() {
-                self.exit.snapshot_kept_reasoning = kept
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Thinking { .. }));
+                self.exit.kept_reasoning = kept.iter().find_map(|block| match block {
+                    ContentBlock::Thinking { text, .. } => Some(text.clone()),
+                    _ => None,
+                });
                 self.conversation.push(TuiMessage::Assistant {
                     blocks: kept,
                     timestamp: chrono::Utc::now(),
@@ -270,25 +271,47 @@ impl TuiApp {
     /// — the app's own exit path already drained, and only the host
     /// knows when the driver after it has settled.
     ///
-    /// One duplicate never lands: a failed turn's end can publish
-    /// the in-flight reasoning as a thinking-only reply after the
-    /// stop already kept that same reasoning from the exit snapshot,
-    /// and the transcript owes it one row, not two — so when the
-    /// settle kept the snapshot's thinking, a thinking-only reply
-    /// graduation is dropped here while every other straggler, tools
-    /// included, still lands.
+    /// One duplicate never lands, and no reasoning is lost with it:
+    /// a failed turn's end can publish the in-flight reasoning as a
+    /// thinking-only reply after the stop already kept that
+    /// reasoning from the exit snapshot — and the buffer keeps
+    /// growing after the capture, so the publication can carry more
+    /// than the snapshot read. The drain strips the retained prefix
+    /// from such a graduation: the part the snapshot row already
+    /// carries is never repeated, the extension that streamed past
+    /// the capture still lands as its own row, and every other
+    /// straggler, tools included, lands untouched.
     pub fn drain_late_graduations_at_exit(&mut self) {
-        if self.exit.snapshot_kept_reasoning {
+        if let Some(retained) = self.exit.kept_reasoning.as_deref() {
             let mut graduations = self
                 .state
                 .graduations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for graduation in graduations.iter_mut() {
+                if let Graduation::Reply {
+                    text,
+                    thinking: Some(block),
+                } = graduation
+                    && text.is_empty()
+                    && let ContentBlock::Thinking {
+                        text: reasoning, ..
+                    } = block
+                {
+                    let extension = reasoning
+                        .strip_prefix(retained)
+                        .unwrap_or(reasoning.as_str())
+                        .to_string();
+                    *reasoning = extension;
+                }
+            }
             graduations.retain(|graduation| {
                 !matches!(
                     graduation,
-                    Graduation::Reply { text, thinking }
-                        if text.is_empty() && thinking.is_some()
+                    Graduation::Reply {
+                        text,
+                        thinking: Some(ContentBlock::Thinking { text: reasoning, .. })
+                    } if text.is_empty() && reasoning.is_empty()
                 )
             });
         }
@@ -472,16 +495,18 @@ pub(crate) struct ExitState {
     /// and the settle sits past it and counts as the stop's own.
     pub(crate) stop_since: Option<usize>,
 
-    /// Whether the stop kept the exit snapshot's reasoning.
+    /// The reasoning the stop's snapshot kept, when it kept any.
     ///
     /// Set when the settle lands the ungraduated snapshot with its
-    /// thinking blocks aboard, because the teardown window's failed
-    /// turn can still publish that same reasoning as a thinking-only
-    /// reply graduation — a duplicate the late drain owes the
-    /// transcript never to write. Left false whenever the snapshot
-    /// is not kept whole: a graduated reply carries its reasoning
-    /// where it landed.
-    pub(crate) snapshot_kept_reasoning: bool,
+    /// thinking blocks aboard: the teardown window's failed turn can
+    /// still publish that reasoning — plus whatever deltas streamed
+    /// after the capture — as a thinking-only reply graduation, and
+    /// the late drain strips this retained prefix from it, so the
+    /// transcript never repeats what the snapshot row already
+    /// carries while any reasoning that streamed past the capture
+    /// still lands. `None` whenever the snapshot is not kept whole: a
+    /// graduated reply carries its reasoning where it landed.
+    pub(crate) kept_reasoning: Option<String>,
 }
 /// The quit lifecycle's two halves.
 ///
@@ -986,6 +1011,57 @@ mod tests {
                     if blocks.iter().any(|block| matches!(block, ContentBlock::Tool { .. }))
             )),
             "a late tool row still lands beside the dropped duplicate"
+        );
+    }
+
+    #[test]
+    fn a_late_reply_extending_the_kept_reasoning_lands_its_extension() {
+        // The reasoning buffer keeps growing after the capture: the
+        // failed turn's end graduates the whole buffer, and the part
+        // that streamed past the snapshot must still reach the
+        // transcript. The late drain strips only the retained prefix
+        // — the snapshot row keeps what it captured, the extension
+        // lands as its own row after it, and nothing appears twice.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half said");
+        app.state
+            .thinking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .text = "thought first".to_string();
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        app.state
+            .graduations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Graduation::Reply {
+                text: String::new(),
+                thinking: Some(ContentBlock::Thinking {
+                    text: "thought first, then further".to_string(),
+                    redacted: false,
+                    duration_ms: 0,
+                }),
+            });
+        app.drain_late_graduations_at_exit();
+        let thinkings = app
+            .conversation
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::Assistant { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .flat_map(|blocks| {
+                blocks.iter().filter_map(|block| match block {
+                    ContentBlock::Thinking { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            thinkings,
+            ["thought first", ", then further"],
+            "the retained prefix stands once and the extension that streamed past the capture lands"
         );
     }
 
