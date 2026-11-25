@@ -244,8 +244,9 @@ impl TuiApp {
     /// Every accepted write lands in two places at once — the session's
     /// own config and the config file, via
     /// [`persist_config`](Self::persist_config) — but only a value the
-    /// running panel re-reads (the theme, the verbosity, the caret
-    /// display, the diff layout) changes the session already running:
+    /// running panel re-reads (the theme, the verbosity, the strip, the
+    /// caret display, the diff layout, the copy command) changes the
+    /// session already running:
     /// those apply on the spot and are remembered so `/unset` can undo
     /// them. A value the loop, the HTTP client, or a spawned process
     /// reads once at startup cannot be moved for this session; the
@@ -604,13 +605,14 @@ impl TuiApp {
 
     /// Push a just-changed value into whatever panel state reads it live.
     ///
-    /// Only display-classed values have panel state to refresh — the
+    /// Only display-classed values have panel state to refresh: the
     /// theme, the verbosity, and the diff layout have handlers that
     /// re-bake the caches exactly as the interactive controls would;
-    /// caret display and path style are read from the config every
-    /// frame, so they need no arm and take effect at once; every other
-    /// key falls through untouched, its effect waiting on the next
-    /// start.
+    /// the strip's position and style copy into the display state and
+    /// the copy command rewires the selection copier on the spot; caret
+    /// display and path style are read from the config every frame, so
+    /// they need no arm and take effect at once; every other key falls
+    /// through untouched, its effect waiting on the next start.
     fn apply_live_config(&mut self, key: &str) {
         match key {
             "theme" => {
@@ -1793,7 +1795,7 @@ mod tests {
 
     #[test]
     fn bare_preset_lists_the_configured_presets() {
-        // The listing the spec promises: bare `/preset` reaches the
+        // Bare `/preset` reaches the
         // listing branch now that the parser admits it (the arg shape
         // matches `/mode`) — naming the configured presets and the
         // live selection; with none configured it says so instead.
@@ -2661,7 +2663,7 @@ mod tests {
 
     #[test]
     fn a_preset_selection_is_session_state_and_never_reaches_the_config_file() {
-        // The `/preset` spec calls the selection process state — neither
+        // The selection is process state — neither
         // a restart nor a launch `--resume` carries it — and the
         // command's own doc says it never reaches the configuration
         // file; the two claims this pins the behavior half of. The
@@ -2669,8 +2671,8 @@ mod tests {
         // still lands (the theme proves the save went through), and
         // the file the save wrote carries no `preset` selection — so a
         // restart and every fresh session resolve under the
-        // configuration's own selection, exactly what the spec's last
-        // sentence promises. A `preset` key here would mean the
+        // configuration's own selection, exactly what the command's
+        // doc promises. A `preset` key here would mean the
         // session-scoped choice leaked into the file.
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dch_config::DchConfig::from_toml_str(concat!(

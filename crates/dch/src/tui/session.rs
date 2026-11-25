@@ -476,6 +476,14 @@ pub(crate) fn assemble_runner_builder<'a>(
 /// settle above, so nothing more can be saved by waiting. Whatever the
 /// run had already settled for the exit lines stands: the bound is on
 /// the join, not on what the run reported before it.
+///
+/// The abort is reaped under its own short bound: a poll already in
+/// flight on another worker finishes the synchronous tail it is in —
+/// the exit-owned cancel's publication into the error lane, which the
+/// late drain that follows strips by name — before the session reads
+/// the lanes, so no publication can outlive the strip and land as a
+/// twin record. A driver wedged inside a synchronous section still
+/// costs only the reap's bound, never the wait the first bound refused.
 pub(crate) async fn tear_down_driver_bounded(driver: tokio::task::JoinHandle<()>) {
     let mut driver = driver;
     if tokio::time::timeout(std::time::Duration::from_millis(500), &mut driver)
@@ -483,6 +491,12 @@ pub(crate) async fn tear_down_driver_bounded(driver: tokio::task::JoinHandle<()>
         .is_err()
     {
         driver.abort();
+        if tokio::time::timeout(std::time::Duration::from_millis(100), &mut driver)
+            .await
+            .is_err()
+        {
+            tracing::debug!("the driver stayed wedged through the abort's reap");
+        }
     }
 }
 

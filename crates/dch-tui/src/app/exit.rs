@@ -548,7 +548,7 @@ pub(crate) struct ExitState {
 /// Exit is Ctrl+C pressed twice on an empty buffer: the first
 /// arms, the second confirms and requests the exit. The press
 /// that clears a non-empty buffer arms nothing — clearing is not
-/// consenting — and any other key or mouse event disarms, so the
+/// consenting — and any other key or mouse press disarms, so the
 /// chord never fires from stale intent.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct QuitState {
@@ -785,6 +785,21 @@ mod tests {
         assert_eq!(
             records, 2,
             "the earlier row stands and this stop writes its own record"
+        );
+    }
+
+    #[test]
+    fn the_cancelled_error_spells_the_record_the_settle_strips() {
+        // The late drain strips the driver's publication by comparing
+        // it with the record the settle writes, and the two spellings
+        // come from different places — the crate's error Display and
+        // the settle's own literal. Pinned together here, so a change
+        // to either half fails this test rather than silently landing
+        // a twin record at a real exit with the suite green.
+        assert_eq!(
+            loopctl::error::LoopError::Cancelled.to_string(),
+            "Agent cancelled",
+            "the driver's publication and the settle's record share one spelling"
         );
     }
 

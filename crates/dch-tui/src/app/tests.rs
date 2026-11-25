@@ -1522,30 +1522,83 @@ fn backtab_from_a_bare_stem_applies_the_last_row() {
 
 #[test]
 fn backtab_over_a_stale_cycle_applies_the_last_row() {
-    // A cycle left standing by a mutation that is not a keystroke is
-    // stale, not holding the line: the first reverse press treats it
-    // as no cycle at all and lands on the last row — the same
-    // contract the clean-path pin states for the bare stem.
+    // A cycle opened on a fragment freezes that fragment's short list.
+    // Edited back to a stem it no longer holds, the cycle is stale,
+    // not holding the line, and the first reverse press treats it as
+    // no cycle at all — re-deriving from the stem and landing on the
+    // last row — rather than stepping the frozen list's first entry.
     let mut app = TuiApp::new(dch_config::DchConfig::default());
-    app.composer.input.set_text("/theme ".to_string());
-    let (_, candidates, _) = app.fresh_completion("/theme ");
-    assert!(candidates.len() >= 2, "themes offer more than one");
-    let first = candidates.first().cloned().unwrap_or_default();
-    let last = candidates.last().cloned().unwrap_or_default();
+    let (_, full, _) = app.fresh_completion("/theme ");
+    assert!(full.len() >= 2, "themes offer more than one");
+    let last = full.last().cloned().unwrap_or_default();
+    let fragment = full
+        .iter()
+        .filter(|candidate| candidate.len() >= 2)
+        .find_map(|candidate| {
+            let stem = &candidate[..1];
+            let (_, filtered, _) = app.fresh_completion(&format!("/theme {stem}"));
+            (filtered.len() >= 2 && *filtered.first()? != *full.first()?)
+                .then(|| (stem.to_string(), filtered))
+        })
+        .expect("a stem whose filtered list starts off the full list's first row");
+    app.composer
+        .input
+        .set_text(format!("/theme {}", fragment.0));
     assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    let applied = fragment.1.first().cloned().unwrap_or_default();
     assert_eq!(
         app.composer.input.text(),
-        format!("/theme {first}"),
-        "fixture premise: the forward press applied the first row"
+        format!("/theme {applied}"),
+        "fixture premise: the forward press applied the frozen list's first row"
     );
-    // A paste-shaped mutation — no key wrapper runs — leaves the
-    // cycle parked against a line it no longer holds.
+    // A paste-shaped mutation — no key wrapper runs — widens the stem
+    // past what the frozen list holds.
     app.composer.input.set_text("/theme ".to_string());
     assert!(app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
     assert_eq!(
         app.composer.input.text(),
         format!("/theme {last}"),
         "the stale cycle is treated as none: the first reverse press lands on the last row"
+    );
+}
+
+#[test]
+fn enter_over_a_stale_cycle_names_the_row_the_popup_highlights() {
+    // The fragment-opened cycle again: its frozen list is shorter than
+    // the one the popup now renders at the widened stem, so the two
+    // disagree about what stands at the cycle's index. Enter must name
+    // the row the screen highlights — the rendered list's — never the
+    // frozen list's, or Tab and Enter would commit different themes at
+    // one identical screen state.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let (_, full, _) = app.fresh_completion("/theme ");
+    let rendered_first = full.first().cloned().unwrap_or_default();
+    let stem = full
+        .iter()
+        .filter(|candidate| candidate.len() >= 2)
+        .find_map(|candidate| {
+            let stem = &candidate[..1];
+            let (_, filtered, _) = app.fresh_completion(&format!("/theme {stem}"));
+            (filtered.len() >= 2 && *filtered.first()? != rendered_first).then(|| stem.to_string())
+        })
+        .expect("a stem whose filtered list starts off the rendered list's first row");
+    app.composer.input.set_text(format!("/theme {stem}"));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    assert!(
+        app.browse.theme_before_browse.is_some(),
+        "fixture premise: the Tab parked the browse and previewed a palette"
+    );
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&rendered_first)
+            .map_or(rendered_first.clone(), |theme| theme.name.to_string()),
+        "Enter commits the row the popup highlights at the widened stem"
+    );
+    assert!(
+        app.browse.theme_before_browse.is_none(),
+        "the commit retired the browse"
     );
 }
 
@@ -1705,56 +1758,58 @@ fn enter_over_a_bare_theme_browse_names_the_highlighted_row() {
 
 #[test]
 fn a_stood_down_strip_erases_the_row_it_last_painted() {
-    // The strip's exit discipline: a frame that paints nothing must
-    // still spend the frame clearing its row, because the frame
-    // buffer is cumulative — without the clear the last painted bar
-    // lingers into the frames that follow. The glow style paints one
-    // unambiguous full-width rule, so its row's fate is the pin. The
-    // dedicated first row is the honest seat for it: at the default
-    // placement the composer's hairline repaints the spacer the moment
-    // the strip stands down, which would mask a lingering bar, while
-    // nothing else paints the top row.
-    let config = dch_config::DchConfig {
+    // The strip's exit discipline, read on the buffer that still holds
+    // the bar: a frame the strip does not paint must render its row
+    // blank rather than skip it, because the terminal contract asks
+    // every frame to render whole. The running strip paints its bar
+    // into a frame taken straight from the terminal's current buffer,
+    // the strip stands down, and the same buffer — no swap, no diff —
+    // must come back blank; a terminal draw could not tell the clear
+    // from the diff that rewrites every changed cell anyway.
+    let app = TuiApp::new(dch_config::DchConfig {
         display: dch_config::DisplayConfig {
             strip_style: StripStyle::Glow,
-            strip_position: StripPosition::Top,
             ..dch_config::DisplayConfig::default()
         },
         ..dch_config::DchConfig::default()
-    };
-    let mut app = TuiApp::new(config);
+    });
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).expect("terminal");
+    let area = ratatui::layout::Rect::new(0, 0, 80, 1);
     app.state
         .agent_running
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    terminal.draw(|frame| app.render(frame)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let strip_row = (0..buffer.area().height).find(|row| {
-        let cells: Vec<&str> = (0..buffer.area().width)
-            .filter_map(|column| {
-                buffer
-                    .cell(ratatui::layout::Position::new(column, *row))
-                    .map(ratatui::buffer::Cell::symbol)
+    assert!(
+        app.render_pulse_strip(&mut terminal.get_frame(), area),
+        "fixture premise: the running strip claimed the row"
+    );
+    let bar_cells = |frame: &mut ratatui::Frame<'_>| {
+        (0..80u16)
+            .filter(|column| {
+                frame
+                    .buffer_mut()
+                    .cell(ratatui::layout::Position::new(*column, 0))
+                    .is_some_and(|cell| cell.symbol() == "\u{2500}")
             })
-            .collect();
-        cells.len() == usize::from(buffer.area().width)
-            && cells
-                .iter()
-                .all(|symbol| *symbol == "\u{2500}" || *symbol == " ")
-            && cells.iter().filter(|symbol| **symbol == "\u{2500}").count() >= 40
-    });
-    let Some(row) = strip_row else {
-        panic!("the running strip painted its bar");
+            .count()
     };
+    assert!(
+        bar_cells(&mut terminal.get_frame()) >= 40,
+        "fixture premise: the bar stands in the buffer"
+    );
     app.state
         .agent_running
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    terminal.draw(|frame| app.render(frame)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let cleared = (0..buffer.area().width).all(|column| {
-        buffer
-            .cell(ratatui::layout::Position::new(column, row))
-            .is_some_and(|cell| cell.symbol() == " ")
+    assert!(
+        !app.render_pulse_strip(&mut terminal.get_frame(), area),
+        "the idle strip stands the row down"
+    );
+    let mut frame = terminal.get_frame();
+    let cleared = (0..80u16).all(|column| {
+        frame
+            .buffer_mut()
+            .cell(ratatui::layout::Position::new(column, 0))
+            .is_some_and(|cell| cell.symbol() == " " && cell.fg == ratatui::style::Color::Reset)
     });
     assert!(
         cleared,

@@ -59,9 +59,10 @@ impl TuiApp {
     /// page-scroll keys stay app-level, everything else belongs to the
     /// input editor — unless a permission ask is pending, in which
     /// case the overlay owns the keyboard first (`y` allows,
-    /// `n`/Esc deny, the rest swallowed) and only the two `c` chords and
+    /// `n`/Esc deny, the rest swallowed) and only the copy chord and
     /// the keys [`key_survives_the_sheet`] names pass through to the
-    /// machinery below.
+    /// machinery below; the plain interrupt is the ask's own deny and
+    /// never reaches them.
     ///
     /// Under a running agent, Ctrl+C Ctrl+C is one action in the
     /// Esc-Esc shape: with an empty composer, the first press only
@@ -347,12 +348,13 @@ impl TuiApp {
 /// top of it, and that conversation is exactly what a user needs in order
 /// to decide. Both overlays therefore hold these keys off the sheet and
 /// hand them to the machinery below — the copy chord on every sheet,
-/// while the plain interrupt is the ask sheet's own deny and never
-/// rides this pass: swallowing them would leave a user scrolling for
-/// context with a keyboard that answers nothing. The steering chord
-/// rides the same rule — the hint row offers it the moment a draft
-/// meets a running agent, and an overlay swallowing a chord the
-/// interface is advertising would be advertising noise.
+/// while the plain interrupt is the permission ask's own deny and
+/// never rides this pass there (the question sheet, the pickers, and
+/// the queue section do let it through): swallowing them would leave a
+/// user scrolling for context with a keyboard that answers nothing.
+/// The steering chord rides the same rule — the hint row offers it
+/// the moment a draft meets a running agent, and an overlay swallowing
+/// a chord the interface is advertising would be advertising noise.
 pub(crate) fn key_survives_the_sheet(key: KeyEvent) -> bool {
     let chord = key.code == KeyCode::Char('c')
         && (key.modifiers == KeyModifiers::CONTROL

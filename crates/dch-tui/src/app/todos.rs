@@ -443,10 +443,11 @@ pub(crate) struct PlanState {
     /// The conversation's per-update block accents exactly these
     /// rows: the ids whose status moved in that call, against the
     /// snapshot the previous call left. Bounded with the transcript
-    /// itself; the map rides in memory only — a fresh session carries
-    /// no deltas, and the resume path re-derives its accents from the
-    /// seeding walk, which records each restored update's deltas
-    /// against the snapshot before it.
+    /// itself; the map rides in memory only and dies with the rows it
+    /// keyed — a fresh or cleared session carries no deltas, and the
+    /// resume path re-derives its accents from the seeding walk, which
+    /// records each restored update's deltas against the snapshot
+    /// before it.
     pub(crate) todo_changes: HashMap<String, HashMap<String, todo_view::TodoStatus>>,
 
     /// The rows the newest todo update changed, for the plan section.
@@ -473,8 +474,9 @@ pub(crate) struct PlanState {
     /// press, the chord or a click on the section, opening the whole
     /// list and the next folding the section away. A view preference,
     /// not a mode: no keys are owned, the plan keeps updating
-    /// underneath, and every claim starts the next run's plan from the
-    /// capped posture whatever the last run left. The cycle skips the
+    /// underneath, and the posture is a view preference the claims
+    /// leave standing — whatever the last run left is what the next
+    /// run's plan opens in. The cycle skips the
     /// open posture when the capped one already shows every entry —
     /// opening a list that stands whole changes nothing, so the press
     /// spends itself on the fold.
@@ -724,11 +726,11 @@ pub(crate) enum ThinkingMode {
 /// leaves it.
 ///
 /// One chord — or one click on the section — walks the three: capped
-/// at its four task rows with the cut named, opened to the whole list
-/// however tall, or folded away entirely. A posture is a view
+/// at its four task rows with the cut named, opened up to the screen's
+/// height with the wheel walking a taller plan, or folded away
+/// entirely. A posture is a view
 /// preference — the plan keeps updating underneath every one of them,
-/// and the run's landing clears the section out of whatever posture
-/// it was in.
+/// and the claims leave it standing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanView {
     /// Capped at [`TODO_SECTION_BODY_ROWS`] task rows, the ellipsis

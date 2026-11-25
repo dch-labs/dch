@@ -99,8 +99,8 @@ type TurnEndHook =
     Box<dyn Fn(&[TuiMessage], Option<&Arc<Vec<loopctl::message::Message>>>) + Send + Sync>;
 
 /// The host's wiring and the session's identity: the lanes the
-/// driver installed, the session's id and place, and the row the
-/// place line above the composer spells them onto.
+/// driver installed, the session's id the status bar shows, and the
+/// place the row above the composer spells.
 ///
 /// Everything the embedding host hands the shell before the run loop
 /// starts, in one place — the submit, guidance, session-update, and
@@ -824,9 +824,14 @@ impl TuiApp {
     /// them — a thinking section or compaction expanded by position in
     /// the old conversation is nothing the new one ever opened, and a
     /// driverless host has no adoption reply to drop them later — and
-    /// the selection goes with the rows it spanned.
+    /// the selection goes with the rows it spanned. The todo deltas
+    /// keyed by the old transcript's call ids die with it too: the
+    /// seeding walk records the resumed transcript's own deltas afresh
+    /// over the emptied map, and a cleared session carries none.
     fn replace_conversation_with(&mut self, transcript: Vec<TuiMessage>) {
         self.conversation.clear();
+        self.plan.todo_changes.clear();
+        self.plan.todo_section_changes.clear();
         self.seed_messages(transcript);
         self.bake.rebake_whole();
         self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);

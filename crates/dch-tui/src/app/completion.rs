@@ -61,15 +61,22 @@ impl TuiApp {
     /// The popup's Enter act: the user browsed with arrows (or Tab),
     /// the highlight stands on a row, and Enter names it so the
     /// submit commits the choice the screen says is selected. The
-    /// prefix is kept — only the value after it is written.
+    /// prefix is kept — only the value after it is written. The row
+    /// is read from the list the popup renders, not the cycle's frozen
+    /// one: a cycle opened on a fragment and edited back to a wider
+    /// stem freezes a shorter list than the popup now shows, and the
+    /// highlighted row and the drafted line must stay one choice.
     fn apply_highlighted_row(&mut self) {
         let Some(cycle) = self.completion.completion.as_ref() else {
             return;
         };
-        let Some(chosen) = cycle.candidates.get(cycle.index) else {
+        let Some((prefix, candidates)) = self.popup_candidates() else {
             return;
         };
-        let text = format!("{}{}", cycle.prefix, chosen);
+        let Some(chosen) = candidates.get(cycle.index) else {
+            return;
+        };
+        let text = format!("{prefix}{chosen}");
         self.composer.input.set_text(text);
     }
 

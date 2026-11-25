@@ -1556,15 +1556,6 @@ fn connect_bounded(host: &str, port: u16) -> Option<TcpStream> {
         .find_map(|address| TcpStream::connect_timeout(address, PROBE_BOUND).ok())
 }
 
-/// One minimal HTTP GET, returning the response body.
-///
-/// Speaks just enough HTTP for the model-listing endpoints the smoke
-/// discovery reads, against plain-`http` endpoints; a non-200 status,
-/// a connection failure, or a body that never arrives is a `None` the
-/// caller treats as "not listed here". Chunked transfer encoding —
-/// what Ollama actually answers with — is stripped before the body
-/// returns.
-///
 /// Issue one small POST and return its 200 body, dechunked if needed.
 ///
 /// The Ollama control endpoints (`/api/show` among them) take the
@@ -1594,6 +1585,14 @@ fn http_post_body(host: &str, port: u16, path: &str, body: &str) -> Option<Strin
     }
 }
 
+/// One minimal HTTP GET, returning the response body.
+///
+/// Speaks just enough HTTP for the model-listing endpoints the smoke
+/// discovery reads, against plain-`http` endpoints; a non-200 status,
+/// a connection failure, or a body that never arrives is a `None` the
+/// caller treats as "not listed here". Chunked transfer encoding —
+/// what Ollama actually answers with — is stripped before the body
+/// returns.
 fn http_get_body(host: &str, port: u16, path: &str) -> Option<String> {
     let mut stream = connect_bounded(host, port)?;
     stream.set_read_timeout(Some(PROBE_BOUND)).ok()?;

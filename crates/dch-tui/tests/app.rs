@@ -7390,6 +7390,64 @@ fn the_question_sheet_reserves_its_rows_above_the_conversation() {
 }
 
 #[test]
+fn a_whitespace_draft_at_rest_reads_as_no_draft() {
+    // The at-rest compose row tells the sheet's own truth: Enter on the
+    // rows reopens a whitespace draft rather than sending, and the
+    // composing hint already says a written answer is required — so a
+    // draft of nothing but blanks shows the placeholder with the
+    // no-draft subtext, never blank cells under an "enter sends it"
+    // promise. A contrast case with real wording reads the other way.
+    let (mut app, answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    write(&mut app, "x");
+    app.handle_event(&plain(KeyCode::Backspace));
+    app.handle_event(&plain(KeyCode::Char(' ')));
+    app.handle_event(&plain(KeyCode::Esc));
+    let mut answers = answers;
+    let at_rest = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        at_rest.contains("Type your answer")
+            && at_rest.contains("a reply the options did not offer"),
+        "a whitespace-only draft reads as no draft at rest:\n{at_rest}"
+    );
+    assert!(
+        !at_rest.contains("enter sends it"),
+        "nothing promises a send for a draft Enter will only reopen:\n{at_rest}"
+    );
+    assert!(
+        matches!(
+            answers[0].try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "nothing was sent on the way out"
+    );
+
+    let (mut app, answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    let mut answers = answers;
+    write(&mut app, "src/");
+    app.handle_event(&plain(KeyCode::Esc));
+    let typed = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        typed.contains("src/") && typed.contains("enter sends it"),
+        "a draft with words keeps its row and its promise:\n{typed}"
+    );
+    assert!(
+        matches!(
+            answers[0].try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the contrast case sent nothing either"
+    );
+}
+
+#[test]
 fn the_compose_row_sends_a_typed_answer_the_options_never_offered() {
     let (mut app, mut replies) = question_app(&[StagedQuestion {
         question: "Ship it?",
@@ -11147,6 +11205,65 @@ fn a_long_plan_caps_its_section_and_names_the_cut() {
     assert!(
         flat.contains("… +5 more (ctrl+t for all)"),
         "the walk returns to the capped posture: {flat:?}"
+    );
+}
+
+#[test]
+fn a_full_plan_taller_than_the_screen_caps_and_the_wheel_walks_it() {
+    // Opened, the section still answers to the screen: a plan taller
+    // than the screen minus its furniture opens up to that height and
+    // names the rest with the ellipsis, and the wheel over the section
+    // walks the window an entry at a time — the open posture is a
+    // taller window, never an unbounded one.
+    let mut app = app();
+    let tasks: Vec<String> = (0..30)
+        .map(|index| {
+            format!("{{\"id\":\"{index}\",\"subject\":\"task {index}\",\"status\":\"pending\"}}")
+        })
+        .collect();
+    todo_graduation(
+        &app,
+        "call-tall",
+        &format!("{{\"todos\":[{}]}}", tasks.join(",")),
+    );
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("… +26 more"),
+        "capped, four of thirty show: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let flat: String = rows.join("\n");
+    assert!(
+        flat.contains("… +18 more"),
+        "opened, the section grows to the screen's height — twelve of thirty — \
+         and names the rest: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{2610} task 11") && !flat.contains("\u{2610} task 12"),
+        "the window holds the first twelve tasks and no more: {flat:?}"
+    );
+    let section_row = rows
+        .iter()
+        .position(|row| row.contains(" TODO "))
+        .unwrap_or_else(|| panic!("the badge row stands in the section: {flat:?}"));
+    assert!(app.handle_event(&Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 1,
+        row: u16::try_from(section_row).unwrap_or(u16::MAX),
+        modifiers: KeyModifiers::NONE,
+    })));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        !flat.contains("\u{2610} task 0 ") && flat.contains("\u{2610} task 12"),
+        "one notch stepped the window past the first task and brought the \
+         thirteenth in: {flat:?}"
     );
 }
 

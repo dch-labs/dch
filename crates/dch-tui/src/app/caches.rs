@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// The accumulators one conversation render pass fills.
 ///
 /// A render of a message range produces the styled rows themselves
-/// and the five index structures the app's press resolution and
+/// and the index structures the app's press resolution and
 /// lane overlays read — one output, always filled together, so it
 /// folds into a single struct the pass fills. The bake pass owns
 /// the half the app keeps between frames; the tail pass starts
@@ -997,6 +997,73 @@ mod tests {
         assert!(
             subject.expansion.expanded_thinking.is_empty(),
             "an expansion keyed by position dies with the conversation that named it"
+        );
+    }
+
+    #[test]
+    fn an_adopted_resume_rederives_its_todo_deltas_per_restored_block() {
+        // The seeding walk is the resumed transcript's accent source:
+        // each restored TodoWrite block records its status changes
+        // against the snapshot the block before it left, keyed by its
+        // own call id — so the conversation's per-update blocks accent
+        // the rows that moved in that update, exactly as a live run's
+        // did. Deltas the replaced transcript left behind die with it.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject
+            .plan
+            .todo_changes
+            .insert("stale".to_string(), std::collections::HashMap::new());
+        let now = chrono::Utc::now();
+        let block = |call_id: &str, status: &str| crate::message::ContentBlock::Tool {
+            name: "TodoWrite".to_string(),
+            call_id: call_id.to_string(),
+            input_preview: String::new(),
+            success: true,
+            elapsed_secs: 0.0,
+            output_preview: String::new(),
+            retained_input: format!(
+                "{{\"todos\":[{{\"id\":\"0\",\"subject\":\"ship it\",\"status\":\"{status}\"}}]}}"
+            ),
+        };
+        let transcript = vec![
+            TuiMessage::Assistant {
+                blocks: vec![block("call-a", "pending")],
+                timestamp: now,
+                duration_ms: None,
+            },
+            TuiMessage::Assistant {
+                blocks: vec![block("call-b", "completed")],
+                timestamp: now,
+                duration_ms: None,
+            },
+        ];
+        subject.adopt_resumed_session(
+            "resumed".to_string(),
+            transcript,
+            crate::queue::ResumedTokens {
+                cumulative_input: 0,
+                cumulative_output: 0,
+                last_input: 0,
+                context_tokens: 0,
+            },
+        );
+        assert!(
+            !subject.plan.todo_changes.contains_key("stale"),
+            "a delta keyed by the replaced transcript's call id dies with it"
+        );
+        let second = subject
+            .plan
+            .todo_changes
+            .get("call-b")
+            .expect("the second restored block recorded its deltas");
+        assert_eq!(
+            second.get("0"),
+            Some(&crate::todo_view::TodoStatus::Completed),
+            "the second block's delta names the row that moved against the first block's snapshot"
+        );
+        assert!(
+            subject.plan.todo_changes.contains_key("call-a"),
+            "the first restored block recorded its deltas against the empty snapshot"
         );
     }
 

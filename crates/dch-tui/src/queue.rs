@@ -369,7 +369,10 @@ pub enum SessionCommand {
         /// The base URL the new provider listens on.
         ///
         /// The endpoint the rebuilt runner's client sends every request
-        /// to.
+        /// to; an empty spelling inherits the endpoint the user stated in
+        /// `[api]` — never the live one, which may be a previous entry's
+        /// layer — so the stated credential never travels to another
+        /// profile's endpoint.
         base_url: String,
 
         /// The API type the new provider speaks, spelled as the
