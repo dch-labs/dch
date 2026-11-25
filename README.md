@@ -250,7 +250,7 @@ Conversation:
 | `Up` / `Down` | Scroll one line (only while the input is empty with nothing recallable) |
 | `Alt+Up` / `Alt+Down` | Jump to the previous / next prompt you sent — the target prompt's first row lands at the top of the viewport, whatever the composer holds. Steered echoes and unsent drafts are not stops |
 | `PageUp` / `PageDown` | Scroll ten lines |
-| Mouse wheel | Scroll the transcript, one line per event |
+| Mouse wheel | Scroll the transcript, one line per event; over an open plan section, walk its window an entry per event |
 | Mouse drag | Select characters; the highlight stays after release and the text is copied to the clipboard. Dragging on the pane's top or bottom line scrolls the transcript with the selection |
 | Mouse click (composer) | Place the caret where the press landed, clamped to the text |
 | Mouse click (tool row) | Expand a tool call's block to its full command and output — pretty-printed input, then the (redacted) output; click any row of the open block to fold it back. Long output scrolls with the transcript. The last 256 tool calls stay expandable |
@@ -359,10 +359,12 @@ beside it (`2/5 done`), then one checkbox row per task (◐ the task in
 progress and newly filed rows in the accent; ☑ finished rows uniform
 in the dim register, the words struck through and the box plain), and
 an ellipsis naming the tasks past the section's four
-rows — and the ellipsis names the chord that lifts the cap: `Ctrl-T`
-opens the whole list when the cap actually cut an entry, then folds
-the section, then stands the cap again — a cap that already shows the
-whole list skips the opening press and folds instead — the plan
+rows — and the ellipsis names the way to them: `Ctrl-T` opens the
+list up to the screen's height when the cap actually cut an entry,
+then folds the section, then stands the cap again — a cap that already
+shows the whole list skips the opening press and folds instead — and
+over an open section the mouse wheel walks the window an entry at a
+time, never past the plan's end; the plan
 updating underneath every posture. Between prompts the plan keeps
 only what is owed: a new prompt inherits the entries in progress and
 the completed history, while entries still pending — filed by an

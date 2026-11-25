@@ -245,8 +245,8 @@ impl TuiApp {
     /// own config and the config file, via
     /// [`persist_config`](Self::persist_config) — but only a value the
     /// running panel re-reads (the theme, the verbosity, the strip, the
-    /// caret display, the diff layout, the copy command) changes the
-    /// session already running:
+    /// caret display, the diff layout, the copy command, the path style)
+    /// changes the session already running:
     /// those apply on the spot and are remembered so `/unset` can undo
     /// them. A value the loop, the HTTP client, or a spawned process
     /// reads once at startup cannot be moved for this session; the

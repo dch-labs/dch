@@ -1683,6 +1683,73 @@ fn the_cancel_arm_dies_with_the_run_it_was_armed_against() {
 }
 
 #[test]
+fn the_plan_posture_stands_across_a_run_s_end_and_a_clear() {
+    // The posture is a view preference the claims leave standing: a
+    // run's end and the claim it retires into touch the rows, never the
+    // posture, and a /clear replaces the conversation without folding
+    // the section — whatever the last run left is what the next run's
+    // plan opens in.
+    let mut subject = TuiApp::new(dch_config::DchConfig::default());
+    subject.plan.plan_view = PlanView::Full;
+    {
+        let mut graduations = subject
+            .state
+            .graduations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        graduations.push(crate::observer::Graduation::RunEnded {
+            duration_ms: 1,
+            success: true,
+        });
+        graduations.push(crate::observer::Graduation::Sent {
+            text: "the next run's prompt".to_string(),
+            steered: false,
+        });
+    }
+    subject.drain_shared_state();
+    assert_eq!(
+        subject.plan.plan_view,
+        PlanView::Full,
+        "the run's end and the claim after it left the posture standing"
+    );
+    command_output(&mut subject, "/clear");
+    assert_eq!(
+        subject.plan.plan_view,
+        PlanView::Full,
+        "the clear replaced the conversation and left the posture"
+    );
+}
+
+#[test]
+fn a_click_in_the_section_s_margins_flips_the_queue_posture() {
+    // The section records its full seat — the inset pane it paints and
+    // the margins beside it — and the click answers against that seat:
+    // a press on a margin column toggles the fold the same way a press
+    // on a painted row does, while a press outside the seat is not the
+    // section's.
+    let mut subject = TuiApp::new(dch_config::DchConfig::default());
+    subject.push_queued("waiting one".to_string());
+    subject.push_queued("waiting two".to_string());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| subject.render(frame)).unwrap();
+    let rect = subject.queue.queue_section_rect;
+    assert!(rect.height > 0, "the section rendered: {rect:?}");
+    let before = subject.queue.queue_posture;
+    assert!(
+        subject.toggle_queue_section_at(rect.x, rect.y.saturating_add(1)),
+        "a press on the seat's left margin is the section's"
+    );
+    assert_ne!(
+        subject.queue.queue_posture, before,
+        "and it flips the posture"
+    );
+    assert!(
+        !subject.toggle_queue_section_at(rect.right(), rect.y),
+        "a press past the seat's right edge is not the section's"
+    );
+}
+
+#[test]
 fn any_mouse_press_stands_the_quit_chord_down() {
     // The chord must never fire from stale intent: a right-button
     // press between the presses disarms it the same way a left press

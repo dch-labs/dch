@@ -471,12 +471,12 @@ pub(crate) struct PlanState {
     /// The plan section's posture, as Ctrl+T or a click leaves it.
     ///
     /// Capped by default — four task rows and the ellipsis — with one
-    /// press, the chord or a click on the section, opening the whole
-    /// list and the next folding the section away. A view preference,
-    /// not a mode: no keys are owned, the plan keeps updating
-    /// underneath, and the posture is a view preference the claims
-    /// leave standing — whatever the last run left is what the next
-    /// run's plan opens in. The cycle skips the
+    /// press, the chord or a click on the section, opening the list up
+    /// to the screen's height and the next folding the section away. A
+    /// view preference, not a mode: no keys are owned, the plan keeps
+    /// updating underneath, and the claims leave the posture standing
+    /// — whatever the last run left is what the next run's plan opens
+    /// in. The cycle skips the
     /// open posture when the capped one already shows every entry —
     /// opening a list that stands whole changes nothing, so the press
     /// spends itself on the fold.

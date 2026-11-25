@@ -1243,21 +1243,25 @@ mod tests {
         // exactly such a tail, and the late drain that follows the
         // teardown strips it by name. The teardown must not return
         // ahead of that publication, or the strip reads an empty lane
-        // and the twin record lands after it. The driver here is one
-        // synchronous sleep that spans the bound and publishes at its
-        // end; without the reap the teardown would return at the bound
-        // with the publication still pending. The runtime is
-        // multi-threaded for the same reason: on one thread the sleep
-        // would block the bound itself and the two orders could not
-        // be told apart.
+        // and the twin record lands after it. The tail is modeled as
+        // the drop the abort provokes: it runs on the worker when the
+        // cancellation is processed, and only awaiting the aborted
+        // handle guarantees it has run. A multi-thread runtime keeps
+        // the worker distinct from the caller; no timer rides the
+        // margin.
+        struct OnDrop(Arc<std::sync::Mutex<Vec<String>>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push("the cancel's record".to_string());
+            }
+        }
         let lane = Arc::new(std::sync::Mutex::new(Vec::new()));
         let published = Arc::clone(&lane);
         let in_flight = tokio::spawn(async move {
-            std::thread::sleep(std::time::Duration::from_millis(550));
-            published
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push("the cancel's record".to_string());
+            let _tail = OnDrop(published);
             std::future::pending::<()>().await;
         });
         tear_down_driver_bounded(in_flight).await;

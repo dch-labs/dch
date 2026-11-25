@@ -80,6 +80,7 @@ use self::paint::welcome::{WelcomeShape, WelcomeState};
 use self::queue::QueueMode;
 use self::run::FRAME_INTERVAL;
 use self::todos::PlanView;
+pub(crate) use self::todos::TODO_SECTION_BODY_ROWS;
 use crate::markdown;
 use crate::todo_view;
 

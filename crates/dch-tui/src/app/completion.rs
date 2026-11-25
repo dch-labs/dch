@@ -41,10 +41,11 @@ impl TuiApp {
     /// Whether the current state shows a theme the browse previewed.
     ///
     /// The popup's Enter arm reads this to decide whether the standing
-    /// highlight represents the user's browsing choice — a theme the
-    /// palette is currently previewing because the browse parked the
-    /// session's own to show it — so Enter can name it in the composer
-    /// before submitting.
+    /// highlight is the user's browsing choice — a theme browse is
+    /// parked against the bare stem, so the row the popup highlights
+    /// is the one to name in the composer before submitting. The
+    /// palette may still preview an earlier row of the walk, so the
+    /// highlight is the choice, never whatever the palette shows.
     fn previewed_a_theme(&self) -> bool {
         self.browse.theme_before_browse.is_some()
             && self

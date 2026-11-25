@@ -286,12 +286,13 @@ impl CannedServer {
         self.port
     }
 
-    /// The request bodies received so far, in arrival order.
+    /// The provider-turn request bodies received so far, in arrival
+    /// order.
     ///
     /// A snapshot clone under the lock, so a scenario can read it
-    /// while the server thread keeps accepting; the order is the
-    /// order the connections arrived in, which is the order the
-    /// scripted turns ran.
+    /// while the server thread keeps accepting; session-title requests
+    /// are answered off-script and withheld, so the order is the order
+    /// the provider turns ran.
     pub fn requests(&self) -> Vec<String> {
         self.requests
             .lock()
@@ -304,8 +305,9 @@ impl CannedServer {
 ///
 /// Headers are consumed line by line until the blank separator; the
 /// `Content-Length` that follows names the body's bytes. A request the
-/// test binary never finishes writing yields `None` and the connection
-/// is answered with the server's run-dry response.
+/// test binary never finishes writing yields `None`: nothing is
+/// recorded for it, and the connection is served from the script like
+/// any other — the run-dry answer only once the script is spent.
 fn read_request(stream: &mut TcpStream) -> Option<String> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -1528,12 +1530,14 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// How long any discovery probe may spend connecting or reading.
+/// How long any discovery probe may spend on one connect or one read.
 ///
 /// The probes back the smoke suite's model discovery against
 /// endpoints nobody controls: one that accepts a connection but never
-/// answers must not hold discovery hostage behind it, so every probe
-/// fails on this bound and discovery moves on to its next candidate.
+/// answers must not hold discovery hostage behind it, so every connect
+/// and every read fails on this bound. The bound is per operation —
+/// an endpoint that drips a byte inside every window is not cut off
+/// as a whole.
 const PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One bounded connection to `host:port`, trying every address the

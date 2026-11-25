@@ -377,7 +377,8 @@ pub(crate) struct FramePacing {
 
     /// The frame lane's own bookkeeping, for the log.
     ///
-    /// One line per second under `RUST_LOG=dch_tui::frames=debug`:
+    /// One line per drawn second under `RUST_LOG=dch_tui::frames=debug`
+    /// — a lane that never draws logs nothing — naming:
     /// how many animation wakes fired, how many terminal draws ran,
     /// and the slowest draw's duration — the three numbers that
     /// separate a stalled wake lane (wakes low), a blocked loop

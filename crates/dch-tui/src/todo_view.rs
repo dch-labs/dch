@@ -669,8 +669,13 @@ pub(crate) fn section_lines(
     }
     let more = rows.len().saturating_sub(skip).saturating_sub(shown);
     if more > 0 {
+        let way = if skip > 0 || body_cap > crate::app::TODO_SECTION_BODY_ROWS {
+            "wheel to walk"
+        } else {
+            "ctrl+t to open"
+        };
         lines.push(Line::styled(
-            format!("… +{more} more (ctrl+t for all)"),
+            format!("… +{more} more ({way})"),
             Style::default().fg(colors.dim),
         ));
     }
@@ -968,7 +973,7 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             .collect();
         assert_eq!(
             text.last().expect("an ellipsis stands last"),
-            "… +3 more (ctrl+t for all)",
+            "… +3 more (ctrl+t to open)",
             "a zero budget hides nothing yet counts it as shown"
         );
         assert_eq!(
@@ -1142,7 +1147,7 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             .collect();
         assert!(
             text.iter()
-                .any(|line| line.contains("+2 more (ctrl+t for all)")),
+                .any(|line| line.contains("+2 more (ctrl+t to open)")),
             "a cut that hides two keeps its ellipsis: {text:?}"
         );
     }
@@ -1278,7 +1283,7 @@ mod review_2026_11_01_round {
             .collect();
         assert!(
             text.iter()
-                .any(|line| line.contains("+1 more (ctrl+t for all)")),
+                .any(|line| line.contains("+1 more (ctrl+t to open)")),
             "the entry's unrendered rows stand behind the ellipsis: {text:?}"
         );
         assert_eq!(

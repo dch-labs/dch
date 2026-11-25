@@ -9182,13 +9182,16 @@ fn the_expanded_live_body_caps_rendered_lines() {
     // One logical line, far wider than the pane: it wraps into far
     // more rendered rows than the cap, so only the cap's tail may
     // render while the stream is live.
-    let wall = "word ".repeat(4000);
+    // A backend tall enough to show more than the cap's rows: at the
+    // pane's height every frame would satisfy the bound, capped or not.
+    let wall = "word ".repeat(40_000);
     observer.on_thinking_delta(&thinking_delta(0, &wall));
-    let rows = rendered_rows(&mut app, 80, 24);
+    let rows = rendered_rows(&mut app, 80, 600);
     let body = rows.iter().filter(|row| row.contains("word")).count();
-    assert!(
-        body <= 500,
-        "the live body renders at most the cap's wrapped lines, got {body}"
+    assert_eq!(
+        body, 500,
+        "the live body renders exactly the cap's wrapped lines — the wall wraps to \
+         thousands without it"
     );
 }
 
@@ -11143,7 +11146,7 @@ fn a_long_plan_caps_its_section_and_names_the_cut() {
         "the fraction counts the whole plan, not the window: {flat:?}"
     );
     assert!(
-        flat.contains("… +5 more (ctrl+t for all)"),
+        flat.contains("… +5 more (ctrl+t to open)"),
         "nine tasks, four shown: the section names its cut and the chord \
          that opens the whole list: {flat:?}"
     );
@@ -11203,7 +11206,7 @@ fn a_long_plan_caps_its_section_and_names_the_cut() {
     let terminal = render_to_buffer(&mut app, 80, 40);
     let flat: String = row_texts(&terminal).join("\n");
     assert!(
-        flat.contains("… +5 more (ctrl+t for all)"),
+        flat.contains("… +5 more (ctrl+t to open)"),
         "the walk returns to the capped posture: {flat:?}"
     );
 }
@@ -11264,6 +11267,38 @@ fn a_full_plan_taller_than_the_screen_caps_and_the_wheel_walks_it() {
         !flat.contains("\u{2610} task 0 ") && flat.contains("\u{2610} task 12"),
         "one notch stepped the window past the first task and brought the \
          thirteenth in: {flat:?}"
+    );
+    assert!(
+        flat.contains("… +17 more (wheel to walk)"),
+        "once the window is open the ellipsis names the wheel, not the chord \
+         that would fold the section: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 1,
+        row: u16::try_from(section_row).unwrap_or(u16::MAX),
+        modifiers: KeyModifiers::NONE,
+    })));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("\u{2610} task 0 "),
+        "a notch up brings the first task back: {flat:?}"
+    );
+    for _ in 0..40 {
+        assert!(app.handle_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: u16::try_from(section_row).unwrap_or(u16::MAX),
+            modifiers: KeyModifiers::NONE,
+        })));
+    }
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("\u{2610} task 29") && !flat.contains("more ("),
+        "the window never scrolls past the plan's end: the last entry stays on \
+         screen and nothing is left to name: {flat:?}"
     );
 }
 
@@ -12481,7 +12516,7 @@ fn ctrl_t_opens_only_when_the_cap_cut_an_entry() {
     let rows = row_texts(&terminal);
     assert!(
         rows.iter()
-            .any(|row| row.contains("+2 more (ctrl+t for all)")),
+            .any(|row| row.contains("+2 more (ctrl+t to open)")),
         "the capped posture cut two entries and says so: {rows:?}"
     );
     assert!(
@@ -12521,7 +12556,7 @@ fn ctrl_t_opens_only_when_the_cap_cut_an_entry() {
     let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
-            .any(|row| row.contains("+2 more (ctrl+t for all)")),
+            .any(|row| row.contains("+2 more (ctrl+t to open)")),
         "and the walk returns to the capped posture: {rows:?}"
     );
 }

@@ -93,8 +93,10 @@ pub(crate) struct CopyVerdict {
 
     /// Whether any process transport exited successfully.
     ///
-    /// A transport that launched, consumed the text, and exited zero
-    /// is the only delivery the chain can actually confirm.
+    /// A transport that wrote its input through and exited zero is
+    /// the delivery the chain confirms — a consumption proven only
+    /// for a payload larger than the kernel's pipe buffer, since a
+    /// smaller one completes its write with no read at all.
     pub(crate) verified: bool,
 }
 
