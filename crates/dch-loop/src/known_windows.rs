@@ -30,6 +30,8 @@ const KNOWN_WINDOWS: &[(&str, u64)] = &[
     // https://docs.z.ai/guides/vlm/glm-5.3-flash
     ("glm-5.3-flash", 1_000_000),
     ("glm-5.3-flashx", 1_000_000),
+    // https://docs.z.ai/guides/llm/glm-5.4
+    ("glm-5.4", 1_000_000),
 ];
 
 /// The documented window for `model`, if the table knows it.
