@@ -169,7 +169,7 @@ impl TuiApp {
                 .max(1),
             body_cap,
             self.plan.clamped_todo_skip(),
-            chord_hint,
+            (chord_hint, self.plan.plan_cut_way()),
         );
         for_display_lines(&mut lines);
         frame.render_widget(

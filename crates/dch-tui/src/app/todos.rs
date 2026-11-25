@@ -190,7 +190,7 @@ impl TuiApp {
             inner,
             TODO_SECTION_BODY_ROWS,
             self.plan.clamped_todo_skip(),
-            self.plan_chord_hint(),
+            (self.plan_chord_hint(), self.plan.plan_cut_way()),
         )
         .last()
         .is_some_and(|line| {
@@ -297,6 +297,7 @@ impl TuiApp {
         };
         self.full_body_cap.set(body_cap);
         let chord_hint = self.plan_chord_hint();
+        let cut_way = self.plan.plan_cut_way();
         let lines = todo_view::section_lines(
             &self.plan.latest_todos,
             &self.plan.todo_section_changes,
@@ -304,7 +305,7 @@ impl TuiApp {
             inner,
             body_cap,
             self.plan.clamped_todo_skip(),
-            chord_hint,
+            (chord_hint, cut_way),
         );
         let cut = body_cap != usize::MAX
             && matches!(lines.last(), Some(line)
@@ -652,6 +653,21 @@ impl PlanState {
     /// Down moves deeper into the plan, up back toward its head; the
     /// clamp keeps at least one entry on screen either way, so the
     /// window never scrolls past the plan's end.
+    /// The gesture that reaches the cut rows, for the ellipsis.
+    ///
+    /// The posture decides it: while the cap holds the window the
+    /// chord opens the list, and once the list is open the wheel walks
+    /// it — the chord there folds the section, so naming it would
+    /// promise the opposite of the next press. Open follows the
+    /// posture, never the window's size: a screen too short to widen
+    /// the window still leaves the wheel as the way in.
+    pub(super) fn plan_cut_way(&self) -> &'static str {
+        match self.plan_view {
+            PlanView::Full => "wheel to walk",
+            PlanView::Capped | PlanView::Hidden => "ctrl+t to open",
+        }
+    }
+
     pub(crate) fn scroll_todo_section(&mut self, up: bool) {
         if self.latest_todos.is_empty() {
             return;

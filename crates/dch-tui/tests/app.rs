@@ -11212,6 +11212,53 @@ fn a_long_plan_caps_its_section_and_names_the_cut() {
 }
 
 #[test]
+fn a_cut_open_plan_on_a_short_screen_names_the_wheel_not_the_folding_chord() {
+    // The open posture on a screen too short to widen its window: the
+    // body cap falls back to four rows, a plan longer than that still
+    // cuts, and the chord's next press folds the section — so the
+    // ellipsis must name the wheel, the one gesture that reaches the
+    // cut rows, and agree with the badge that names the fold. Before
+    // the fix it inferred the posture from the window's size and
+    // promised the chord that would hide the list.
+    let mut app = app();
+    let tasks: Vec<String> = (0..9)
+        .map(|index| {
+            format!("{{\"id\":\"{index}\",\"subject\":\"task {index}\",\"status\":\"pending\"}}")
+        })
+        .collect();
+    todo_graduation(
+        &app,
+        "call-short",
+        &format!("{{\"todos\":[{}]}}", tasks.join(",")),
+    );
+    let terminal = render_to_buffer(&mut app, 80, 16);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("… +5 more (ctrl+t to open)") && flat.contains("ctrl+t to open"),
+        "capped, the ellipsis and the badge both name the open: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 16);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("… +5 more (wheel to walk)"),
+        "open on a short screen the window cannot widen, so the ellipsis names \
+         the wheel: {flat:?}"
+    );
+    assert!(
+        flat.contains("ctrl+t to hide"),
+        "and the badge names what the chord does next — the fold: {flat:?}"
+    );
+    assert!(
+        !flat.contains("ctrl+t to open"),
+        "no row promises the chord as the way in: {flat:?}"
+    );
+}
+
+#[test]
 fn a_full_plan_taller_than_the_screen_caps_and_the_wheel_walks_it() {
     // Opened, the section still answers to the screen: a plan taller
     // than the screen minus its furniture opens up to that height and
@@ -12520,7 +12567,7 @@ fn ctrl_t_opens_only_when_the_cap_cut_an_entry() {
         "the capped posture cut two entries and says so: {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row.contains("ctrl+t to show all")),
+        rows.iter().any(|row| row.contains("ctrl+t to open")),
         "a cut cap names the whole list its press opens: {rows:?}"
     );
 

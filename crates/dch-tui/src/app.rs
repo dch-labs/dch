@@ -80,7 +80,6 @@ use self::paint::welcome::{WelcomeShape, WelcomeState};
 use self::queue::QueueMode;
 use self::run::FRAME_INTERVAL;
 use self::todos::PlanView;
-pub(crate) use self::todos::TODO_SECTION_BODY_ROWS;
 use crate::markdown;
 use crate::todo_view;
 
@@ -2087,13 +2086,13 @@ impl TuiApp {
     /// The cycle spends its press differently per posture — and the
     /// capped posture's press depends on whether the cap actually cut
     /// an entry — so the badge tells the truth for the state it stands
-    /// in: a cut cap names the whole list, a whole cap and the open
-    /// list name the fold. `None` for the hidden posture, whose one
-    /// row carries its own hint.
+    /// in: a cut cap names the open, a whole cap and the open list
+    /// name the fold. `None` for the hidden posture, whose one row
+    /// carries its own hint.
     fn plan_chord_hint(&self) -> Option<&'static str> {
         match self.plan.plan_view {
             PlanView::Hidden => None,
-            PlanView::Capped if self.plan.plan_cut.get() => Some("ctrl+t to show all"),
+            PlanView::Capped if self.plan.plan_cut.get() => Some("ctrl+t to open"),
             PlanView::Full | PlanView::Capped => Some("ctrl+t to hide"),
         }
     }
