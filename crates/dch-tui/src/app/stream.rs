@@ -225,9 +225,10 @@ impl FreezeCache {
     /// Drops the frozen lines, offset, and separator count; the next
     /// layout re-freezes from the buffer's start. Called when the
     /// buffer empties (the reply graduated or the turn failed), its
-    /// frozen prefix stops matching, or the pane width changes.
-    /// Returns whether any rendered lines were dropped.
-    fn reset(&mut self) -> bool {
+    /// frozen prefix stops matching, the pane width changes, or the
+    /// session's renders are invalidated wholesale. Returns whether
+    /// any rendered lines were dropped.
+    pub(crate) fn reset(&mut self) -> bool {
         let dropped = !(self.frozen_lines.is_empty() && self.live_lines.is_empty());
         self.frozen_lines.clear();
         self.frozen_upto = 0;

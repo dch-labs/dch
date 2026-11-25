@@ -387,7 +387,7 @@ fn painted_text(row: &[(String, Color, Color)]) -> String {
 ///
 /// The pill spans one fill cell proud of the word on either side, so
 /// callers index relative to the returned column: `column - 1` is the
-/// lead fill, `column` through `column + 4` the letters, `column + 5`
+/// lead fill, `column` through `column + 5` the letters, `column + 6`
 /// the trail fill.
 fn badge_at(painted: &[Vec<(String, Color, Color)>]) -> (usize, usize) {
     let row = painted
@@ -407,7 +407,7 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
 
     let painted = painted_rows(&mut app, 80, 24);
     let (row, column) = badge_at(&painted);
-    for offset in 0..5 {
+    for offset in 0..6 {
         let (symbol, fg, bg) = &painted[row][column + offset];
         assert_eq!(
             *bg, app.theme.ui.secondary,
@@ -418,7 +418,7 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
             "the canvas color keeps the letters legible on the accent"
         );
     }
-    for proud in [column - 1, column + 5] {
+    for proud in [column - 1, column + 6] {
         let (_, _, bg) = &painted[row][proud];
         assert_eq!(
             *bg, app.theme.ui.secondary,
@@ -478,7 +478,7 @@ fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
 
     let painted = painted_rows(&mut app, 80, 24);
     let (row, column) = badge_at(&painted);
-    for offset in 0..5 {
+    for offset in 0..6 {
         let (_, fg, bg) = &painted[row][column + offset];
         assert_eq!(
             *bg, app.theme.ui.secondary,
@@ -512,7 +512,7 @@ fn a_deferring_theme_leaves_the_badge_unfilled() {
 
     let painted = painted_rows(&mut app, 80, 24);
     let (row, column) = badge_at(&painted);
-    for (_, _, bg) in painted[row].iter().skip(column - 1).take(7) {
+    for (_, _, bg) in painted[row].iter().skip(column - 1).take(8) {
         assert_eq!(
             *bg,
             Color::Reset,

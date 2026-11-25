@@ -89,15 +89,18 @@ mod tests;
 ///
 /// Installed by the mode driver to persist the session transcript;
 /// receives the conversation snapshot and, when a turn end arrived
-/// since the last fire, the engine's own history snapshot for that
-/// turn — full on success, committed-only on failure — so the host
-/// persists both halves without reaching into display state.
+/// since the last fire, the newest engine history a publication
+/// landed — which only a successful turn publishes; a failed turn's
+/// committed-only half is stale by design and reaches no
+/// publication, so the hook sees `None` there and the host re-reads
+/// the engine's state at its own resolution — persisting both
+/// halves without reaching into display state.
 type TurnEndHook =
     Box<dyn Fn(&[TuiMessage], Option<&Arc<Vec<loopctl::message::Message>>>) + Send + Sync>;
 
 /// The host's wiring and the session's identity: the lanes the
-/// driver installed, the session's id and place, and the row the
-/// status bar reads them onto.
+/// driver installed, the session's id the status bar shows, and the
+/// place the row above the composer spells.
 ///
 /// Everything the embedding host hands the shell before the run loop
 /// starts, in one place — the submit, guidance, session-update, and
@@ -163,18 +166,19 @@ pub(crate) struct HostLanes {
     /// `None` when no id is displayed or the segment is fully clipped.
     pub(crate) session_id_span: std::cell::Cell<Option<(u16, u16, u16)>>,
 
-    /// The working directory's own name, as the status bar shows it.
+    /// The working directory, as the host handed it over.
     ///
-    /// Set by the host at launch with the directory the runner
-    /// operates in, reduced to its leaf — the path that leads to it
-    /// never shows — so a frame paints it without touching the
-    /// filesystem.
+    /// Stored whole — the path as given — and spelled at paint time
+    /// by the place row above the composer per the config's
+    /// `path_style`: the full path or its `~`-relative shape. The
+    /// string is the only holder, so a frame paints it without
+    /// touching the filesystem.
     pub(crate) working_dir: Option<String>,
 
-    /// The git branch beside the working directory's name.
+    /// The git branch beside the working directory.
     ///
     /// Set by the host at launch from the workdir's repository; the
-    /// bar renders it in parentheses after the folder's name, and
+    /// place row renders it in parentheses after the directory, and
     /// nothing when the workdir sits in no working tree.
     pub(crate) git_branch: Option<String>,
 }
@@ -771,7 +775,9 @@ impl TuiApp {
     /// session-scoped mode override dies with the conversation it was
     /// recorded against: the adopted session's own mode stands, and
     /// `/unset permission_mode` in it must not resurrect the previous
-    /// session's original.
+    /// session's original. The conversation is replaced through
+    /// [`Self::replace_conversation_with`], which also drops the bake
+    /// and the index-keyed expansions the old rows keyed.
     fn adopt_resumed_session(
         &mut self,
         id: String,
@@ -784,10 +790,7 @@ impl TuiApp {
         self.compaction_summary_owed.clear();
         self.plan.latest_todos.clear();
         self.plan.todo_section_changes.clear();
-        self.conversation.clear();
-        self.seed_messages(transcript);
-        self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
-        self.pointer.selection = None;
+        self.replace_conversation_with(transcript);
         self.queue.handed = None;
         self.state
             .queued
@@ -807,6 +810,34 @@ impl TuiApp {
         }
         self.host.session_id = Some(id);
         self.scroll.scroll_to_bottom();
+    }
+
+    /// Replace the conversation wholesale: seed `transcript` over an
+    /// empty one and drop every render that keyed on the old rows.
+    ///
+    /// The one seam both wholesale replacements share — a live resume
+    /// adopting a saved transcript, a `/clear` starting a fresh one.
+    /// The bake's reset guard keys on width and length alone, so a
+    /// replacement that grows would splice the abandoned rows under
+    /// the new head; the bake is dropped whole here instead. The
+    /// index-keyed expansions die with the conversation that named
+    /// them — a thinking section or compaction expanded by position in
+    /// the old conversation is nothing the new one ever opened, and a
+    /// driverless host has no adoption reply to drop them later — and
+    /// the selection goes with the rows it spanned. The todo deltas
+    /// keyed by the old transcript's call ids die with it too: the
+    /// seeding walk records the resumed transcript's own deltas afresh
+    /// over the emptied map, and a cleared session carries none.
+    fn replace_conversation_with(&mut self, transcript: Vec<TuiMessage>) {
+        self.conversation.clear();
+        self.plan.todo_changes.clear();
+        self.plan.todo_section_changes.clear();
+        self.seed_messages(transcript);
+        self.bake.rebake_whole();
+        self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
+        self.expansion.expanded_thinking.clear();
+        self.expansion.expanded_compactions.clear();
+        self.pointer.selection = None;
     }
 
     /// How long a theme switch waits for the event reader to
@@ -2055,13 +2086,13 @@ impl TuiApp {
     /// The cycle spends its press differently per posture — and the
     /// capped posture's press depends on whether the cap actually cut
     /// an entry — so the badge tells the truth for the state it stands
-    /// in: a cut cap names the whole list, a whole cap and the open
-    /// list name the fold. `None` for the hidden posture, whose one
-    /// row carries its own hint.
+    /// in: a cut cap names the open, a whole cap and the open list
+    /// name the fold. `None` for the hidden posture, whose one row
+    /// carries its own hint.
     fn plan_chord_hint(&self) -> Option<&'static str> {
         match self.plan.plan_view {
             PlanView::Hidden => None,
-            PlanView::Capped if self.plan.plan_cut.get() => Some("ctrl+t to show all"),
+            PlanView::Capped if self.plan.plan_cut.get() => Some("ctrl+t to open"),
             PlanView::Full | PlanView::Capped => Some("ctrl+t to hide"),
         }
     }
@@ -2078,7 +2109,8 @@ impl TuiApp {
     /// it. The tail renders alone, so its row indexes are
     /// tail-relative; the frame's merged view products are rebuilt
     /// with the tail rebased by the bake's line count, and the bake's
-    /// own metadata lives in [`Self::conversation_bake_meta`].
+    /// own metadata lives on the bake's `conversation_bake_meta`
+    /// field.
     fn bake_conversation_cache(&mut self, text_area: Rect, width: u16) {
         if self.bake.conversation_cache_width != width
             || self.conversation.len() < self.bake.conversation_baked_through
@@ -2300,6 +2332,7 @@ impl TuiApp {
                     success,
                 } => {
                     self.plan.plan_interrupted = !success;
+                    self.exit.cancel_arm = false;
                     if let Some(TuiMessage::Assistant {
                         duration_ms: reply_duration,
                         ..

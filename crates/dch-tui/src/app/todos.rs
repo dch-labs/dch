@@ -190,7 +190,7 @@ impl TuiApp {
             inner,
             TODO_SECTION_BODY_ROWS,
             self.plan.clamped_todo_skip(),
-            self.plan_chord_hint(),
+            (self.plan_chord_hint(), self.plan.plan_cut_way()),
         )
         .last()
         .is_some_and(|line| {
@@ -297,6 +297,7 @@ impl TuiApp {
         };
         self.full_body_cap.set(body_cap);
         let chord_hint = self.plan_chord_hint();
+        let cut_way = self.plan.plan_cut_way();
         let lines = todo_view::section_lines(
             &self.plan.latest_todos,
             &self.plan.todo_section_changes,
@@ -304,7 +305,7 @@ impl TuiApp {
             inner,
             body_cap,
             self.plan.clamped_todo_skip(),
-            chord_hint,
+            (chord_hint, cut_way),
         );
         let cut = body_cap != usize::MAX
             && matches!(lines.last(), Some(line)
@@ -443,8 +444,11 @@ pub(crate) struct PlanState {
     /// The conversation's per-update block accents exactly these
     /// rows: the ids whose status moved in that call, against the
     /// snapshot the previous call left. Bounded with the transcript
-    /// itself; the map rides in memory only — a resumed session
-    /// accents nothing, which reads correctly as "no deltas known".
+    /// itself; the map rides in memory only and dies with the rows it
+    /// keyed — a fresh or cleared session carries no deltas, and the
+    /// resume path re-derives its accents from the seeding walk, which
+    /// records each restored update's deltas against the snapshot
+    /// before it.
     pub(crate) todo_changes: HashMap<String, HashMap<String, todo_view::TodoStatus>>,
 
     /// The rows the newest todo update changed, for the plan section.
@@ -468,11 +472,12 @@ pub(crate) struct PlanState {
     /// The plan section's posture, as Ctrl+T or a click leaves it.
     ///
     /// Capped by default — four task rows and the ellipsis — with one
-    /// press, the chord or a click on the section, opening the whole
-    /// list and the next folding the section away. A view preference,
-    /// not a mode: no keys are owned, the plan keeps updating
-    /// underneath, and every claim starts the next run's plan from the
-    /// capped posture whatever the last run left. The cycle skips the
+    /// press, the chord or a click on the section, opening the list up
+    /// to the screen's height and the next folding the section away. A
+    /// view preference, not a mode: no keys are owned, the plan keeps
+    /// updating underneath, and the claims leave the posture standing
+    /// — whatever the last run left is what the next run's plan opens
+    /// in. The cycle skips the
     /// open posture when the capped one already shows every entry —
     /// opening a list that stands whole changes nothing, so the press
     /// spends itself on the fold.
@@ -482,11 +487,11 @@ pub(crate) struct PlanState {
     ///
     /// The layout computes the section's rows from the same render the
     /// frame draws, so it is the one place that already knows whether
-    /// the cap ate anything; the cell carries that answer across the
-    /// `&self` render into the key press that cycles the posture.
-    /// Fresh until the first frame renders — `false` reads as "the cap
-    /// cut nothing", which is at worst one skipped posture step before
-    /// the first frame draws.
+    /// the cap ate anything; the cell carries that answer to the chord
+    /// hint the identity row names — whether to offer the grow chord —
+    /// while the posture cycle measures fresh at its own press. Fresh
+    /// until the first frame renders — `false` reads as "the cap cut
+    /// nothing" until one proves otherwise.
     pub(crate) plan_cut: std::cell::Cell<bool>,
 
     /// The pinned section's scroll: how many entries the window skips.
@@ -648,6 +653,21 @@ impl PlanState {
     /// Down moves deeper into the plan, up back toward its head; the
     /// clamp keeps at least one entry on screen either way, so the
     /// window never scrolls past the plan's end.
+    /// The gesture that reaches the cut rows, for the ellipsis.
+    ///
+    /// The posture decides it: while the cap holds the window the
+    /// chord opens the list, and once the list is open the wheel walks
+    /// it — the chord there folds the section, so naming it would
+    /// promise the opposite of the next press. Open follows the
+    /// posture, never the window's size: a screen too short to widen
+    /// the window still leaves the wheel as the way in.
+    pub(super) fn plan_cut_way(&self) -> &'static str {
+        match self.plan_view {
+            PlanView::Full => "wheel to walk",
+            PlanView::Capped | PlanView::Hidden => "ctrl+t to open",
+        }
+    }
+
     pub(crate) fn scroll_todo_section(&mut self, up: bool) {
         if self.latest_todos.is_empty() {
             return;
@@ -722,18 +742,19 @@ pub(crate) enum ThinkingMode {
 /// leaves it.
 ///
 /// One chord — or one click on the section — walks the three: capped
-/// at its four task rows with the cut named, opened to the whole list
-/// however tall, or folded away entirely. A posture is a view
+/// at its four task rows with the cut named, opened up to the screen's
+/// height with the wheel walking a taller plan, or folded away
+/// entirely. A posture is a view
 /// preference — the plan keeps updating underneath every one of them,
-/// and the run's landing clears the section out of whatever posture
-/// it was in.
+/// and the claims leave it standing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanView {
     /// Capped at [`TODO_SECTION_BODY_ROWS`] task rows, the ellipsis
     /// naming the rest and the chord that shows them.
     Capped,
 
-    /// The whole list — the section grows to whatever the plan holds,
+    /// Opened to the whole list up to the screen's height — taller
+    /// plans cap with the ellipsis, and the wheel walks the rest —
     /// because opening it is a deliberate act with the cost in plain
     /// sight.
     Full,

@@ -614,7 +614,12 @@ fn folded_hint(rows: &[TodoRow], colors: &TodoColors) -> Line<'static> {
 /// that one row, it stands there instead — no ellipsis at all, the
 /// whole list on screen for the price of the count that hid it.
 /// The caller's height arithmetic counts what this returns, so the
-/// layout always pays for exactly what is painted.
+/// layout always pays for exactly what is painted. `ways` carries the
+/// two gestures the section may name: the chord's next act for the
+/// badge, and the way to the cut rows for the ellipsis — the caller's,
+/// because it knows the posture: the chord while the cap holds the
+/// window, the wheel once the window is open, where the chord would
+/// fold the section.
 pub(crate) fn section_lines(
     rows: &[TodoRow],
     changes: &HashMap<String, TodoStatus>,
@@ -622,7 +627,7 @@ pub(crate) fn section_lines(
     width: u16,
     body_cap: usize,
     skip: usize,
-    chord_hint: Option<&'static str>,
+    ways: (Option<&'static str>, &'static str),
 ) -> Vec<Line<'static>> {
     let mut badge_spans = vec![
         Span::styled(
@@ -637,6 +642,7 @@ pub(crate) fn section_lines(
             Style::default().fg(colors.dim),
         ),
     ];
+    let (chord_hint, cut_way) = ways;
     if let Some(chord) = chord_hint {
         badge_spans.push(Span::raw(" · "));
         badge_spans.push(Span::styled(
@@ -670,7 +676,7 @@ pub(crate) fn section_lines(
     let more = rows.len().saturating_sub(skip).saturating_sub(shown);
     if more > 0 {
         lines.push(Line::styled(
-            format!("… +{more} more (ctrl+t for all)"),
+            format!("… +{more} more ({cut_way})"),
             Style::default().fg(colors.dim),
         ));
     }
@@ -801,7 +807,15 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 2, None);
+        let lines = section_lines(
+            &rows,
+            &HashMap::new(),
+            &colors,
+            60,
+            4,
+            2,
+            (None, "ctrl+t to open"),
+        );
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -956,7 +970,15 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, 0, None);
+        let lines = section_lines(
+            &rows,
+            &HashMap::new(),
+            &colors,
+            60,
+            0,
+            0,
+            (None, "ctrl+t to open"),
+        );
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -968,7 +990,7 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             .collect();
         assert_eq!(
             text.last().expect("an ellipsis stands last"),
-            "… +3 more (ctrl+t for all)",
+            "… +3 more (ctrl+t to open)",
             "a zero budget hides nothing yet counts it as shown"
         );
         assert_eq!(
@@ -1054,7 +1076,15 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, 0, None);
+        let lines = section_lines(
+            &rows,
+            &HashMap::new(),
+            &colors,
+            60,
+            0,
+            0,
+            (None, "ctrl+t to open"),
+        );
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1097,7 +1127,15 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 0, None);
+        let lines = section_lines(
+            &rows,
+            &HashMap::new(),
+            &colors,
+            60,
+            4,
+            0,
+            (None, "ctrl+t to open"),
+        );
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1130,7 +1168,15 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
                 status: TodoStatus::Pending,
             })
             .collect();
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 0, None);
+        let lines = section_lines(
+            &rows,
+            &HashMap::new(),
+            &colors,
+            60,
+            4,
+            0,
+            (None, "ctrl+t to open"),
+        );
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1142,7 +1188,7 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             .collect();
         assert!(
             text.iter()
-                .any(|line| line.contains("+2 more (ctrl+t for all)")),
+                .any(|line| line.contains("+2 more (ctrl+t to open)")),
             "a cut that hides two keeps its ellipsis: {text:?}"
         );
     }
@@ -1209,7 +1255,15 @@ mod long_subject_wrap {
 
         // And the section's arithmetic pays for the wrap: the open
         // posture's line count includes every continuation row.
-        let section = section_lines(&rows, &HashMap::new(), &colors, 30, usize::MAX, 0, None);
+        let section = section_lines(
+            &rows,
+            &HashMap::new(),
+            &colors,
+            30,
+            usize::MAX,
+            0,
+            (None, "ctrl+t to open"),
+        );
         assert_eq!(
             section.len(),
             lines.len() + 2,
@@ -1266,7 +1320,15 @@ mod review_2026_11_01_round {
             subject,
             status: TodoStatus::Pending,
         }];
-        let lines = section_lines(&rows, &HashMap::new(), &plain_colors(), 20, 4, 0, None);
+        let lines = section_lines(
+            &rows,
+            &HashMap::new(),
+            &plain_colors(),
+            20,
+            4,
+            0,
+            (None, "ctrl+t to open"),
+        );
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1278,7 +1340,7 @@ mod review_2026_11_01_round {
             .collect();
         assert!(
             text.iter()
-                .any(|line| line.contains("+1 more (ctrl+t for all)")),
+                .any(|line| line.contains("+1 more (ctrl+t to open)")),
             "the entry's unrendered rows stand behind the ellipsis: {text:?}"
         );
         assert_eq!(

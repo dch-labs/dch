@@ -2180,11 +2180,11 @@ fn a_turn_end_hook_fires_for_surfaced_errors() {
 
 #[test]
 fn the_error_block_separates_from_the_tool_footer_it_lands_beneath() {
-    // Session 1fab4451's shape: a long tool call completes, then the
-    // next model request dies. The error block must open on rows of
-    // its own — a spacer between the tool's duration footer and the
-    // failure, then a header naming the request's own facts — so the
-    // failure reads as the model request's, never the tool's.
+    // A long tool call completes, then the next model request dies.
+    // The error block must open on rows of its own — a spacer between
+    // the tool's duration footer and the failure, then a header naming
+    // the request's own facts — so the failure reads as the model
+    // request's, never the tool's.
     let now = chrono::Utc::now();
     let mut app = app();
     app.seed_messages(vec![
@@ -5030,10 +5030,10 @@ fn a_seated_pane_grounds_its_canvas_and_keeps_its_surfaces() {
 
 #[test]
 fn the_scrolled_error_block_renders_its_header_and_wrapped_detail() {
-    // The 502 shape from session 1fab4451: an API error with an HTML
+    // A provider's HTML error page: an API error with an HTML
     // edge body bakes into the conversation with its header naming
     // the attempts, the status, and the gateway tag, and the detail
-    // wraps as clean rows — no control bytes from the provider's
+    // wraps as clean rows — no escape debris from the provider's
     // page riding into the cells.
     let now = chrono::Utc::now();
     let mut app = app();
@@ -5059,7 +5059,7 @@ fn the_scrolled_error_block_renders_its_header_and_wrapped_detail() {
         },
         TuiMessage::Error {
             text: "API error: stream (stream failed before completing after 4 attempts: \
-HTTP error: HTTP 502: <html><head><title>502 Bad Gateway</title></head>\
+HTTP error: HTTP 502: <html><head><title>502 Bad Gateway\u{1b}[2J</title></head>\
 <hr><center>alibaba-ga</center></html>) and fallback failed: HTTP error: \
 HTTP 502: upstream reset"
                 .to_string(),
@@ -5079,6 +5079,20 @@ HTTP 502: upstream reset"
     assert!(
         header.contains("alibaba-ga"),
         "the sanitized gateway tag rides the header: {header:?}"
+    );
+    let detail_rows = rows
+        .iter()
+        .filter(|row| row.contains("502 Bad Gateway") || row.contains("upstream reset"))
+        .collect::<Vec<_>>();
+    assert!(
+        !detail_rows.is_empty(),
+        "the provider's page renders as visible detail rows beneath the header"
+    );
+    assert!(
+        rows.iter().all(|row| !row.contains("[2J")),
+        "the page's escape leaves no parameter-byte debris in any row — the \
+         terminal drops the escape byte itself, so the sequence's parameters are \
+         what an unsanitized row would paint: {rows:?}"
     );
 }
 
@@ -6965,7 +6979,7 @@ fn a_permission_sheet_strips_the_clusters_the_screen_cannot_size() {
 
 #[test]
 fn a_sheet_tells_selector_differing_commands_apart() {
-    // Findings B and C: two commands differing only by a composition
+    // Two commands differing only by a composition
     // input must never share one preview — the approval runs the
     // original, so the sheet has to show which one it holds. The
     // preview renders the removed input as a visible escape while no
@@ -7372,6 +7386,64 @@ fn the_question_sheet_reserves_its_rows_above_the_conversation() {
     assert!(
         screen.contains("Type your answer"),
         "the compose row rides after the options: {screen}"
+    );
+}
+
+#[test]
+fn a_whitespace_draft_at_rest_reads_as_no_draft() {
+    // The at-rest compose row tells the sheet's own truth: Enter on the
+    // rows reopens a whitespace draft rather than sending, and the
+    // composing hint already says a written answer is required — so a
+    // draft of nothing but blanks shows the placeholder with the
+    // no-draft subtext, never blank cells under an "enter sends it"
+    // promise. A contrast case with real wording reads the other way.
+    let (mut app, answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    write(&mut app, "x");
+    app.handle_event(&plain(KeyCode::Backspace));
+    app.handle_event(&plain(KeyCode::Char(' ')));
+    app.handle_event(&plain(KeyCode::Esc));
+    let mut answers = answers;
+    let at_rest = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        at_rest.contains("Type your answer")
+            && at_rest.contains("a reply the options did not offer"),
+        "a whitespace-only draft reads as no draft at rest:\n{at_rest}"
+    );
+    assert!(
+        !at_rest.contains("enter sends it"),
+        "nothing promises a send for a draft Enter will only reopen:\n{at_rest}"
+    );
+    assert!(
+        matches!(
+            answers[0].try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "nothing was sent on the way out"
+    );
+
+    let (mut app, answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    let mut answers = answers;
+    write(&mut app, "src/");
+    app.handle_event(&plain(KeyCode::Esc));
+    let typed = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        typed.contains("src/") && typed.contains("enter sends it"),
+        "a draft with words keeps its row and its promise:\n{typed}"
+    );
+    assert!(
+        matches!(
+            answers[0].try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the contrast case sent nothing either"
     );
 }
 
@@ -9110,13 +9182,16 @@ fn the_expanded_live_body_caps_rendered_lines() {
     // One logical line, far wider than the pane: it wraps into far
     // more rendered rows than the cap, so only the cap's tail may
     // render while the stream is live.
-    let wall = "word ".repeat(4000);
+    // A backend tall enough to show more than the cap's rows: at the
+    // pane's height every frame would satisfy the bound, capped or not.
+    let wall = "word ".repeat(40_000);
     observer.on_thinking_delta(&thinking_delta(0, &wall));
-    let rows = rendered_rows(&mut app, 80, 24);
+    let rows = rendered_rows(&mut app, 80, 600);
     let body = rows.iter().filter(|row| row.contains("word")).count();
-    assert!(
-        body <= 500,
-        "the live body renders at most the cap's wrapped lines, got {body}"
+    assert_eq!(
+        body, 500,
+        "the live body renders exactly the cap's wrapped lines — the wall wraps to \
+         thousands without it"
     );
 }
 
@@ -11071,7 +11146,7 @@ fn a_long_plan_caps_its_section_and_names_the_cut() {
         "the fraction counts the whole plan, not the window: {flat:?}"
     );
     assert!(
-        flat.contains("… +5 more (ctrl+t for all)"),
+        flat.contains("… +5 more (ctrl+t to open)"),
         "nine tasks, four shown: the section names its cut and the chord \
          that opens the whole list: {flat:?}"
     );
@@ -11131,8 +11206,146 @@ fn a_long_plan_caps_its_section_and_names_the_cut() {
     let terminal = render_to_buffer(&mut app, 80, 40);
     let flat: String = row_texts(&terminal).join("\n");
     assert!(
-        flat.contains("… +5 more (ctrl+t for all)"),
+        flat.contains("… +5 more (ctrl+t to open)"),
         "the walk returns to the capped posture: {flat:?}"
+    );
+}
+
+#[test]
+fn a_cut_open_plan_on_a_short_screen_names_the_wheel_not_the_folding_chord() {
+    // The open posture on a screen too short to widen its window: the
+    // body cap falls back to four rows, a plan longer than that still
+    // cuts, and the chord's next press folds the section — so the
+    // ellipsis must name the wheel, the one gesture that reaches the
+    // cut rows, and agree with the badge that names the fold. Before
+    // the fix it inferred the posture from the window's size and
+    // promised the chord that would hide the list.
+    let mut app = app();
+    let tasks: Vec<String> = (0..9)
+        .map(|index| {
+            format!("{{\"id\":\"{index}\",\"subject\":\"task {index}\",\"status\":\"pending\"}}")
+        })
+        .collect();
+    todo_graduation(
+        &app,
+        "call-short",
+        &format!("{{\"todos\":[{}]}}", tasks.join(",")),
+    );
+    let terminal = render_to_buffer(&mut app, 80, 16);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("… +5 more (ctrl+t to open)") && flat.contains("ctrl+t to open"),
+        "capped, the ellipsis and the badge both name the open: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 16);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("… +5 more (wheel to walk)"),
+        "open on a short screen the window cannot widen, so the ellipsis names \
+         the wheel: {flat:?}"
+    );
+    assert!(
+        flat.contains("ctrl+t to hide"),
+        "and the badge names what the chord does next — the fold: {flat:?}"
+    );
+    assert!(
+        !flat.contains("ctrl+t to open"),
+        "no row promises the chord as the way in: {flat:?}"
+    );
+}
+
+#[test]
+fn a_full_plan_taller_than_the_screen_caps_and_the_wheel_walks_it() {
+    // Opened, the section still answers to the screen: a plan taller
+    // than the screen minus its furniture opens up to that height and
+    // names the rest with the ellipsis, and the wheel over the section
+    // walks the window an entry at a time — the open posture is a
+    // taller window, never an unbounded one.
+    let mut app = app();
+    let tasks: Vec<String> = (0..30)
+        .map(|index| {
+            format!("{{\"id\":\"{index}\",\"subject\":\"task {index}\",\"status\":\"pending\"}}")
+        })
+        .collect();
+    todo_graduation(
+        &app,
+        "call-tall",
+        &format!("{{\"todos\":[{}]}}", tasks.join(",")),
+    );
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("… +26 more"),
+        "capped, four of thirty show: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let flat: String = rows.join("\n");
+    assert!(
+        flat.contains("… +18 more"),
+        "opened, the section grows to the screen's height — twelve of thirty — \
+         and names the rest: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{2610} task 11") && !flat.contains("\u{2610} task 12"),
+        "the window holds the first twelve tasks and no more: {flat:?}"
+    );
+    let section_row = rows
+        .iter()
+        .position(|row| row.contains(" TODO "))
+        .unwrap_or_else(|| panic!("the badge row stands in the section: {flat:?}"));
+    assert!(app.handle_event(&Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 1,
+        row: u16::try_from(section_row).unwrap_or(u16::MAX),
+        modifiers: KeyModifiers::NONE,
+    })));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        !flat.contains("\u{2610} task 0 ") && flat.contains("\u{2610} task 12"),
+        "one notch stepped the window past the first task and brought the \
+         thirteenth in: {flat:?}"
+    );
+    assert!(
+        flat.contains("… +17 more (wheel to walk)"),
+        "once the window is open the ellipsis names the wheel, not the chord \
+         that would fold the section: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 1,
+        row: u16::try_from(section_row).unwrap_or(u16::MAX),
+        modifiers: KeyModifiers::NONE,
+    })));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("\u{2610} task 0 "),
+        "a notch up brings the first task back: {flat:?}"
+    );
+    for _ in 0..40 {
+        assert!(app.handle_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: u16::try_from(section_row).unwrap_or(u16::MAX),
+            modifiers: KeyModifiers::NONE,
+        })));
+    }
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("\u{2610} task 29") && !flat.contains("more ("),
+        "the window never scrolls past the plan's end: the last entry stays on \
+         screen and nothing is left to name: {flat:?}"
     );
 }
 
@@ -12350,11 +12563,11 @@ fn ctrl_t_opens_only_when_the_cap_cut_an_entry() {
     let rows = row_texts(&terminal);
     assert!(
         rows.iter()
-            .any(|row| row.contains("+2 more (ctrl+t for all)")),
+            .any(|row| row.contains("+2 more (ctrl+t to open)")),
         "the capped posture cut two entries and says so: {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row.contains("ctrl+t to show all")),
+        rows.iter().any(|row| row.contains("ctrl+t to open")),
         "a cut cap names the whole list its press opens: {rows:?}"
     );
 
@@ -12390,7 +12603,7 @@ fn ctrl_t_opens_only_when_the_cap_cut_an_entry() {
     let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
-            .any(|row| row.contains("+2 more (ctrl+t for all)")),
+            .any(|row| row.contains("+2 more (ctrl+t to open)")),
         "and the walk returns to the capped posture: {rows:?}"
     );
 }

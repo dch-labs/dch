@@ -54,8 +54,10 @@ struct CannedResponse {
 /// A canned provider endpoint on an ephemeral local port.
 ///
 /// Serves one response body per accepted connection, in the order they
-/// were scripted, and records every request body it receives — the
-/// recordings are how tests assert on what the model was shown (tool
+/// were scripted, and records every provider-turn request body it
+/// receives — session-title requests are answered from the canned
+/// title and withheld from the recording — the recordings are how
+/// tests assert on what the model was shown (tool
 /// results, resumed history, block messages) without touching the
 /// engine's internals. Each response closes the connection, so the
 /// provider client's keep-alive pool never couples two scripted turns
@@ -67,7 +69,8 @@ pub struct CannedServer {
     /// provider client dials this server and nothing else.
     port: u16,
 
-    /// Every request body received so far, in arrival order.
+    /// Every provider-turn request body received so far, in arrival
+    /// order.
     ///
     /// Shared with the accept thread, which appends as requests land;
     /// tests snapshot it to assert on what the model was shown.
@@ -283,12 +286,13 @@ impl CannedServer {
         self.port
     }
 
-    /// The request bodies received so far, in arrival order.
+    /// The provider-turn request bodies received so far, in arrival
+    /// order.
     ///
     /// A snapshot clone under the lock, so a scenario can read it
-    /// while the server thread keeps accepting; the order is the
-    /// order the connections arrived in, which is the order the
-    /// scripted turns ran.
+    /// while the server thread keeps accepting; session-title requests
+    /// are answered off-script and withheld, so the order is the order
+    /// the provider turns ran.
     pub fn requests(&self) -> Vec<String> {
         self.requests
             .lock()
@@ -301,8 +305,9 @@ impl CannedServer {
 ///
 /// Headers are consumed line by line until the blank separator; the
 /// `Content-Length` that follows names the body's bytes. A request the
-/// test binary never finishes writing yields `None` and the connection
-/// is answered with the server's run-dry response.
+/// test binary never finishes writing yields `None`: nothing is
+/// recorded for it, and the connection is served from the script like
+/// any other — the run-dry answer only once the script is spent.
 fn read_request(stream: &mut TcpStream) -> Option<String> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -1525,12 +1530,14 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// How long any discovery probe may spend connecting or reading.
+/// How long any discovery probe may spend on one connect or one read.
 ///
 /// The probes back the smoke suite's model discovery against
 /// endpoints nobody controls: one that accepts a connection but never
-/// answers must not hold discovery hostage behind it, so every probe
-/// fails on this bound and discovery moves on to its next candidate.
+/// answers must not hold discovery hostage behind it, so every connect
+/// and every read fails on this bound. The bound is per operation —
+/// an endpoint that drips a byte inside every window is not cut off
+/// as a whole.
 const PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One bounded connection to `host:port`, trying every address the
@@ -1553,14 +1560,6 @@ fn connect_bounded(host: &str, port: u16) -> Option<TcpStream> {
         .find_map(|address| TcpStream::connect_timeout(address, PROBE_BOUND).ok())
 }
 
-/// One minimal HTTP GET, returning the response body.
-///
-/// Speaks just enough HTTP for the model-listing endpoints the smoke
-/// discovery reads, against plain-`http` endpoints; a non-200 status,
-/// a connection failure, or a body that never arrives is a `None` the
-/// caller treats as "not listed here". Chunked transfer encoding —
-/// what Ollama actually answers with — is stripped before the body
-/// returns.
 /// Issue one small POST and return its 200 body, dechunked if needed.
 ///
 /// The Ollama control endpoints (`/api/show` among them) take the
@@ -1590,6 +1589,14 @@ fn http_post_body(host: &str, port: u16, path: &str, body: &str) -> Option<Strin
     }
 }
 
+/// One minimal HTTP GET, returning the response body.
+///
+/// Speaks just enough HTTP for the model-listing endpoints the smoke
+/// discovery reads, against plain-`http` endpoints; a non-200 status,
+/// a connection failure, or a body that never arrives is a `None` the
+/// caller treats as "not listed here". Chunked transfer encoding —
+/// what Ollama actually answers with — is stripped before the body
+/// returns.
 fn http_get_body(host: &str, port: u16, path: &str) -> Option<String> {
     let mut stream = connect_bounded(host, port)?;
     stream.set_read_timeout(Some(PROBE_BOUND)).ok()?;

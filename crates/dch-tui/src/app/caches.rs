@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// The accumulators one conversation render pass fills.
 ///
 /// A render of a message range produces the styled rows themselves
-/// and the five index structures the app's press resolution and
+/// and the index structures the app's press resolution and
 /// lane overlays read — one output, always filled together, so it
 /// folds into a single struct the pass fills. The bake pass owns
 /// the half the app keeps between frames; the tail pass starts
@@ -228,7 +228,7 @@ pub(super) struct LaneCaches {
 /// The cache is the bake plus the last message's fresh tail,
 /// recomposed whenever a mutation or a width change lands; the bake
 /// itself only grows, appending each message's rendered rows once a
-/// newer message follows. The index maps the frame's merged view
+/// newer message follows. The indexes the frame's merged view
 /// carries — tool rows, thinking sections, compaction notices,
 /// user-turn spans, prompt marks, todo blocks — are rebuilt from the
 /// bake's metadata and the tail's on every frame that draws.
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn no_rendered_cell_carries_a_composition_input_or_a_split_measure() {
-        // The incident pin: a streamed reply full of every cluster
+        // A streamed reply full of every cluster
         // class the screen cannot size — the joined family that
         // leaked beside its row, a selector cluster, a skin-tone
         // compound, a keycap, a flag pair, a tagged flag — renders
@@ -738,14 +738,14 @@ mod tests {
 
     #[test]
     fn chrome_rows_paint_the_stripped_projection() {
-        // The round-4 surfaces: the notice row (a user-typed theme
-        // argument rides it), the place row (the working directory),
-        // and the welcome screen's notice and directory caption —
-        // every chrome row that embeds outside text now paints the
-        // display projection, so no composition input reaches the
-        // screen outside the composer and the question draft, the
-        // two documented raw surfaces. The first draw catches the
-        // welcome's rows, the second the standing furniture once a
+        // The surfaces that embed outside text: the notice row (a
+        // user-typed theme argument rides it), the place row (the
+        // working directory), and the welcome screen's notice and
+        // directory caption — every chrome row that embeds outside
+        // text paints the display projection, so no composition input
+        // reaches the screen outside the composer and the question
+        // draft, the two documented raw surfaces. The first draw catches
+        // the welcome's rows, the second the standing furniture once a
         // message retires the welcome.
         let mut subject = app();
         let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
@@ -912,6 +912,158 @@ mod tests {
         assert!(
             texts.iter().any(|text| text.contains("p0")),
             "the rebake renders the surviving messages from scratch"
+        );
+    }
+
+    #[test]
+    fn an_adopted_resume_replaces_the_warm_bake_whole() {
+        // A live resume over a session that already rendered: the
+        // bake's reset keys on width and length alone, so a
+        // replacement that grows would splice the abandoned
+        // session's rows under the adopted one's tail — the head
+        // the resumed transcript opens with would never paint. The
+        // adoption drops the bake and the index-keyed expansions
+        // whole, so the next frame renders the resumed transcript
+        // from its own head and a section the old conversation had
+        // expanded stays closed in the new one.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        let now = chrono::Utc::now();
+        subject.push_message(TuiMessage::User {
+            text: "the abandoned session's prompt".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        });
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![crate::message::ContentBlock::Text {
+                text: "the abandoned session's reply".to_string(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        assert!(
+            subject.bake.conversation_baked_through >= 1,
+            "fixture premise: the abandoned session rendered a warm bake"
+        );
+        subject
+            .expansion
+            .expanded_thinking
+            .insert("m1b0".to_string());
+        subject.adopt_resumed_session(
+            "resumed".to_string(),
+            vec![
+                TuiMessage::User {
+                    text: "the resumed session's head".to_string(),
+                    timestamp: now,
+                    steered: false,
+                    unsent: false,
+                },
+                TuiMessage::Assistant {
+                    blocks: vec![crate::message::ContentBlock::Text {
+                        text: "the resumed session's reply".to_string(),
+                    }],
+                    timestamp: now,
+                    duration_ms: None,
+                },
+                TuiMessage::User {
+                    text: "the resumed session's follow-up".to_string(),
+                    timestamp: now,
+                    steered: false,
+                    unsent: false,
+                },
+            ],
+            crate::queue::ResumedTokens {
+                cumulative_input: 1,
+                cumulative_output: 2,
+                last_input: 3,
+                context_tokens: 4,
+            },
+        );
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        let texts = texts_of(&subject.bake.conversation_cache);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("the resumed session's head")),
+            "the resumed transcript renders from its own head"
+        );
+        assert!(
+            texts.iter().all(|text| !text.contains("abandoned")),
+            "no row of the abandoned session survives the adoption: {texts:?}"
+        );
+        assert!(
+            subject.expansion.expanded_thinking.is_empty(),
+            "an expansion keyed by position dies with the conversation that named it"
+        );
+    }
+
+    #[test]
+    fn an_adopted_resume_rederives_its_todo_deltas_per_restored_block() {
+        // The seeding walk is the resumed transcript's accent source:
+        // each restored TodoWrite block records its status changes
+        // against the snapshot the block before it left, keyed by its
+        // own call id — so the conversation's per-update blocks accent
+        // the rows that moved in that update, exactly as a live run's
+        // did. Deltas the replaced transcript left behind die with it.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject
+            .plan
+            .todo_changes
+            .insert("stale".to_string(), std::collections::HashMap::new());
+        let now = chrono::Utc::now();
+        let block = |call_id: &str, status: &str| crate::message::ContentBlock::Tool {
+            name: "TodoWrite".to_string(),
+            call_id: call_id.to_string(),
+            input_preview: String::new(),
+            success: true,
+            elapsed_secs: 0.0,
+            output_preview: String::new(),
+            retained_input: format!(
+                "{{\"todos\":[{{\"id\":\"0\",\"subject\":\"ship it\",\"status\":\"{status}\"}}]}}"
+            ),
+        };
+        let transcript = vec![
+            TuiMessage::Assistant {
+                blocks: vec![block("call-a", "pending")],
+                timestamp: now,
+                duration_ms: None,
+            },
+            TuiMessage::Assistant {
+                blocks: vec![block("call-b", "completed")],
+                timestamp: now,
+                duration_ms: None,
+            },
+        ];
+        subject.adopt_resumed_session(
+            "resumed".to_string(),
+            transcript,
+            crate::queue::ResumedTokens {
+                cumulative_input: 0,
+                cumulative_output: 0,
+                last_input: 0,
+                context_tokens: 0,
+            },
+        );
+        assert!(
+            !subject.plan.todo_changes.contains_key("stale"),
+            "a delta keyed by the replaced transcript's call id dies with it"
+        );
+        let second = subject
+            .plan
+            .todo_changes
+            .get("call-b")
+            .expect("the second restored block recorded its deltas");
+        assert_eq!(
+            second.get("0"),
+            Some(&crate::todo_view::TodoStatus::Completed),
+            "the second block's delta names the row that moved against the first block's snapshot"
+        );
+        assert!(
+            subject.plan.todo_changes.contains_key("call-a"),
+            "the first restored block recorded its deltas against the empty snapshot"
         );
     }
 

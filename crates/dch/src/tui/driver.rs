@@ -1235,6 +1235,47 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_publication_in_flight_at_the_abort_lands_before_the_teardown_returns() {
+        // The abort's reap: a poll already in flight on another worker
+        // runs its synchronous tail out before the task can be dropped
+        // — the exit-owned cancel's publication into the error lane is
+        // exactly such a tail, and the late drain that follows the
+        // teardown strips it by name. The teardown must not return
+        // ahead of that publication, or the strip reads an empty lane
+        // and the twin record lands after it. The tail is modeled as
+        // the drop the abort provokes: it runs on the worker when the
+        // cancellation is processed, and only awaiting the aborted
+        // handle guarantees it has run. A multi-thread runtime keeps
+        // the worker distinct from the caller; no timer rides the
+        // margin.
+        struct OnDrop(Arc<std::sync::Mutex<Vec<String>>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push("the cancel's record".to_string());
+            }
+        }
+        let lane = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let published = Arc::clone(&lane);
+        let in_flight = tokio::spawn(async move {
+            let _tail = OnDrop(published);
+            std::future::pending::<()>().await;
+        });
+        tear_down_driver_bounded(in_flight).await;
+        let landed = lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            landed,
+            ["the cancel's record"],
+            "the in-flight publication landed before the teardown returned"
+        );
+    }
+
     #[test]
     fn the_session_context_carries_the_runs_flag_statements() {
         // The driver's halves read the flags through this one wiring: a

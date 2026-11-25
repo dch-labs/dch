@@ -33,9 +33,11 @@ impl TuiApp {
     /// One wheel notch: up pages into the conversation, down toward the
     /// newest line.
     ///
-    /// The plain transcript and both overlays take their scrolling from
-    /// here, so a notch means the same distance and rearms auto-scroll on
-    /// the same terms wherever it arrives.
+    /// The plain transcript and the question sheet take their
+    /// scrolling from here, so a notch means the same distance and
+    /// rearms auto-scroll on the same terms on either surface; the
+    /// permission ask parks scrolling wholesale, and the plan
+    /// section's wheel keeps its own one-entry step.
     pub(crate) fn scroll_the_wheel(&mut self, up: bool) -> bool {
         if up {
             self.scroll.scroll_offset =

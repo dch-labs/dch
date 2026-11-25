@@ -169,7 +169,7 @@ impl TuiApp {
                 .max(1),
             body_cap,
             self.plan.clamped_todo_skip(),
-            chord_hint,
+            (chord_hint, self.plan.plan_cut_way()),
         );
         for_display_lines(&mut lines);
         frame.render_widget(
@@ -227,9 +227,10 @@ impl TuiApp {
     /// color, at rest and under the keys alike. In a theme that defers
     /// to the terminal the fill resets and the badge degrades to plain
     /// text — the letters keep at most a foreground voice, which
-    /// paints nothing. The render records the rect it filled — either
-    /// posture's rows — so a later click on the section answers
-    /// against the geometry this frame painted.
+    /// paints nothing. The render records its full seat — the inset
+    /// pane it paints, margins included — so a later click anywhere
+    /// in the section's rows answers, the same seat the plan section
+    /// records.
     pub(in crate::app) fn render_queue(&mut self, frame: &mut Frame, area: Rect) {
         if area.height == 0 || area.width == 0 {
             return;

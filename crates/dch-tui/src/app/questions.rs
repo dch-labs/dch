@@ -574,7 +574,7 @@ impl TuiApp {
         } else {
             "  "
         };
-        let has_draft = !ui.draft.is_empty();
+        let has_draft = !ui.draft.trim().is_empty();
         let body = if has_draft {
             ui.draft.as_str()
         } else {

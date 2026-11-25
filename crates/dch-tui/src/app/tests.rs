@@ -1521,6 +1521,370 @@ fn backtab_from_a_bare_stem_applies_the_last_row() {
 }
 
 #[test]
+fn backtab_over_a_stale_cycle_applies_the_last_row() {
+    // A cycle opened on a fragment freezes that fragment's short list.
+    // Edited back to a stem it no longer holds, the cycle is stale,
+    // not holding the line, and the first reverse press treats it as
+    // no cycle at all — re-deriving from the stem and landing on the
+    // last row — rather than stepping the frozen list's first entry.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let (_, full, _) = app.fresh_completion("/theme ");
+    assert!(full.len() >= 2, "themes offer more than one");
+    let last = full.last().cloned().unwrap_or_default();
+    let fragment = full
+        .iter()
+        .filter(|candidate| candidate.len() >= 2)
+        .find_map(|candidate| {
+            let stem = &candidate[..1];
+            let (_, filtered, _) = app.fresh_completion(&format!("/theme {stem}"));
+            (filtered.len() >= 2 && *filtered.first()? != *full.first()?)
+                .then(|| (stem.to_string(), filtered))
+        })
+        .expect("a stem whose filtered list starts off the full list's first row");
+    app.composer
+        .input
+        .set_text(format!("/theme {}", fragment.0));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    let applied = fragment.1.first().cloned().unwrap_or_default();
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {applied}"),
+        "fixture premise: the forward press applied the frozen list's first row"
+    );
+    // A paste-shaped mutation — no key wrapper runs — widens the stem
+    // past what the frozen list holds.
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {last}"),
+        "the stale cycle is treated as none: the first reverse press lands on the last row"
+    );
+}
+
+#[test]
+fn enter_over_a_stale_cycle_names_the_row_the_popup_highlights() {
+    // The fragment-opened cycle again: its frozen list is shorter than
+    // the one the popup now renders at the widened stem, so the two
+    // disagree about what stands at the cycle's index. Enter must name
+    // the row the screen highlights — the rendered list's — never the
+    // frozen list's, or Tab and Enter would commit different themes at
+    // one identical screen state.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let (_, full, _) = app.fresh_completion("/theme ");
+    let rendered_first = full.first().cloned().unwrap_or_default();
+    let stem = full
+        .iter()
+        .filter(|candidate| candidate.len() >= 2)
+        .find_map(|candidate| {
+            let stem = &candidate[..1];
+            let (_, filtered, _) = app.fresh_completion(&format!("/theme {stem}"));
+            (filtered.len() >= 2 && *filtered.first()? != rendered_first).then(|| stem.to_string())
+        })
+        .expect("a stem whose filtered list starts off the rendered list's first row");
+    app.composer.input.set_text(format!("/theme {stem}"));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    assert!(
+        app.browse.theme_before_browse.is_some(),
+        "fixture premise: the Tab parked the browse and previewed a palette"
+    );
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&rendered_first)
+            .map_or(rendered_first.clone(), |theme| theme.name.to_string()),
+        "Enter commits the row the popup highlights at the widened stem"
+    );
+    assert!(
+        app.browse.theme_before_browse.is_none(),
+        "the commit retired the browse"
+    );
+}
+
+#[test]
+fn a_paste_that_drifts_the_browse_retires_the_preview() {
+    // Paste is the one composer-mutating entry point the key wrapper
+    // never sees: a '/theme' browse the pasted text drifts away from
+    // must retire on the paste itself, or the screen keeps the
+    // previewed palette until some later key press spends the
+    // restore.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let original = app.theme.clone();
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert!(
+        app.browse.theme_before_browse.is_some(),
+        "fixture premise: the browse parked the session's own palette"
+    );
+    assert_ne!(
+        app.theme.name, original.name,
+        "fixture premise: the landed row previewed another palette"
+    );
+    assert!(app.handle_event(&crossterm::event::Event::Paste("x".to_string())));
+    assert!(
+        app.browse.theme_before_browse.is_none(),
+        "the drifted browse retired on the paste itself"
+    );
+    assert_eq!(
+        app.theme.name, original.name,
+        "the session's own palette came back with the retirement"
+    );
+}
+
+#[test]
+fn the_cancel_arm_dies_with_the_run_it_was_armed_against() {
+    // The queued-claim window: the driver ends one run and starts the
+    // next with no yield between the two flag stores, so the running
+    // flag is back up before any drain could read it down. The run's
+    // end rides the graduation the drain processes regardless of the
+    // flag, and the arm retires there — the next run's first Esc arms
+    // afresh instead of firing a cancel one press old.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let fired = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let count = std::rc::Rc::clone(&fired);
+    app.set_run_canceller(Box::new(move || count.set(count.get().saturating_add(1))));
+    app.state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(
+        app.exit.cancel_arm,
+        "fixture premise: the first Esc armed the ladder"
+    );
+    // Run A ends and B starts back to back: the end rides the
+    // graduation lane while the running flag never falls.
+    app.state
+        .graduations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(crate::observer::Graduation::RunEnded {
+            duration_ms: 1,
+            success: true,
+        });
+    app.drain_shared_state();
+    assert!(
+        !app.exit.cancel_arm,
+        "the arm retired with the run whose end the drain processed"
+    );
+    assert_eq!(fired.get(), 0, "no cancel fired on the way out");
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert_eq!(
+        fired.get(),
+        0,
+        "the next run's first Esc arms, never fires a cancel one press old"
+    );
+    assert!(
+        app.exit.cancel_arm,
+        "it arms the ladder afresh against the run in flight"
+    );
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert_eq!(fired.get(), 1, "and the second press is the cancel");
+}
+
+#[test]
+fn the_plan_posture_stands_across_a_run_s_end_and_a_clear() {
+    // The posture is a view preference the claims leave standing: a
+    // run's end and the claim it retires into touch the rows, never the
+    // posture, and a /clear replaces the conversation without folding
+    // the section — whatever the last run left is what the next run's
+    // plan opens in.
+    let mut subject = TuiApp::new(dch_config::DchConfig::default());
+    subject.plan.plan_view = PlanView::Full;
+    {
+        let mut graduations = subject
+            .state
+            .graduations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        graduations.push(crate::observer::Graduation::RunEnded {
+            duration_ms: 1,
+            success: true,
+        });
+        graduations.push(crate::observer::Graduation::Sent {
+            text: "the next run's prompt".to_string(),
+            steered: false,
+        });
+    }
+    subject.drain_shared_state();
+    assert_eq!(
+        subject.plan.plan_view,
+        PlanView::Full,
+        "the run's end and the claim after it left the posture standing"
+    );
+    command_output(&mut subject, "/clear");
+    assert_eq!(
+        subject.plan.plan_view,
+        PlanView::Full,
+        "the clear replaced the conversation and left the posture"
+    );
+}
+
+#[test]
+fn a_click_in_the_section_s_margins_flips_the_queue_posture() {
+    // The section records its full seat — the inset pane it paints and
+    // the margins beside it — and the click answers against that seat:
+    // a press on a margin column toggles the fold the same way a press
+    // on a painted row does, while a press outside the seat is not the
+    // section's.
+    let mut subject = TuiApp::new(dch_config::DchConfig::default());
+    subject.push_queued("waiting one".to_string());
+    subject.push_queued("waiting two".to_string());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| subject.render(frame)).unwrap();
+    let rect = subject.queue.queue_section_rect;
+    assert!(rect.height > 0, "the section rendered: {rect:?}");
+    let before = subject.queue.queue_posture;
+    assert!(
+        subject.toggle_queue_section_at(rect.x, rect.y.saturating_add(1)),
+        "a press on the seat's left margin is the section's"
+    );
+    assert_ne!(
+        subject.queue.queue_posture, before,
+        "and it flips the posture"
+    );
+    assert!(
+        !subject.toggle_queue_section_at(rect.right(), rect.y),
+        "a press past the seat's right edge is not the section's"
+    );
+}
+
+#[test]
+fn any_mouse_press_stands_the_quit_chord_down() {
+    // The chord must never fire from stale intent: a right-button
+    // press between the presses disarms it the same way a left press
+    // or a key does.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.quit.arm();
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(!app.quit.armed, "the right press spent the arm");
+}
+
+#[test]
+fn a_render_invalidation_resets_the_frozen_stream_whole() {
+    // The freeze's cached half: rows frozen under the palette that
+    // stood when they settled. A render invalidation drops the frozen
+    // prefix with the bake — or the cached half would keep serving
+    // the old colors until the stream's next delta or its graduation.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    *app.state
+        .streaming_text
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        "settled block one\n\nlive tail".to_string();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    assert!(
+        app.freeze.frozen_upto > 0,
+        "fixture premise: a block settled into the freeze"
+    );
+    app.invalidate_conversation_renders();
+    assert!(
+        app.freeze.frozen_lines.is_empty() && app.freeze.frozen_upto == 0,
+        "the invalidation drops the frozen prefix with the bake"
+    );
+}
+
+#[test]
+fn enter_over_a_bare_theme_browse_names_the_highlighted_row() {
+    // The browse's commit path: Enter over a bare '/theme ' stem —
+    // the popup standing, a row highlighted by the walk — names that
+    // row in the composer and submits it, so the session lands on
+    // the browsed choice rather than whatever the draft spelled.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let original = app.theme.clone();
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    let second = candidates.get(1).cloned().unwrap_or_default();
+    assert!(
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        "the walk applies and previews the landed row"
+    );
+    assert_ne!(
+        app.theme.name, original.name,
+        "fixture premise: the walk previewed another palette"
+    );
+    // Back to the bare stem the Enter arm reads, browse still standing.
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&second).map_or(second.clone(), |theme| theme.name.to_string()),
+        "the highlighted row's palette is the one the session committed"
+    );
+    assert!(
+        app.browse.theme_before_browse.is_none(),
+        "the commit retired the browse"
+    );
+}
+
+#[test]
+fn a_stood_down_strip_erases_the_row_it_last_painted() {
+    // The strip's exit discipline, read on the buffer that still holds
+    // the bar: a frame the strip does not paint must render its row
+    // blank rather than skip it, because the terminal contract asks
+    // every frame to render whole. The running strip paints its bar
+    // into a frame taken straight from the terminal's current buffer,
+    // the strip stands down, and the same buffer — no swap, no diff —
+    // must come back blank; a terminal draw could not tell the clear
+    // from the diff that rewrites every changed cell anyway.
+    let app = TuiApp::new(dch_config::DchConfig {
+        display: dch_config::DisplayConfig {
+            strip_style: StripStyle::Glow,
+            ..dch_config::DisplayConfig::default()
+        },
+        ..dch_config::DchConfig::default()
+    });
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).expect("terminal");
+    let area = ratatui::layout::Rect::new(0, 0, 80, 1);
+    app.state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        app.render_pulse_strip(&mut terminal.get_frame(), area),
+        "fixture premise: the running strip claimed the row"
+    );
+    let bar_cells = |frame: &mut ratatui::Frame<'_>| {
+        (0..80u16)
+            .filter(|column| {
+                frame
+                    .buffer_mut()
+                    .cell(ratatui::layout::Position::new(*column, 0))
+                    .is_some_and(|cell| cell.symbol() == "\u{2500}")
+            })
+            .count()
+    };
+    assert!(
+        bar_cells(&mut terminal.get_frame()) >= 40,
+        "fixture premise: the bar stands in the buffer"
+    );
+    app.state
+        .agent_running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        !app.render_pulse_strip(&mut terminal.get_frame(), area),
+        "the idle strip stands the row down"
+    );
+    let mut frame = terminal.get_frame();
+    let cleared = (0..80u16).all(|column| {
+        frame
+            .buffer_mut()
+            .cell(ratatui::layout::Position::new(column, 0))
+            .is_some_and(|cell| cell.symbol() == " " && cell.fg == ratatui::style::Color::Reset)
+    });
+    assert!(
+        cleared,
+        "the stood-down strip erased the bar its last painted frame left"
+    );
+}
+
+#[test]
 fn arrows_walk_the_suggestion_popup_and_preview_the_landed_row() {
     let mut app = TuiApp::new(dch_config::DchConfig::default());
     app.composer.input.set_text("/theme ".to_string());
@@ -1920,7 +2284,7 @@ fn the_flipped_highlight_covers_exactly_the_swept_cells() {
 
 #[test]
 fn the_identity_row_picker_and_completion_paint_the_stripped_projection() {
-    // Round 5's three surfaces on one welcome draw: the composer
+    // Three surfaces on one welcome draw: the composer
     // identity row (a free-form config model rides it), the
     // session picker's model column, and the completion popup's
     // candidate values. All paint the projection; the picker's
@@ -2393,7 +2757,7 @@ fn context_bar_readout_rounds_from_the_true_ratio() {
 }
 
 #[test]
-fn a_drained_verdict_replaces_the_notice_wording() {
+fn an_unconfirmed_drained_verdict_leaves_the_posted_wording_standing() {
     let mut app = TuiApp::new(dch_config::DchConfig::default());
     app.post_notice("selection copied".to_string());
     let mut slot = app.copy.copy_outcomes.lock().expect("the outcomes slot");
@@ -3876,13 +4240,14 @@ fn a_steer_of_an_open_edit_delivers_the_saved_words_literally() {
 }
 
 #[test]
-fn a_correction_the_channel_refuses_is_delivered_literally() {
-    // The gone-arm of an edit commit: the run claimed the prompt while
-    // its body stood in the composer, and the correction has no driver
-    // left to take it. The corrected wording is still a saved prompt's
-    // body, so the channel-less fallback delivers the words rather than
-    // parsing them: a body spelling `/clear` cannot clear the session
-    // in the very act of being corrected.
+fn a_correction_with_no_driver_is_delivered_literally() {
+    // The gone-arm of an edit commit on a host with no driver: the
+    // run claimed the prompt while its body stood in the composer,
+    // and nothing is left to take the correction. The corrected
+    // wording is still a saved prompt's body, so the driver-less
+    // fallback delivers the words rather than parsing them: a body
+    // spelling `/clear` cannot clear the session in the very act of
+    // being corrected.
     use crate::message::TuiMessage;
     let mut subject = app();
     subject.push_message(TuiMessage::System {
@@ -3921,10 +4286,66 @@ fn a_correction_the_channel_refuses_is_delivered_literally() {
 }
 
 #[test]
+fn a_correction_the_refused_channel_hands_back_to_the_composer() {
+    // The refused-send arm: a driver whose channel has gone silent
+    // takes nothing, so the corrected words come back the way every
+    // refused submit returns them — a notice naming the dead driver,
+    // the words in the composer, and no transcript row for a turn
+    // that never started.
+    use crate::message::TuiMessage;
+    let mut subject = app();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    subject.host.submit_tx = Some(tx);
+    drop(rx);
+    subject.push_message(TuiMessage::System {
+        text: "a row the session keeps".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let id = subject.push_queued("the prompt that went out".to_string());
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 0;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)));
+    subject
+        .composer
+        .input
+        .set_text("the corrected wording".to_string());
+    let _claimed = subject.remove_queued(id);
+    assert_eq!(
+        subject.queue_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(true),
+        "the save chord reaches the open edit"
+    );
+    assert_eq!(
+        subject.queued_len(),
+        0,
+        "the refused send re-queued nothing"
+    );
+    assert!(
+        subject.conversation.iter().all(|message| !matches!(
+            message,
+            TuiMessage::User { text, .. } if text == "the corrected wording"
+        )),
+        "no transcript row for words that never left"
+    );
+    assert_eq!(
+        subject.composer.input.text(),
+        "the corrected wording",
+        "the words come back to the composer"
+    );
+    assert!(
+        subject
+            .notice_text()
+            .as_deref()
+            .is_some_and(|notice| notice.contains("the driver has gone")),
+        "the notice names the dead driver"
+    );
+}
+
+#[test]
 fn the_cost_command_agrees_with_the_bar_at_an_odd_window() {
-    // S1's contract, pinned at the number: `/cost` reads the same
-    // snapshot the context bar draws from and rounds it the same way,
-    // so the two figures a user can see side by side never disagree.
+    // `/cost` reads the same snapshot the context bar draws from and
+    // rounds it the same way, so the two figures a user can see side by
+    // side never disagree.
     // The window is odd on purpose — an even split needs no rounding
     // and would hide the half-up the two computations must share — and
     // the usage crosses the window, the overshoot case where the old
@@ -3965,12 +4386,12 @@ fn the_cost_command_agrees_with_the_bar_at_an_odd_window() {
 
 #[test]
 fn a_live_model_switch_that_fails_its_save_says_it_stands_live() {
-    // S2's wording, pinned: a model switch is live the moment the
-    // loop takes it, so a failed config save must not claim the value
-    // "was never applied" — the restart-class phrasing every other
-    // key's failure carries. The save is made to fail against a path
-    // a file already occupies, and the notice names the truth: the
-    // switch is live, the save is what failed.
+    // A model switch is live the moment the loop takes it, so a failed
+    // config save must not claim the value "was never applied" — the
+    // restart-class phrasing every other key's failure carries. The
+    // save is made to fail against a path a file already occupies, and
+    // the notice names the truth: the switch is live, the save is what
+    // failed.
     let mut subject = app();
     let occupied = tempfile::NamedTempFile::new().expect("a file where the dir should be");
     subject.config_writes.config_persist_dir = Some(occupied.path().to_path_buf());
@@ -3984,10 +4405,9 @@ fn a_live_model_switch_that_fails_its_save_says_it_stands_live() {
 
 #[test]
 fn an_empty_session_catalog_answers_with_a_notice() {
-    // S4's empty-catalog reply, pinned: `/sessions` against a catalog
-    // with nothing in it says so on the notice row — the user asked
-    // and deserves an answer, not a blank screen — and seats no
-    // picker there is nothing to seat.
+    // `/sessions` against a catalog with nothing in it says so on the
+    // notice row — the user asked and deserves an answer, not a blank
+    // screen — and seats no picker there is nothing to seat.
     let mut subject = app();
     subject.open_session_picker(Vec::new());
     assert_eq!(

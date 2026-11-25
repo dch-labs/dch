@@ -43,6 +43,7 @@ impl TuiApp {
                 self.composer
                     .input
                     .insert_str(&normalize_pasted_newlines(text));
+                self.retire_theme_browse_if_gone();
                 true
             }
             Event::Resize(_, _) => true,
@@ -58,9 +59,11 @@ impl TuiApp {
     /// page-scroll keys stay app-level, everything else belongs to the
     /// input editor — unless a permission ask is pending, in which
     /// case the overlay owns the keyboard first (`y` allows,
-    /// `n`/Esc deny, the rest swallowed) and only the two `c` chords and
+    /// `n`/Esc deny, the rest swallowed) and only the copy chord and
     /// the keys [`key_survives_the_sheet`] names pass through to the
-    /// machinery below.
+    /// machinery below — except while the ask's reason line is open,
+    /// which takes every key; the plain interrupt is the ask's own deny
+    /// and never reaches them.
     ///
     /// Under a running agent, Ctrl+C Ctrl+C is one action in the
     /// Esc-Esc shape: with an empty composer, the first press only
@@ -260,6 +263,9 @@ impl TuiApp {
                 }
             };
         }
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.quit.disarm();
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp if self.plan.wheel_over_todo_section(mouse.row) => {
                 self.plan.scroll_todo_section(true);
@@ -272,7 +278,6 @@ impl TuiApp {
             MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
             MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                self.quit.disarm();
                 if let Some(cell) = self.pointer.cell_at(mouse.column, mouse.row) {
                     self.pointer.selection = Some(CellSelection {
                         anchor: cell,
@@ -343,12 +348,15 @@ impl TuiApp {
 /// conversation; neither answers the question or the permission waiting on
 /// top of it, and that conversation is exactly what a user needs in order
 /// to decide. Both overlays therefore hold these keys off the sheet and
-/// hand them to the machinery below, the way they already hold off the `c`
-/// chords: swallowing them would leave a user scrolling for context with a
-/// keyboard that answers nothing. The steering chord rides the same rule
-/// — the hint row offers it the moment a draft meets a running agent, and
-/// an overlay swallowing a chord the interface is advertising would be
-/// advertising noise.
+/// hand them to the machinery below — the copy chord on every sheet but
+/// the permission ask's reason line, which takes every key — while the
+/// plain interrupt is the permission ask's own deny and
+/// never rides this pass there (the question sheet, the pickers, and
+/// the queue section do let it through): swallowing them would leave a
+/// user scrolling for context with a keyboard that answers nothing.
+/// The steering chord rides the same rule — the hint row offers it
+/// the moment a draft meets a running agent, and an overlay swallowing
+/// a chord the interface is advertising would be advertising noise.
 pub(crate) fn key_survives_the_sheet(key: KeyEvent) -> bool {
     let chord = key.code == KeyCode::Char('c')
         && (key.modifiers == KeyModifiers::CONTROL

@@ -138,12 +138,13 @@ fn content_text(content: &ToolContent) -> String {
 /// Provider and tool output can carry ANSI escape sequences and stray
 /// control characters — colors and cursor moves from a child program,
 /// an HTML error page's CRLF pairs, bytes read out of a binary file.
-/// Rendered as cell symbols they reach the terminal verbatim and
-/// re-execute mid-frame, corrupting the layout in ways the app's
-/// frame diff can no longer match, so stale characters survive every
-/// later repaint. The sanitizer drops escape sequences whole, keeps
-/// line breaks, expands tabs, and removes the remaining control
-/// characters. The capture path and the plaintext wrap funnel
+/// Left in, a sequence's parameter bytes paint as debris beside the
+/// words and the row's width is measured on bytes that never render;
+/// the sanitizer drops escape sequences whole, keeps line breaks
+/// (folding a lone carriage return into one), expands tabs, and
+/// removes the remaining control characters — so nothing a widget
+/// hands the terminal carries a sequence the provider wrote. The
+/// capture path and the plaintext wrap funnel
 /// ([`crate::app::notices::plain_wrapped_lines_styled`]) both run
 /// their text through it, so every plaintext row a frame paints
 /// shares this contract.

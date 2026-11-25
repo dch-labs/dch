@@ -9,18 +9,17 @@ use crate::cells::{display_width, for_display, suffix_within};
 use crate::splash;
 
 impl TuiApp {
-    /// Render the fresh session's welcome: splash, notice, open
-    /// composer, and the pinned status bar.
+    /// Render the fresh session's welcome: splash, notice, and the
+    /// open composer.
     ///
     /// One compact group — the splash band, the notice on its own
     /// row, and the composer as an open, borderless field the width
     /// of the art, murmuring the name in night colors until the
     /// first keystroke — rides between two equal fillers, so the
-    /// group centers in the frame while the status bar keeps the
-    /// bottom edge. The docked rules do not follow it here — the
-    /// identity row does, riding the open composer's bottom edge —
-    /// and the first traffic of any kind returns the frame to the
-    /// docked layout.
+    /// group centers in a frame it owns whole while it stands. The
+    /// docked rules do not follow it here — the identity row does,
+    /// riding the open composer's bottom edge — and the first
+    /// traffic of any kind returns the frame to the docked layout.
     pub(in crate::app) fn render_welcome(
         &mut self,
         frame: &mut Frame,

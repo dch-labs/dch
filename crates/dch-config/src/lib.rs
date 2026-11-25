@@ -1123,11 +1123,10 @@ pub struct DisplayConfig {
 
     /// Which color vocabulary the welcome splash paints in.
     ///
-    /// `auto` (the default) shows the original truecolors everywhere
-    /// they can reach the screen and falls back to the fixed-palette
-    /// rendition only behind a tmux client tmux itself names as one it
-    /// would convert; `truecolor` and `palette` force one rendition
-    /// unconditionally. See [`SplashColors`].
+    /// `auto` (the default) keeps the original truecolors everywhere
+    /// they can reach the screen; `truecolor` and `palette` force one
+    /// rendition unconditionally — the palette is an explicit opt-in,
+    /// never an automatic downgrade. See [`SplashColors`].
     pub splash_colors: SplashColors,
 
     /// Let the TUI capture the mouse.
@@ -2335,8 +2334,9 @@ mod tests {
     #[test]
     fn splash_colors_parse_and_default() {
         // The knob speaks its three lowercase names and defaults to
-        // auto, where the session asks tmux and keeps truecolor on
-        // any unanswered ask. The knob rides the [display] table of
+        // auto, which keeps the original truecolors everywhere — the
+        // palette is an explicit opt-in, never a downgrade the session
+        // decides on its own. The knob rides the [display] table of
         // the whole document, so the honest parse is the one the
         // config loader performs.
         let mode = |document: &str| -> SplashColors {
@@ -2348,7 +2348,7 @@ mod tests {
         assert_eq!(
             mode("[display]\n"),
             SplashColors::Auto,
-            "an absent knob is the asking mode"
+            "an absent knob is the default that keeps the original art"
         );
         assert_eq!(
             mode("[display]\nsplash_colors = \"truecolor\"\n"),

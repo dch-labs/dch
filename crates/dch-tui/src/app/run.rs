@@ -226,9 +226,9 @@ pub(crate) const FRAME_REPORT_SECONDS: std::time::Duration = std::time::Duration
 
 /// The frame lane's per-second counters.
 ///
-/// Reset each time a second's line is logged; the second opens on the
-/// first draw measured into it, so a lane that never draws reports
-/// zeros honestly.
+/// Reset each time a second's line is logged; each reopened window
+/// opens at the draw that closed the last, and a lane that never
+/// draws logs nothing at all.
 #[derive(Default)]
 pub(crate) struct FrameStats {
     /// Animation-lane wakes this second.
@@ -377,7 +377,8 @@ pub(crate) struct FramePacing {
 
     /// The frame lane's own bookkeeping, for the log.
     ///
-    /// One line per second under `RUST_LOG=dch_tui::frames=debug`:
+    /// One line per drawn second under `RUST_LOG=dch_tui::frames=debug`
+    /// — a lane that never draws logs nothing — naming:
     /// how many animation wakes fired, how many terminal draws ran,
     /// and the slowest draw's duration — the three numbers that
     /// separate a stalled wake lane (wakes low), a blocked loop
