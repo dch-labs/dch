@@ -61,8 +61,8 @@ pub use queue::{
     SessionUpdate, Submission,
 };
 pub use terminal::{
-    TerminalGuard, arm_fatal_signal_restore, enter_signal_deaf_window, exit_signal_deaf_window,
-    ignore_fatal_signals, init_terminal, reset_cursor_color, restore_terminal, set_cursor_color,
-    sync_default_background,
+    SessionTerminal, TerminalGuard, arm_fatal_signal_restore, enter_signal_deaf_window,
+    exit_signal_deaf_window, ignore_fatal_signals, init_terminal, reset_cursor_color,
+    restore_terminal, set_cursor_color, sync_default_background,
 };
 pub use tool_capture::{CapturingMiddleware, ToolCapture, ToolCaptureSink};

@@ -47,17 +47,9 @@ fn seed_resumed_machine(
         return;
     };
     let adopted = filtered_machine_history(&std::sync::Arc::new(machine.to_vec()));
-    *state
-        .machine_history
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
+    store_machine_history(state, &adopted);
     let compactions = recorded_compactions(conversation);
-    transcript.send_machine(MachineSnapshot {
-        messages: adopted,
-        saved_at: chrono::Utc::now(),
-        compactions,
-        saver: None,
-    });
+    transcript.send_machine(machine_snapshot(adopted, compactions));
 }
 
 /// Seed the shared token counters from a resumed session's envelope.
@@ -70,15 +62,56 @@ fn seed_resumed_machine(
 /// definition.
 fn seed_resumed_tokens(state: &TuiObserverState, control: &ResumeControl) {
     if let ResumeControl::Resumed(outcome) = control {
-        let mut tokens = state
-            .tokens
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tokens.cumulative_input = outcome.tokens.cumulative_input;
-        tokens.cumulative_output = outcome.tokens.cumulative_output;
-        tokens.input = outcome.tokens.last_input_tokens;
-        tokens.context_tokens = outcome.tokens.context_tokens;
+        seed_token_counters(state, outcome.tokens);
     }
+}
+
+/// Continue the shared token counters from a session's own figures.
+///
+/// The accounting core both resume paths drive — the launch through
+/// [`seed_resumed_tokens`], a mid-session `/resume` directly — so the
+/// four figures continue as one set: the cumulative totals, the last
+/// turn's input, and the context the display's bar reads.
+fn seed_token_counters(state: &TuiObserverState, from: crate::session::SessionTokens) {
+    let mut tokens = state
+        .tokens
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    tokens.cumulative_input = from.cumulative_input;
+    tokens.cumulative_output = from.cumulative_output;
+    tokens.input = from.last_input_tokens;
+    tokens.context_tokens = from.context_tokens;
+}
+
+/// The machine half of a save, stamped at the moment it publishes.
+///
+/// Every publish of the adopted history — the launch's seed, a
+/// mid-session resume's re-publish, the turn-end hook's own — stamps
+/// `saved_at` at publication and leaves the save target the
+/// transcript already holds: the snapshot travels without retargeting
+/// the writer.
+fn machine_snapshot(
+    messages: Arc<Vec<loopctl::message::Message>>,
+    compactions: u32,
+) -> MachineSnapshot {
+    MachineSnapshot {
+        messages,
+        saved_at: chrono::Utc::now(),
+        compactions,
+        saver: None,
+    }
+}
+
+/// Publish the adopted machine history into the shared state.
+///
+/// The cell both resume paths hand the display and the driver to read
+/// the engine's history from; the filter is the caller's, so what
+/// stands in the cell is exactly what the caller adopted.
+fn store_machine_history(state: &TuiObserverState, adopted: &Arc<Vec<loopctl::message::Message>>) {
+    *state
+        .machine_history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(adopted));
 }
 
 /// Cancel the runner the session ends on, through the shared cell.
@@ -177,6 +210,264 @@ pub(crate) fn launch_identity(
     )
 }
 
+/// Say the degraded fresh start's reason before the terminal opens.
+///
+/// A fresh control built from a resume that degraded carries its
+/// reason; the user hears it on the normal terminal, where a failure
+/// reported before the alternate screen can still be read.
+fn report_startup_warn(control: &ResumeControl) {
+    if let ResumeControl::Fresh {
+        warn: Some(warn), ..
+    } = control
+    {
+        crate::signals::report(&format!("dch: {warn}"));
+    }
+}
+
+/// Bring up the shared observer state a session publishes into.
+///
+/// The observer half travels to the runner builder (see
+/// [`build_session_runner`]); the state half stays with the session —
+/// the display's cells and the engine's events share it from the
+/// first frame.
+fn new_display_state(redact_secrets: bool) -> TuiObserverState {
+    TuiObserverState::new()
+        .with_secret_redaction(redact_secrets)
+        .into_observer()
+        .1
+}
+
+/// Build the launch's runner, resumed reads already re-recorded.
+///
+/// The launch's construction as one step: the shared build mounts
+/// whatever machine history the resumed control brought (a fresh
+/// start mounts none), and once the runner stands, the files the
+/// resumed conversation had read are re-recorded on it — so the
+/// launch owes the same guard re-seeding a mid-session resume
+/// performs, and cannot forget it.
+///
+/// # Errors
+///
+/// Propagates the shared build's construction failure; the launch
+/// words it as its own agent-construction message.
+async fn build_launch_runner(
+    config: &dch_config::DchConfig,
+    workdir: &std::path::Path,
+    state: &TuiObserverState,
+    lanes: &InteractiveLanes,
+    shutting_down: &Arc<AtomicBool>,
+    control: &ResumeControl,
+) -> Result<dch_loop::Runner, dch_loop::RunnerError> {
+    let history = resume_history_for_launch(control, config.security.redact_secrets);
+    let runner =
+        build_session_runner(config, workdir, state, lanes, shutting_down, history).await?;
+    if let ResumeControl::Resumed(outcome) = control {
+        record_resumed_reads(&runner, outcome).await;
+    }
+    Ok(runner)
+}
+
+/// Install the cooperative interrupt bridge over the live cell.
+///
+/// The first external SIGINT or SIGTERM cancels the run in flight;
+/// the forced second press restores the terminal before the bridge's
+/// own exit. The bridge relays through the shared cancel-signal cell,
+/// so a press always reaches the CURRENT runner — whoever adoption
+/// last named.
+fn arm_interrupt_bridge(state: &TuiObserverState) -> crate::signals::CancelBridge {
+    crate::signals::install_live_cancel_handler(Arc::clone(&state.cancel_signal), || {
+        let _restored = dch_tui::restore_terminal();
+    })
+}
+
+/// Wire the display whole, and open the run's channels.
+///
+/// Both halves of the app's wiring in one place — the persisting half
+/// (both config halves, the submit and save channels, the directory,
+/// persist target, and branch the status bar shows) and the
+/// interactive half (the steer share, the permission lane's receiver
+/// and memory beside it, the lane cells the display mirrors and
+/// steers through, and the question receiver the panel answers back
+/// along). The run's two channels open here: the half the driver
+/// consumes and the half the transcript writer publishes through come
+/// back; their display ends ride onto the app.
+fn wire_display_app(
+    app: &mut TuiApp,
+    config_base: dch_config::DchConfig,
+    config_file: dch_config::DchConfig,
+    permission_rx: mpsc::UnboundedReceiver<dch_tui::PermissionRequest>,
+    prompt_rx: mpsc::UnboundedReceiver<dch_tui::QuestionPrompt>,
+    lanes: &InteractiveLanes,
+    workdir: &Path,
+) -> (
+    mpsc::UnboundedReceiver<dch_tui::Submission>,
+    mpsc::UnboundedSender<SessionUpdate>,
+) {
+    let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (session_tx, session_rx) = mpsc::unbounded_channel();
+    app.set_config_base(config_base);
+    app.set_config_file(config_file);
+    app.set_submit_tx(submit_tx);
+    app.set_session_requests(session_rx);
+    app.set_working_dir(workdir);
+    app.set_config_persist_dir(Some(dch_config::config_dir()));
+    app.set_git_branch(git_branch(workdir));
+    app.set_permission_requests(permission_rx);
+    app.set_permission_memory(lanes.memory.clone());
+    app.set_permission_mode_cell(Some(Arc::clone(&lanes.mode_cell)));
+    app.set_permission_config_rules_cell(Some(Arc::clone(&lanes.config_rules_cell)));
+    app.set_permission_preset_cell(Some(Arc::clone(&lanes.preset_cell)));
+    app.set_permission_adoption_guard(Some(Arc::clone(&lanes.adoption_guard)));
+    app.set_question_requests(prompt_rx);
+    (submit_rx, session_tx)
+}
+
+/// Open the transcript worker and stage the session's first save.
+///
+/// The persistence half of the launch's staging, lifted for length:
+/// the worker opens on the launch saver; the saved permission memory
+/// is replayed into the lane cells — and when its file was damaged
+/// the session closes the permission lane outright before the first
+/// frame, the same refusal a headless run makes; the turn-end hook
+/// goes onto the app beside the handle it publishes through; and the
+/// opening snapshot rides out immediately, so the file the exit lines
+/// name exists before the first frame can fail. Returns the handle
+/// the driver and the machine seed publish through, the worker to
+/// join at the exit, and the saver cell the exit lines read the final
+/// id from.
+fn stage_transcript_worker(
+    app: &mut TuiApp,
+    driver_config: &mut dch_config::DchConfig,
+    state: &TuiObserverState,
+    lanes: &InteractiveLanes,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    saver: Arc<crate::session::SessionSaver>,
+    permission_memory: &dch_tui::PermissionMemory,
+) -> (
+    TranscriptHandle,
+    TranscriptWorker,
+    Arc<std::sync::Mutex<Arc<crate::session::SessionSaver>>>,
+) {
+    let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
+    let initial_transcript = transcript_handle.clone();
+    let permission_restore = wire_permission_memory(permission_memory, &initial_transcript);
+    if permission_restore.damage_stands() {
+        fail_permission_restore_closed_at_startup(app, driver_config, lanes, session_tx);
+    }
+    let exit_saver = Arc::clone(&initial_transcript.saver);
+    install_turn_end_hook(app, state, transcript_handle);
+    initial_transcript.send(app.conversation().to_vec(), snapshot_tokens(&state.tokens));
+    (initial_transcript, transcript_worker, exit_saver)
+}
+
+/// Bring the alternate screen up and settle the theme onto it.
+///
+/// The panic hook first, then the guard and canvas together, then the
+/// theme's own decision: a terminal that answers the default-
+/// background query keeps its canvas as authored, one that does not
+/// gets the deferred palette — and the fatal-signal restore net goes
+/// up the moment the screen is entered, so an uncatchable death still
+/// hands the user a sane terminal.
+///
+/// # Errors
+///
+/// A terminal-initialization failure is reported as `terminal init:`
+/// beside the system's own reason, before the alternate screen is on.
+fn open_session_terminal(
+    app: &mut TuiApp,
+    mouse_capture: bool,
+) -> Result<(TerminalGuard, dch_tui::SessionTerminal), String> {
+    TerminalGuard::install_panic_hook();
+    let (guard, terminal) =
+        TerminalGuard::new(mouse_capture).map_err(|err| format!("terminal init: {err}"))?;
+    if dch_tui::sync_default_background(app.theme.ui.background) {
+        dch_tui::set_cursor_color(app.theme.ui.primary);
+    } else {
+        app.theme = app.theme.deferred_to_terminal();
+    }
+    dch_tui::arm_fatal_signal_restore();
+    Ok((guard, terminal))
+}
+
+/// Spawn the driver loop that owns the runner for the session's
+/// life.
+///
+/// The engine enters on the boxed future the session runs it
+/// through, holding the runner, both channel halves, and the
+/// context it drives under; the handle comes back for the exit's
+/// bounded join — nothing else waits on the run.
+fn spawn_session_driver(
+    runner: dch_loop::Runner,
+    submit_rx: mpsc::UnboundedReceiver<dch_tui::Submission>,
+    driver_context: DriverContext,
+    initial_transcript: TranscriptHandle,
+    session_tx: mpsc::UnboundedSender<SessionUpdate>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(Box::pin(run_driver_loop(
+        runner,
+        submit_rx,
+        driver_context,
+        initial_transcript,
+        session_tx,
+    )))
+}
+
+/// Wire the display's own stop onto the live runner's signal.
+///
+/// The canceller the display's Esc,Esc reaches, and the shutdown flag
+/// a begun exit raises so a reminder turn declines before it is paid
+/// for, are armed together from the runner the screen now owns.
+fn arm_run_cancellation(
+    app: &mut TuiApp,
+    runner: &dch_loop::Runner,
+    shutting_down: &Arc<AtomicBool>,
+) {
+    let cancel = Arc::clone(&runner.cancel_signal());
+    app.set_run_canceller(Box::new(move || cancel.cancel()));
+    app.set_shutdown_flag(Arc::clone(shutting_down));
+}
+
+/// Run the display to its end, then close every lane in order.
+///
+/// The session's whole teardown as one ordered close, lifted for
+/// length: the run loop ends; the shutdown flag goes up before any
+/// later claim can race a reminder turn; the settled frame stops with
+/// its waiting prompts re-echoed — then the question supervision is
+/// pulled, the LIVE runner is cancelled through the shared cell, the
+/// driver joins bounded, the late graduations and rescued corrections
+/// land in the transcript's final writes, the app drops with the
+/// terminal still guarded, and the signal bridge stands down. The
+/// run's own result comes back last: a draw failure is reported only
+/// after every one of those has run.
+///
+/// # Errors
+///
+/// Propagates the draw failure the display's run ended with, after
+/// every lane has closed.
+async fn close_the_session_run(
+    mut app: TuiApp,
+    terminal: &mut dch_tui::SessionTerminal,
+    state: &TuiObserverState,
+    shutting_down: &Arc<AtomicBool>,
+    questions: tokio::task::JoinHandle<()>,
+    driver: tokio::task::JoinHandle<()>,
+    signal_bridge: crate::signals::CancelBridge,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session = app.run(terminal).await;
+    shutting_down.store(true, Ordering::SeqCst);
+    let unclaimed = app.waiting_prompt_texts_at_exit();
+    app.settle_exit_stop(terminal);
+    app.echo_waiting_prompts_at_exit(unclaimed);
+    questions.abort();
+    cancel_the_live_runner(state);
+    tear_down_driver_bounded(driver).await;
+    app.drain_late_graduations_at_exit();
+    app.echo_rescued_corrections_at_exit();
+    drop(app);
+    signal_bridge.stop().await;
+    session
+}
+
 /// Host one interactive session end to end.
 ///
 /// Every construction step — config, working directory, agent,
@@ -195,116 +486,50 @@ pub(crate) fn launch_identity(
 /// Returns a human-readable message when terminal initialization
 /// fails or the session's runner cannot be constructed.
 pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), String> {
-    if let ResumeControl::Fresh {
-        warn: Some(warn), ..
-    } = &control
-    {
-        crate::signals::report(&format!("dch: {warn}"));
-    }
+    report_startup_warn(&control);
     let (config, config_base, config_file) = resolve_session_config_pair(args, &control)?;
     let flag_mode = config.runner.permission_mode;
     let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
-    let (observer, state) = TuiObserverState::new()
-        .with_secret_redaction(config.security.redact_secrets)
-        .into_observer();
+    let state = new_display_state(config.security.redact_secrets);
     seed_resumed_tokens(&state, &control);
     let (lanes, permission_rx, prompt_rx, permission_memory) = InteractiveLanes::bridges(&config);
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let mut builder =
-        assemble_runner_builder(&config, &workdir, observer, &state, &lanes, &shutting_down);
-    if let ResumeControl::Resumed(outcome) = &control {
-        builder = builder.with_history(crate::resume::history_for_resume(
-            outcome,
-            config.security.redact_secrets,
-        ));
-    }
-    let runner = builder
-        .build()
+    let runner = build_launch_runner(&config, &workdir, &state, &lanes, &shutting_down, &control)
         .await
         .map_err(|err| format!("agent construction: {err}"))?;
-    state
-        .context_window
-        .store(runner.context_window(), Ordering::SeqCst);
-
-    if let ResumeControl::Resumed(outcome) = &control {
-        for path in crate::resume::resumed_read_paths_with_machine(
-            &outcome.messages,
-            outcome.machine.as_deref(),
-        ) {
-            let _recorded = runner.record_resumed_read(&path).await;
-        }
-    }
-
-    // The cooperative interrupt bridge: the first external SIGINT or
-    // SIGTERM cancels the run in flight; the forced second press
-    // restores the terminal before the bridge's own exit. The live
-    // handles the display reads — stored once here and after every
-    // runner rebuild, so Esc,Esc and Ctrl+S always reach the CURRENT
-    // runner. The guidance share is the panel's own steer handle.
-    let guidance: Option<Arc<dyn dch_tui::Guidance>> = Some(Arc::new(LoopGuidance {
-        steering: runner.steering(),
-    }));
-    state.adopt_runner_handles(runner.cancel_signal(), guidance.clone());
-    let signal_bridge =
-        crate::signals::install_live_cancel_handler(Arc::clone(&state.cancel_signal), || {
-            let _restored = dch_tui::restore_terminal();
-        });
-
+    let signal_bridge = arm_interrupt_bridge(&state);
+    let guidance = adopt_live_runner(&state, &runner);
     let questions = lanes.open(&runner);
-    let (submit_tx, submit_rx) = mpsc::unbounded_channel();
-    let (session_tx, session_rx) = mpsc::unbounded_channel();
     let model = config.api.model.clone();
     let mut driver_config = config.clone();
     let driver_base = Arc::new(config_base.clone());
-    let mut app = TuiApp::from_observer_state(config, state.clone());
-    app.set_config_base(config_base);
     let file_permission_default = config_file.runner.permission_mode;
-    app.set_config_file(config_file);
-    app.set_submit_tx(submit_tx);
-    app.set_guidance(guidance.clone());
-    app.set_permission_requests(permission_rx);
-    app.set_permission_memory(permission_memory.clone());
-    app.set_permission_mode_cell(Some(Arc::clone(&lanes.mode_cell)));
-    app.set_permission_config_rules_cell(Some(Arc::clone(&lanes.config_rules_cell)));
-    app.set_permission_preset_cell(Some(Arc::clone(&lanes.preset_cell)));
-    app.set_permission_adoption_guard(Some(Arc::clone(&lanes.adoption_guard)));
-    app.set_question_requests(prompt_rx);
-    app.set_session_requests(session_rx);
-    app.set_working_dir(&workdir);
-    app.set_config_persist_dir(Some(dch_config::config_dir()));
-    app.set_git_branch(git_branch(&workdir));
+    let mut app = TuiApp::from_observer_state(config, state.clone());
+    app.set_guidance(guidance);
+    let (submit_rx, session_tx) = wire_display_app(
+        &mut app,
+        config_base,
+        config_file,
+        permission_rx,
+        prompt_rx,
+        &lanes,
+        &workdir,
+    );
     let (saver, _session_id, resumed_machine) =
         launch_identity(&mut app, control, &runner, args, flag_mode, model, &workdir);
-    let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
-    let initial_transcript = transcript_handle.clone();
-    let permission_restore = wire_permission_memory(&permission_memory, &initial_transcript);
-    if permission_restore.damage_stands() {
-        fail_permission_restore_closed_at_startup(
-            &mut app,
-            &mut driver_config,
-            &lanes,
-            &session_tx,
-        );
-    }
-    let exit_saver = Arc::clone(&initial_transcript.saver);
-    install_turn_end_hook(&mut app, &state, transcript_handle);
+    let (initial_transcript, transcript_worker, exit_saver) = stage_transcript_worker(
+        &mut app,
+        &mut driver_config,
+        &state,
+        &lanes,
+        &session_tx,
+        saver,
+        &permission_memory,
+    );
+    let (guard, mut terminal) =
+        open_session_terminal(&mut app, driver_config.display.mouse_capture)?;
 
-    initial_transcript.send(app.conversation().to_vec(), snapshot_tokens(&state.tokens));
-
-    TerminalGuard::install_panic_hook();
-    let (guard, mut terminal) = TerminalGuard::new(driver_config.display.mouse_capture)
-        .map_err(|err| format!("terminal init: {err}"))?;
-    if dch_tui::sync_default_background(app.theme.ui.background) {
-        dch_tui::set_cursor_color(app.theme.ui.primary);
-    } else {
-        app.theme = app.theme.deferred_to_terminal();
-    }
-    dch_tui::arm_fatal_signal_restore();
-
-    let cancel = runner.cancel_signal();
-    let cancel_for_app = Arc::clone(&cancel);
-    app.set_run_canceller(Box::new(move || cancel_for_app.cancel()));
-    app.set_shutdown_flag(Arc::clone(&shutting_down));
+    arm_run_cancellation(&mut app, &runner, &shutting_down);
     seed_resumed_machine(
         resumed_machine.as_deref(),
         &state,
@@ -321,26 +546,24 @@ pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Resu
         args,
     );
     driver_context.overrides.permission_default = file_permission_default;
-    let driver = tokio::spawn(Box::pin(run_driver_loop(
+    let driver = spawn_session_driver(
         runner,
         submit_rx,
         driver_context,
         initial_transcript,
         session_tx,
-    )));
+    );
 
-    let session = app.run(&mut terminal).await;
-    shutting_down.store(true, Ordering::SeqCst);
-    let unclaimed = app.waiting_prompt_texts_at_exit();
-    app.settle_exit_stop(&mut terminal);
-    app.echo_waiting_prompts_at_exit(unclaimed);
-    questions.abort();
-    cancel_the_live_runner(&state);
-    tear_down_driver_bounded(driver).await;
-    app.drain_late_graduations_at_exit();
-    app.echo_rescued_corrections_at_exit();
-    drop(app);
-    signal_bridge.stop().await;
+    let session = close_the_session_run(
+        app,
+        &mut terminal,
+        &state,
+        &shutting_down,
+        questions,
+        driver,
+        signal_bridge,
+    )
+    .await;
     restore_and_print_exit(
         transcript_worker,
         guard,
@@ -466,6 +689,96 @@ pub(crate) fn assemble_runner_builder<'a>(
             },
             move || !nudge_gate.load(Ordering::SeqCst),
         )
+}
+
+/// The machine history a resumed launch seeds the engine with.
+///
+/// The engine half of the control's shape: only a resumed control
+/// carries a machine record to seed from, and a fresh start runs on
+/// an empty history by definition.
+fn resume_history_for_launch(
+    control: &ResumeControl,
+    redact_secrets: bool,
+) -> Option<Vec<loopctl::message::Message>> {
+    match control {
+        ResumeControl::Resumed(outcome) => {
+            Some(crate::resume::history_for_resume(outcome, redact_secrets))
+        }
+        ResumeControl::Fresh { .. } => None,
+    }
+}
+
+/// Build the session's runner with every host axis attached.
+///
+/// Both twins construct the live agent through here: the launch
+/// builds its first runner and a mid-session `/resume` rebuilds the
+/// live one the same way — the registration set assembled, the
+/// machine history mounted only when the resume's own record brought
+/// one, and the build awaited. The observer rides the shared state's
+/// own clone, so the engine's events land in the cells the display
+/// already reads. Each caller words its own failure; the construction
+/// itself says nothing about which twin asked.
+///
+/// # Errors
+///
+/// Propagates the engine's own construction failure, verbatim; the
+/// caller words it for its path.
+async fn build_session_runner(
+    config: &dch_config::DchConfig,
+    workdir: &std::path::Path,
+    state: &TuiObserverState,
+    lanes: &InteractiveLanes,
+    shutting_down: &Arc<AtomicBool>,
+    history: Option<Vec<loopctl::message::Message>>,
+) -> Result<dch_loop::Runner, dch_loop::RunnerError> {
+    let observer = state.clone().into_observer().0;
+    let mut builder =
+        assemble_runner_builder(config, workdir, observer, state, lanes, shutting_down);
+    if let Some(history) = history {
+        builder = builder.with_history(history);
+    }
+    builder.build().await
+}
+
+/// Re-record on the runner the files the resumed conversation had
+/// already read.
+///
+/// The read-guard half both resumes owe the write guard: a file the
+/// session read before it was saved gets its baseline re-recorded on
+/// the rebuilt runner, so an edit-resume may still write it. Every
+/// path's recording failure is soft — a vanished file costs nothing
+/// but its own baseline.
+async fn record_resumed_reads(runner: &dch_loop::Runner, outcome: &crate::resume::ResumeOutcome) {
+    for path in crate::resume::resumed_read_paths_with_machine(
+        &outcome.messages,
+        outcome.machine.as_deref(),
+    ) {
+        let _recorded = runner.record_resumed_read(&path).await;
+    }
+}
+
+/// Hand the shared state the live runner's handles and return the
+/// display's guidance share.
+///
+/// The adoption both resumes perform, once per runner so it is never
+/// half-done: the context-window cell takes the new runner's window,
+/// the cancel-signal cell its stop wire, and the guidance cell the
+/// panel's own steer handle — stored together, so the display's
+/// Esc,Esc and Ctrl+S always reach the CURRENT runner. The guidance
+/// comes back for the launch's own app wiring; a mid-session resume
+/// lets the stored share stand.
+fn adopt_live_runner(
+    state: &TuiObserverState,
+    runner: &dch_loop::Runner,
+) -> Option<Arc<dyn dch_tui::Guidance>> {
+    state
+        .context_window
+        .store(runner.context_window(), Ordering::SeqCst);
+    let guidance: Option<Arc<dyn dch_tui::Guidance>> = Some(Arc::new(LoopGuidance {
+        steering: runner.steering(),
+    }));
+    state.adopt_runner_handles(runner.cancel_signal(), guidance.clone());
+    guidance
 }
 
 /// Await the driver with a bound, then tear it down.
@@ -696,6 +1009,167 @@ fn resumed_modes(
     (standing_mode, recorded_mode)
 }
 
+/// Load the session a `/resume` asks for, or say why it cannot.
+///
+/// The reading half of the mid-session resume: an id that is not one,
+/// a file that will not load — each posts its notice and comes back
+/// `None`, leaving the loop's decision to the caller. A session with
+/// a newer queued snapshot than the file's own adopts it first, so
+/// the pair the resume works from is the freshest the save lane ever
+/// settled, never the file alone.
+fn load_resumable_session(
+    id: &str,
+    transcript: &TranscriptHandle,
+    sessions_root: &Path,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+) -> Option<(uuid::Uuid, crate::resume::ResumeOutcome)> {
+    let Ok(target) = uuid::Uuid::parse_str(id) else {
+        post_session_notice(
+            session_tx,
+            format!("{id} is not a session id — nothing was resumed"),
+        );
+        return None;
+    };
+    let queued = transcript.latest_queued_for(target);
+    let machine_floor = queued.as_ref().map(|waiting| waiting.saved_at);
+    let Ok(mut outcome) =
+        crate::resume::load_for_resume_in_with_floor(target, sessions_root, machine_floor)
+    else {
+        post_session_notice(
+            session_tx,
+            format!("session {id} could not be loaded — the loop kept its conversation"),
+        );
+        return None;
+    };
+    if let Some(queued) = queued {
+        adopt_queued_snapshots(&mut outcome, queued);
+    }
+    Some((target, outcome))
+}
+
+/// The config a resumed run executes on, from the file's own record.
+///
+/// The model half of a resume's shaping, worded the way the launch
+/// shapes its own: the session continues on the model it ended on —
+/// the envelope's record, selected through the base config so a
+/// profile's own entry is honored outright — unless the run's
+/// `--model` flag named one, and the run's reasoning-effort flag
+/// reapplies over the resumed file, exactly as a fresh resolution
+/// would.
+fn resumed_run_config(
+    context: &DriverContext,
+    outcome: &crate::resume::ResumeOutcome,
+) -> dch_config::DchConfig {
+    let mut config = context.config.clone();
+    if context.overrides.model.is_none() && !outcome.model.trim().is_empty() {
+        let mut fresh = context.config_base.as_ref().clone();
+        if fresh.select_model(Some(&outcome.model)).is_err() {
+            fresh.api.model.clone_from(&outcome.model);
+        }
+        config.api = fresh.api;
+    }
+    crate::headless::reapply_reasoning_effort(
+        &mut config,
+        context.overrides.reasoning_effort.as_deref(),
+    );
+    config
+}
+
+/// Adopt the rebuilt runner for the resumed session, or refuse.
+///
+/// The adoption decision of a mid-session resume, in one gate: the
+/// shared build mounts the resumed machine history and awaits the new
+/// runner; a success attaches the live lanes to it before it takes
+/// the loop's place, and a failure says so beside the engine's own
+/// reason and leaves the loop exactly as it stood — the caller keeps
+/// its conversation and reports the refusal.
+async fn adopt_resumed_runner(
+    context: &DriverContext,
+    config: &dch_config::DchConfig,
+    machine: &[loopctl::message::Message],
+    id: &str,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+) -> Option<dch_loop::Runner> {
+    let built = build_session_runner(
+        config,
+        &context.workdir,
+        &context.state,
+        &context.lanes,
+        &context.shutting_down,
+        Some(machine.to_vec()),
+    )
+    .await;
+    match built {
+        Ok(built) => {
+            context.lanes.attach(&built);
+            Some(built)
+        }
+        Err(err) => {
+            post_session_notice(
+                session_tx,
+                format!(
+                    "session {id} could not be adopted — the loop kept its conversation ({err})"
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Enforce a resumed session's remembered permissions, or close the
+/// lane.
+///
+/// The enforcement half of a mid-session resume: the saved rules are
+/// adopted into the live lane; when their file was damaged, the mode
+/// the engine will actually run under replaces the resumed standing
+/// in the session's config, and the repair notice — worded once here
+/// — says what stands until `/permissions` repair.
+fn enforce_resumed_permissions(
+    transcript: &TranscriptHandle,
+    context: &mut DriverContext,
+    standing_mode: dch_config::PermissionMode,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+) -> dch_config::PermissionMode {
+    let (enforced_mode, permissions_damaged) =
+        adopt_resumed_permissions(transcript, context, standing_mode);
+    if permissions_damaged {
+        context.config.runner.permission_mode = enforced_mode;
+        post_session_notice(
+            session_tx,
+            "the saved permissions are damaged — remembered rules were dropped; \
+             side effects ask, and the configured rules stay tightened, until \
+             /permissions repair (the damage marker rides inside the permissions \
+             file — hand-fixing the file leaves it standing)"
+                .to_string(),
+        );
+    }
+    enforced_mode
+}
+
+/// The display's report of a resume that happened.
+///
+/// The update that re-seeds the conversation after the swap: the
+/// loaded transcript whole, the continued token figures, and the mode
+/// the session now runs under — under the id the save target moved
+/// onto, so a later `/resume` names exactly this session.
+fn resumed_session_update(
+    target: uuid::Uuid,
+    outcome: crate::resume::ResumeOutcome,
+    permission_mode: dch_config::PermissionMode,
+) -> SessionUpdate {
+    SessionUpdate::Resumed {
+        id: target.to_string(),
+        transcript: outcome.messages,
+        tokens: ResumedTokens {
+            cumulative_input: outcome.tokens.cumulative_input,
+            cumulative_output: outcome.tokens.cumulative_output,
+            last_input: outcome.tokens.last_input_tokens,
+            context_tokens: outcome.tokens.context_tokens,
+        },
+        permission_mode,
+    }
+}
+
 /// The live resume: adopt a saved session's history, file, and display.
 ///
 /// The driver alone can load: it parses the id, reads the saved pair
@@ -723,144 +1197,44 @@ pub(crate) async fn resume_into_session(
     context: &mut DriverContext,
     id: String,
 ) -> bool {
-    let Ok(target) = uuid::Uuid::parse_str(&id) else {
-        post_session_notice(
-            session_tx,
-            format!("{id} is not a session id — nothing was resumed"),
-        );
-        return false;
-    };
-    let queued = transcript.latest_queued_for(target);
-    let machine_floor = queued.as_ref().map(|waiting| waiting.saved_at);
-    let Ok(mut outcome) =
-        crate::resume::load_for_resume_in_with_floor(target, &context.sessions_root, machine_floor)
+    let Some((target, outcome)) =
+        load_resumable_session(&id, transcript, &context.sessions_root, session_tx)
     else {
-        post_session_notice(
-            session_tx,
-            format!("session {id} could not be loaded — the loop kept its conversation"),
-        );
         return false;
     };
-    if let Some(queued) = queued {
-        adopt_queued_snapshots(&mut outcome, queued);
-    }
     let machine =
         crate::resume::history_for_resume(&outcome, context.config.security.redact_secrets);
-    let mut config = context.config.clone();
-    if context.overrides.model.is_none() && !outcome.model.trim().is_empty() {
-        let mut fresh = context.config_base.as_ref().clone();
-        if fresh.select_model(Some(&outcome.model)).is_err() {
-            fresh.api.model.clone_from(&outcome.model);
-        }
-        config.api = fresh.api;
-    }
-    crate::headless::reapply_reasoning_effort(
-        &mut config,
-        context.overrides.reasoning_effort.as_deref(),
-    );
+    let mut config = resumed_run_config(context, &outcome);
     let (standing_mode, recorded_mode) = resumed_modes(context, &outcome);
     config.runner.permission_mode = standing_mode;
-    let observer = context.state.clone().into_observer().0;
-    let new_runner = assemble_runner_builder(
-        &config,
-        &context.workdir,
-        observer,
-        &context.state,
-        &context.lanes,
-        &context.shutting_down,
-    )
-    .with_history(machine.clone())
-    .build()
-    .await;
-    let built = match new_runner {
-        Ok(built) => {
-            context.lanes.attach(&built);
-            built
-        }
-        Err(err) => {
-            post_session_notice(
-                session_tx,
-                format!(
-                    "session {id} could not be adopted — the loop kept its conversation ({err})"
-                ),
-            );
-            return false;
-        }
+    let Some(built) = adopt_resumed_runner(context, &config, &machine, &id, session_tx).await
+    else {
+        return false;
     };
-    for path in crate::resume::resumed_read_paths_with_machine(
-        &outcome.messages,
-        outcome.machine.as_deref(),
-    ) {
-        let _recorded = built.record_resumed_read(&path).await;
-    }
-    let window = built.context_window();
+    record_resumed_reads(&built, &outcome).await;
     *runner = built;
-    context.state.context_window.store(window, Ordering::SeqCst);
-    context.state.adopt_runner_handles(
-        runner.cancel_signal(),
-        Some(Arc::new(LoopGuidance {
-            steering: runner.steering(),
-        })),
-    );
+    adopt_live_runner(&context.state, runner);
     context.config = config;
     *context
         .lanes
         .mode_cell
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = standing_mode;
-    {
-        let mut tokens = context
-            .state
-            .tokens
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tokens.cumulative_input = outcome.tokens.cumulative_input;
-        tokens.cumulative_output = outcome.tokens.cumulative_output;
-        tokens.input = outcome.tokens.last_input_tokens;
-        tokens.context_tokens = outcome.tokens.context_tokens;
-    }
+    seed_token_counters(&context.state, outcome.tokens);
     let adopted = filtered_machine_history(&Arc::new(machine));
-    *context
-        .state
-        .machine_history
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
+    store_machine_history(&context.state, &adopted);
     transcript.retarget(
         target,
         &context.config.api.model,
         outcome.title.clone(),
         recorded_mode,
     );
-    let (enforced_mode, permissions_damaged) =
-        adopt_resumed_permissions(transcript, context, standing_mode);
-    if permissions_damaged {
-        context.config.runner.permission_mode = enforced_mode;
-        post_session_notice(
-            session_tx,
-            "the saved permissions are damaged — remembered rules were dropped; \
-             side effects ask, and the configured rules stay tightened, until \
-             /permissions repair (the damage marker rides inside the permissions \
-             file — hand-fixing the file leaves it standing)"
-                .to_string(),
-        );
-    }
-    transcript.send_machine(MachineSnapshot {
-        messages: adopted,
-        saved_at: chrono::Utc::now(),
-        compactions: recorded_compactions(&outcome.messages),
-        saver: None,
-    });
-    let update = SessionUpdate::Resumed {
-        id: target.to_string(),
-        transcript: outcome.messages,
-        tokens: ResumedTokens {
-            cumulative_input: outcome.tokens.cumulative_input,
-            cumulative_output: outcome.tokens.cumulative_output,
-            last_input: outcome.tokens.last_input_tokens,
-            context_tokens: outcome.tokens.context_tokens,
-        },
-        permission_mode: enforced_mode,
-    };
+    let enforced_mode = enforce_resumed_permissions(transcript, context, standing_mode, session_tx);
+    transcript.send_machine(machine_snapshot(
+        adopted,
+        recorded_compactions(&outcome.messages),
+    ));
+    let update = resumed_session_update(target, outcome, enforced_mode);
     if session_tx.send(update).is_err() {
         tracing::warn!("session resumed but the display is gone");
     }
@@ -1070,5 +1444,133 @@ mod tests {
             adopted,
             "a resumed session's exit names the adopted id"
         );
+    }
+
+    #[test]
+    fn the_machine_snapshot_stamps_now_and_carries_the_pair() {
+        // The save's machine half travels with the count it was read
+        // at and a stamp taken at publication — the pair rule the next
+        // resume compares on. The saver stays off the snapshot: the
+        // snapshot publishes, it does not retarget the writer.
+        let messages = std::sync::Arc::new(Vec::new());
+        let before = chrono::Utc::now();
+        let snapshot = machine_snapshot(std::sync::Arc::clone(&messages), 7);
+        let after = chrono::Utc::now();
+        assert_eq!(snapshot.compactions, 7);
+        assert!(snapshot.saved_at >= before && snapshot.saved_at <= after);
+        assert!(snapshot.saver.is_none());
+        assert!(std::sync::Arc::ptr_eq(&snapshot.messages, &messages));
+    }
+
+    #[test]
+    fn the_store_publishes_the_adopted_history_verbatim() {
+        // Whatever the caller adopted is exactly what the shared cell
+        // hands the display and the driver — the store filters nothing
+        // on the way in.
+        let (_observer, state) = TuiObserverState::new().into_observer();
+        let adopted = std::sync::Arc::new(Vec::new());
+        store_machine_history(&state, &adopted);
+        let cell = state
+            .machine_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the publish lands");
+        assert!(std::sync::Arc::ptr_eq(&cell, &adopted));
+    }
+
+    #[test]
+    fn the_token_counters_continue_from_the_file_s_figures() {
+        // Both resume paths drive this one set: the cumulative totals,
+        // the last turn's input, and the context figure — so the bar
+        // and /cost read the resumed conversation's numbers from the
+        // first frame.
+        let (_observer, state) = TuiObserverState::new().into_observer();
+        seed_token_counters(
+            &state,
+            crate::session::SessionTokens {
+                cumulative_input: 11,
+                cumulative_output: 7,
+                last_input_tokens: 5,
+                context_tokens: 9,
+            },
+        );
+        let tokens = state
+            .tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(tokens.cumulative_input, 11);
+        assert_eq!(tokens.cumulative_output, 7);
+        assert_eq!(tokens.input, 5);
+        assert_eq!(tokens.context_tokens, 9);
+    }
+
+    #[test]
+    fn only_a_resumed_control_carries_a_launch_history() {
+        // A fresh start mounts no history by definition; a resumed
+        // control's own machine record is what the shared build rides.
+        assert!(
+            resume_history_for_launch(
+                &ResumeControl::Fresh {
+                    session_id: None,
+                    warn: None,
+                },
+                false,
+            )
+            .is_none()
+        );
+        let outcome = crate::resume::ResumeOutcome {
+            session_id: uuid::Uuid::new_v4(),
+            model: "model-a".into(),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: Some(Vec::new()),
+            machine_compactions: 0,
+            title: None,
+            permission_mode: None,
+        };
+        let history = resume_history_for_launch(&ResumeControl::Resumed(outcome), false);
+        assert!(history.is_some_and(|history| history.is_empty()));
+    }
+
+    #[test]
+    fn the_resumed_update_carries_the_file_whole() {
+        // The display re-seeds from this one update: the id the target
+        // moved onto, the transcript, the continued figures, and the
+        // standing mode — all mapped as the file reads them.
+        let target = uuid::Uuid::new_v4();
+        let outcome = crate::resume::ResumeOutcome {
+            session_id: target,
+            model: "model-a".into(),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens {
+                cumulative_input: 3,
+                cumulative_output: 4,
+                last_input_tokens: 5,
+                context_tokens: 6,
+            },
+            machine: None,
+            machine_compactions: 0,
+            title: None,
+            permission_mode: None,
+        };
+        let update = resumed_session_update(target, outcome, dch_config::PermissionMode::default());
+        match update {
+            SessionUpdate::Resumed {
+                id,
+                transcript,
+                tokens,
+                permission_mode,
+            } => {
+                assert_eq!(id, target.to_string());
+                assert_eq!(transcript, Vec::new());
+                assert_eq!(tokens.cumulative_input, 3);
+                assert_eq!(tokens.cumulative_output, 4);
+                assert_eq!(tokens.last_input, 5);
+                assert_eq!(tokens.context_tokens, 6);
+                assert_eq!(permission_mode, dch_config::PermissionMode::default());
+            }
+            _ => panic!("a resume posts exactly one update"),
+        }
     }
 }
