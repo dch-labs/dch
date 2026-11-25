@@ -443,11 +443,11 @@ impl TuiApp {
 
     /// Paint the composer's identity row along the pane's bottom edge.
     ///
-    /// The session's name and the field's state tag share the row the
-    /// way the box closes itself: the identity takes what the tag
-    /// leaves, the tag holds its own width right-aligned, and an empty
-    /// tag leaves the identity the whole row. A pane with no rows
-    /// paints nothing at all.
+    /// The model with its effort and the permission mode, and the
+    /// field's state tag, share the row the way the box closes itself:
+    /// the identity takes what the tag leaves, the tag holds its own
+    /// width right-aligned, and an empty tag leaves the identity the
+    /// whole row. A pane with no rows paints nothing at all.
     fn paint_composer_identity(
         &self,
         frame: &mut Frame,
@@ -567,8 +567,8 @@ impl TuiApp {
     /// row counted from the window's first, both clamped to the rows
     /// the pane owns — a terminal too short for the field still shows
     /// the caret on a row the field owns. A theme without real colours
-    /// reverses the cell; one with them paints the input's own
-    /// foreground onto its accent.
+    /// reverses the cell; one with them paints the canvas colour onto
+    /// the input's accent.
     fn paint_composer_caret(
         &self,
         frame: &mut Frame,

@@ -23,8 +23,8 @@ use super::super::{SelectableShape, TuiApp};
 /// gather to the window: where the selectable range ends and the live
 /// regions begin, the height the scroll reads the pane against, where
 /// a pinned steer lane stands when steers wait unclaimed, and the two
-/// live regions whose rows paint straight from this frame's read,
-/// beside the caches the other segments paint from.
+/// live regions whose rows paint straight from this frame's read; the
+/// settled segments paint from the caches the lane stores hold.
 struct LiveRegion {
     /// The row the settled-and-live stack ends on.
     ///
@@ -306,25 +306,23 @@ impl TuiApp {
     }
 }
 
-/// Split the conversation pane into its text area and scrollbar
-/// gutter.
+/// The four areas the conversation carve hands back.
 ///
-/// The gutter is one column off the right edge, reserved whether or
-/// not the document scrolls — wrapped text can never collide with
-/// the scrollbar, and the wrap width never churns when the document
-/// crosses the scrollability threshold. Returns the gutter as `None`
-/// only in the degenerate one-column pane, where the text keeps the
-/// full width and no scrollbar renders.
+/// In order: the pane, the scrollbar's gutter, the mark gutter, and
+/// the text area — what [`carve_conversation_areas`] returns.
+type CarvedAreas = (Rect, Option<Rect>, Option<Rect>, Rect);
+
 /// Carve the conversation's areas out of its allotted rows.
 ///
-/// The geometry every conversation paint reads: the pane net of its
-/// top inset, the scrollbar's gutter beside it when the stack outgrows
-/// the pane (the `Option` that answers for it), the mark gutter where
-/// the pane is wide enough to spare one (its own `Option`), and the
-/// text area net of both gutters, the right inset, and the box margin
-/// — in that order. The text area is what click-mapping and the
-/// paragraph paint read.
-fn carve_conversation_areas(area: Rect) -> (Rect, Option<Rect>, Option<Rect>, Rect) {
+/// The geometry every conversation paint reads, in order: the pane net
+/// of its top inset; the scrollbar's gutter, one column off the right
+/// edge and `None` only in a one-column pane, reserved whether or not
+/// the document scrolls ([`split_scrollbar_gutter`]); the mark gutter
+/// where the pane is wide enough to spare one beside a minimum of
+/// text, the right inset, and the box margin (its own `Option`); and
+/// the text area net of both gutters, the right inset, and the box
+/// margin — the one area click-mapping and the paragraph paint read.
+fn carve_conversation_areas(area: Rect) -> CarvedAreas {
     let padded = Rect {
         y: area.y.saturating_add(CONVERSATION_TOP_INSET),
         height: area.height.saturating_sub(CONVERSATION_TOP_INSET),
@@ -355,6 +353,15 @@ fn carve_conversation_areas(area: Rect) -> (Rect, Option<Rect>, Option<Rect>, Re
     (pane, scrollbar_area, mark_gutter, text_area)
 }
 
+/// Split the conversation pane into its text area and scrollbar
+/// gutter.
+///
+/// The gutter is one column off the right edge, reserved whether or
+/// not the document scrolls — wrapped text can never collide with
+/// the scrollbar, and the wrap width never churns when the document
+/// crosses the scrollability threshold. Returns the gutter as `None`
+/// only in the degenerate one-column pane, where the text keeps the
+/// full width and no scrollbar renders.
 fn split_scrollbar_gutter(area: Rect) -> (Rect, Option<Rect>) {
     if area.width < 2 {
         return (area, None);
@@ -673,28 +680,90 @@ mod tests {
 
     #[test]
     fn the_carve_spares_the_mark_gutter_only_when_the_pane_can() {
-        // The mark gutter, both insets, and the box margin come off
-        // the pane's own width: a pane too narrow to spare a gutter
-        // paints its text where one would have stood, and a wide pane
-        // hands back a text area exactly net of everything it spent.
+        // The carve's whole geometry, row by row, against a 20-row
+        // area at the origin: the top inset comes off every area, the
+        // scrollbar's gutter is one column off the right edge whenever
+        // the pane is at least two wide, the mark gutter appears only
+        // once the pane can spare it beside a minimum of text, and the
+        // text area is net of both gutters, the right inset, and the
+        // box margin. The 17/18 pair is the threshold: at 17 the pane
+        // is one column too narrow, at 18 the mark gutter stands and
+        // the text area is exactly the minimum width.
         use super::{
-            CONVERSATION_BOX_MARGIN, CONVERSATION_MARK_GUTTER, CONVERSATION_RIGHT_INSET,
-            CONVERSATION_TOP_INSET, carve_conversation_areas,
+            CONVERSATION_BOX_MARGIN, CONVERSATION_MARK_GUTTER, CONVERSATION_MARK_MIN_TEXT,
+            CONVERSATION_RIGHT_INSET, CarvedAreas, carve_conversation_areas,
         };
         use ratatui::layout::Rect;
-        let wide = Rect::new(0, 0, 120, 20);
-        let (pane, _gutter, mark, text) = carve_conversation_areas(wide);
-        assert_eq!(pane.y, CONVERSATION_TOP_INSET);
-        let mark = mark.expect("a wide pane spares its gutter");
-        assert_eq!(mark.width, CONVERSATION_MARK_GUTTER);
+        let row = |width: u16| Rect::new(0, 0, width, 20);
+        let cases: [(u16, CarvedAreas); 5] = [
+            (
+                1,
+                (Rect::new(0, 1, 1, 19), None, None, Rect::new(0, 1, 0, 19)),
+            ),
+            (
+                2,
+                (
+                    Rect::new(0, 1, 1, 19),
+                    Some(Rect::new(1, 1, 1, 19)),
+                    None,
+                    Rect::new(0, 1, 0, 19),
+                ),
+            ),
+            (
+                17,
+                (
+                    Rect::new(0, 1, 16, 19),
+                    Some(Rect::new(16, 1, 1, 19)),
+                    None,
+                    Rect::new(0, 1, 12, 19),
+                ),
+            ),
+            (
+                18,
+                (
+                    Rect::new(0, 1, 17, 19),
+                    Some(Rect::new(17, 1, 1, 19)),
+                    Some(Rect::new(0, 1, 5, 19)),
+                    Rect::new(5, 1, 8, 19),
+                ),
+            ),
+            (
+                120,
+                (
+                    Rect::new(0, 1, 119, 19),
+                    Some(Rect::new(119, 1, 1, 19)),
+                    Some(Rect::new(0, 1, 5, 19)),
+                    Rect::new(5, 1, 110, 19),
+                ),
+            ),
+        ];
+        for (width, carved) in cases {
+            assert_eq!(
+                carve_conversation_areas(row(width)),
+                carved,
+                "the carve's four areas for an area {width} columns wide"
+            );
+        }
+        let (_, _, mark_at_threshold, text_at_threshold) = carve_conversation_areas(row(18));
         assert_eq!(
-            text.width,
-            pane.width
-                .saturating_sub(CONVERSATION_MARK_GUTTER)
-                .saturating_sub(CONVERSATION_RIGHT_INSET)
-                .saturating_sub(CONVERSATION_BOX_MARGIN)
+            mark_at_threshold.map(|gutter| gutter.width),
+            Some(CONVERSATION_MARK_GUTTER),
+            "the first width that spares the mark gutter gives it its full width"
         );
-        let (_pane, _gutter, mark, _text) = carve_conversation_areas(Rect::new(0, 0, 8, 20));
-        assert!(mark.is_none(), "a narrow pane spares nothing");
+        assert_eq!(
+            text_at_threshold.width, CONVERSATION_MARK_MIN_TEXT,
+            "and that width's text area is exactly the minimum the threshold protects"
+        );
+        let (_, _, mark_below, _) = carve_conversation_areas(row(17));
+        assert!(
+            mark_below.is_none(),
+            "one column narrower the pane keeps its text and spares no gutter"
+        );
+        let (pane, _, _, text) = carve_conversation_areas(row(120));
+        assert_eq!(
+            text.right().saturating_add(CONVERSATION_RIGHT_INSET),
+            pane.right().saturating_sub(CONVERSATION_BOX_MARGIN),
+            "the text area's right edge leaves exactly the right inset and box margin"
+        );
     }
 }

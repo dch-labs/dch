@@ -131,10 +131,10 @@ fn cancel_the_live_runner(state: &TuiObserverState) {
 /// starts with, in the workdir the session serves, carrying the name
 /// a launch resume adopts.
 ///
-/// One constructor call lifted out of the session setup so the setup
-/// reads as the wiring it is; the title is the resumed session's own —
-/// `None` on a fresh start, where the first claimed prompt's naming
-/// call coins one.
+/// The launch's saver, built in one call so the setup reads as the
+/// wiring it is; the title is the resumed session's own — `None` on a
+/// fresh start, where the first claimed prompt's naming call coins
+/// one.
 pub(crate) fn launch_saver(
     session_id: uuid::Uuid,
     model: String,
@@ -150,8 +150,7 @@ pub(crate) fn launch_saver(
     )
 }
 
-/// Lifted for length: the launch identity and the save target it
-/// writes through.
+/// The launch identity and the save target it writes through.
 ///
 /// Consumes the resume control into the session id — a resumed display
 /// is seeded with its transcript, a degraded fresh start says its warn
@@ -226,15 +225,12 @@ fn report_startup_warn(control: &ResumeControl) {
 
 /// Bring up the shared observer state a session publishes into.
 ///
-/// The observer half travels to the runner builder (see
-/// [`build_session_runner`]); the state half stays with the session —
-/// the display's cells and the engine's events share it from the
-/// first frame.
+/// The display's cells and the engine's events share this one state
+/// from the first frame; the runner builder derives its own observer
+/// from a clone of it (see [`build_session_runner`]), so nothing is
+/// split off here.
 fn new_display_state(redact_secrets: bool) -> TuiObserverState {
-    TuiObserverState::new()
-        .with_secret_redaction(redact_secrets)
-        .into_observer()
-        .1
+    TuiObserverState::new().with_secret_redaction(redact_secrets)
 }
 
 /// Build the launch's runner, resumed reads already re-recorded.
@@ -284,13 +280,14 @@ fn arm_interrupt_bridge(state: &TuiObserverState) -> crate::signals::CancelBridg
 ///
 /// Both halves of the app's wiring in one place — the persisting half
 /// (both config halves, the submit and save channels, the directory,
-/// persist target, and branch the status bar shows) and the
-/// interactive half (the steer share, the permission lane's receiver
-/// and memory beside it, the lane cells the display mirrors and
-/// steers through, and the question receiver the panel answers back
-/// along). The run's two channels open here: the half the driver
-/// consumes and the half the transcript writer publishes through come
-/// back; their display ends ride onto the app.
+/// persist target, and branch the place row shows) and the
+/// interactive half (the permission lane's receiver and memory beside
+/// it, the lane cells the display mirrors and steers through, and the
+/// question receiver the panel answers back along). The steer share
+/// is the parent's to install. The run's two channels open here: the
+/// half the driver consumes and the half the driver publishes the
+/// session's updates through come back; their display ends ride onto
+/// the app.
 fn wire_display_app(
     app: &mut TuiApp,
     config_base: dch_config::DchConfig,
@@ -324,17 +321,16 @@ fn wire_display_app(
 
 /// Open the transcript worker and stage the session's first save.
 ///
-/// The persistence half of the launch's staging, lifted for length:
-/// the worker opens on the launch saver; the saved permission memory
-/// is replayed into the lane cells — and when its file was damaged
-/// the session closes the permission lane outright before the first
-/// frame, the same refusal a headless run makes; the turn-end hook
-/// goes onto the app beside the handle it publishes through; and the
-/// opening snapshot rides out immediately, so the file the exit lines
-/// name exists before the first frame can fail. Returns the handle
-/// the driver and the machine seed publish through, the worker to
-/// join at the exit, and the saver cell the exit lines read the final
-/// id from.
+/// The persistence half of the launch's staging: the worker opens on
+/// the launch saver; the saved permission memory is replayed into the
+/// lane cells — and when its file was damaged the session closes the
+/// permission lane outright before the first frame, the same refusal a
+/// headless run makes; the turn-end hook goes onto the app beside the
+/// handle it publishes through; and the opening snapshot rides out
+/// immediately, so the file the exit lines name exists before the first
+/// frame can fail. Returns the handle the driver and the machine seed
+/// publish through, the worker to join at the exit, and the saver cell
+/// the exit lines read the final id from.
 fn stage_transcript_worker(
     app: &mut TuiApp,
     driver_config: &mut dch_config::DchConfig,
@@ -429,16 +425,15 @@ fn arm_run_cancellation(
 
 /// Run the display to its end, then close every lane in order.
 ///
-/// The session's whole teardown as one ordered close, lifted for
-/// length: the run loop ends; the shutdown flag goes up before any
-/// later claim can race a reminder turn; the settled frame stops with
-/// its waiting prompts re-echoed — then the question supervision is
-/// pulled, the LIVE runner is cancelled through the shared cell, the
-/// driver joins bounded, the late graduations and rescued corrections
-/// land in the transcript's final writes, the app drops with the
-/// terminal still guarded, and the signal bridge stands down. The
-/// run's own result comes back last: a draw failure is reported only
-/// after every one of those has run.
+/// The session's whole teardown as one ordered close: the run loop
+/// ends; the shutdown flag goes up before any later claim can race a
+/// reminder turn; the settled frame stops with its waiting prompts
+/// re-echoed — then the question supervision is pulled, the LIVE runner
+/// is cancelled through the shared cell, the driver joins bounded, the
+/// late graduations and rescued corrections land in the transcript's
+/// final writes, the app drops with the terminal still guarded, and the
+/// signal bridge stands down. The run's own result comes back last: a
+/// draw failure is reported only after every one of those has run.
 ///
 /// # Errors
 ///
@@ -575,11 +570,13 @@ pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Resu
 
 /// Assemble the driver's context from the session's resolved pieces.
 ///
-/// Lifted for length: the session builder hands over its live and base
-/// configs, its shared state, and the run's CLI statements, and the
-/// sessions root and flag overrides land here — the one place that
-/// knows where the driver loads resumes from and which flags it owes
-/// precedence for the session's whole life.
+/// Assemble the driver's context from the session's resolved pieces.
+///
+/// The session builder hands over its live and base configs, its
+/// shared state, and the run's CLI statements, and the sessions root
+/// and flag overrides land here — the one place that knows where the
+/// driver loads resumes from and which flags it owes precedence for
+/// the session's whole life.
 pub(crate) fn session_driver_context(
     config: dch_config::DchConfig,
     config_base: Arc<dch_config::DchConfig>,
@@ -609,15 +606,18 @@ pub(crate) fn session_driver_context(
 /// Join the writer inside the deaf window, then print the exit lines
 /// as one write.
 ///
-/// The teardown tail, lifted for length: the transcript writer joins
-/// with fatal signals deaf so a straggler interrupt cannot take the
-/// process out mid-join, and before the terminal restore stands the
-/// fatal net down outright — its `_exit(130)` would drop whatever
-/// stdout still buffers, the resume command included. The exit lines
-/// carry the session's last fact beside the command: plan entries the
-/// final run left undone, stated for the user who decides whether to
-/// resume. `None` means no run settled a figure to state — the exit says
-/// the plan was never read rather than claiming it finished clean.
+/// Join the transcript writer, restore the terminal, and print the
+/// exit lines.
+///
+/// The transcript writer joins with fatal signals deaf so a straggler
+/// interrupt cannot take the process out mid-join, and before the
+/// terminal restore stands the fatal net down outright — its
+/// `_exit(130)` would drop whatever stdout still buffers, the resume
+/// command included. The exit lines carry the session's last fact
+/// beside the command: plan entries the final run left undone, stated
+/// for the user who decides whether to resume. `None` means no run
+/// settled a figure to state — the exit says the plan was never read
+/// rather than claiming it finished clean.
 /// The command's id is read from the save target after the join — the
 /// session the LAST save wrote, whatever a `/clear` rotation or a
 /// `/resume` retarget left in the cell, never the id the session
@@ -710,14 +710,14 @@ fn resume_history_for_launch(
 
 /// Build the session's runner with every host axis attached.
 ///
-/// Both twins construct the live agent through here: the launch
-/// builds its first runner and a mid-session `/resume` rebuilds the
-/// live one the same way — the registration set assembled, the
-/// machine history mounted only when the resume's own record brought
-/// one, and the build awaited. The observer rides the shared state's
-/// own clone, so the engine's events land in the cells the display
-/// already reads. Each caller words its own failure; the construction
-/// itself says nothing about which twin asked.
+/// Both session entries construct the live agent through here: a
+/// fresh launch builds its first runner and a mid-session `/resume`
+/// rebuilds the live one the same way — the registration set
+/// assembled, the machine history mounted only when the resume's own
+/// record brought one, and the build awaited. The observer rides the
+/// shared state's own clone, so the engine's events land in the cells
+/// the display already reads. Each caller words its own failure; the
+/// construction itself says nothing about which entry asked.
 ///
 /// # Errors
 ///
@@ -1456,10 +1456,22 @@ mod tests {
         let before = chrono::Utc::now();
         let snapshot = machine_snapshot(std::sync::Arc::clone(&messages), 7);
         let after = chrono::Utc::now();
-        assert_eq!(snapshot.compactions, 7);
-        assert!(snapshot.saved_at >= before && snapshot.saved_at <= after);
-        assert!(snapshot.saver.is_none());
-        assert!(std::sync::Arc::ptr_eq(&snapshot.messages, &messages));
+        assert_eq!(
+            snapshot.compactions, 7,
+            "the snapshot carries the count it was read at"
+        );
+        assert!(
+            snapshot.saved_at >= before && snapshot.saved_at <= after,
+            "the stamp is taken at publication, between the two reads of the clock"
+        );
+        assert!(
+            snapshot.saver.is_none(),
+            "the snapshot publishes; it never retargets the writer"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&snapshot.messages, &messages),
+            "the history rides the caller's own allocation, not a copy"
+        );
     }
 
     #[test]
@@ -1476,7 +1488,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .expect("the publish lands");
-        assert!(std::sync::Arc::ptr_eq(&cell, &adopted));
+        assert!(
+            std::sync::Arc::ptr_eq(&cell, &adopted),
+            "the shared cell hands back exactly the history adopted — no copy, no filter"
+        );
     }
 
     #[test]
@@ -1499,10 +1514,22 @@ mod tests {
             .tokens
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(tokens.cumulative_input, 11);
-        assert_eq!(tokens.cumulative_output, 7);
-        assert_eq!(tokens.input, 5);
-        assert_eq!(tokens.context_tokens, 9);
+        assert_eq!(
+            tokens.cumulative_input, 11,
+            "the cumulative input continues from the file's figure"
+        );
+        assert_eq!(
+            tokens.cumulative_output, 7,
+            "the cumulative output continues from the file's figure"
+        );
+        assert_eq!(
+            tokens.input, 5,
+            "the last turn's input reads the file's figure"
+        );
+        assert_eq!(
+            tokens.context_tokens, 9,
+            "the context figure reads the file's figure"
+        );
     }
 
     #[test]
@@ -1517,7 +1544,8 @@ mod tests {
                 },
                 false,
             )
-            .is_none()
+            .is_none(),
+            "a fresh start mounts no history"
         );
         let outcome = crate::resume::ResumeOutcome {
             session_id: uuid::Uuid::new_v4(),
@@ -1530,7 +1558,10 @@ mod tests {
             permission_mode: None,
         };
         let history = resume_history_for_launch(&ResumeControl::Resumed(outcome), false);
-        assert!(history.is_some_and(|history| history.is_empty()));
+        assert!(
+            history.is_some_and(|history| history.is_empty()),
+            "a resumed control mounts its own machine record, whatever it holds"
+        );
     }
 
     #[test]
@@ -1562,13 +1593,34 @@ mod tests {
                 tokens,
                 permission_mode,
             } => {
-                assert_eq!(id, target.to_string());
-                assert_eq!(transcript, Vec::new());
-                assert_eq!(tokens.cumulative_input, 3);
-                assert_eq!(tokens.cumulative_output, 4);
-                assert_eq!(tokens.last_input, 5);
-                assert_eq!(tokens.context_tokens, 6);
-                assert_eq!(permission_mode, dch_config::PermissionMode::default());
+                assert_eq!(
+                    id,
+                    target.to_string(),
+                    "the update names the target it moved onto"
+                );
+                assert_eq!(
+                    transcript,
+                    Vec::new(),
+                    "the transcript maps as the file reads it"
+                );
+                assert_eq!(
+                    tokens.cumulative_input, 3,
+                    "the cumulative input rides the file"
+                );
+                assert_eq!(
+                    tokens.cumulative_output, 4,
+                    "the cumulative output rides the file"
+                );
+                assert_eq!(tokens.last_input, 5, "the last turn's input rides the file");
+                assert_eq!(
+                    tokens.context_tokens, 6,
+                    "the context figure rides the file"
+                );
+                assert_eq!(
+                    permission_mode,
+                    dch_config::PermissionMode::default(),
+                    "the standing mode rides the file"
+                );
             }
             _ => panic!("a resume posts exactly one update"),
         }
