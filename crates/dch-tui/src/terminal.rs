@@ -1714,6 +1714,12 @@ pub fn ignore_fatal_signals() {
 #[cfg(not(unix))]
 pub fn ignore_fatal_signals() {}
 
+/// The canvas a session draws on: ratatui over the process's
+/// standard output — the pair [`init_terminal`] brings up and
+/// [`TerminalGuard`] hands back. Hosts name the terminal through this
+/// alias instead of linking ratatui themselves.
+pub type SessionTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
+
 /// RAII ownership of an initialized TUI terminal.
 ///
 /// Constructing the guard initializes the terminal (see

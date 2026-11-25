@@ -396,16 +396,30 @@ impl TuiApp {
         rows: &[String],
         caret: (u16, u16),
     ) {
-        let (caret_row, column) = caret;
         let muted = self.section_holds_keys();
+        let text_style = self.paint_composer_surface(frame, area, muted);
+        self.paint_composer_identity(frame, area, rows, caret);
+        let (interior, start) = self.paint_composer_text(frame, area, rows, text_style, caret.0);
+        self.paint_composer_caret(frame, area, interior, start, caret);
+    }
+
+    /// Paint the composer pane's own surface and say how its text sits
+    /// on it.
+    ///
+    /// A themed composer border keeps the pane's surface to whatever
+    /// stands behind it; without one the pane claims its surface here,
+    /// and the leftmost column takes the accent the muted field reads
+    /// dim and the live field reads primary. The style handed back is
+    /// the text's own: the muted field dims its voice, the live field
+    /// speaks in the input's colour.
+    fn paint_composer_surface(&self, frame: &mut Frame, area: Rect, muted: bool) -> Style {
         let voice = if muted {
             self.theme.ui.dim
         } else {
             self.theme.ui.input_text
         };
-
         let surface = self.theme.ui.surface;
-        let text_style = if self.theme.ui.composer_border.is_some() {
+        if self.theme.ui.composer_border.is_some() {
             Style::default().fg(voice)
         } else {
             frame
@@ -424,12 +438,24 @@ impl TuiApp {
                 }),
             );
             Style::default().fg(voice).bg(surface)
-        };
-        let text_height = INPUT_TEXT_ROWS.min(
-            area.height
-                .saturating_sub(INPUT_VERTICAL_PADDING.saturating_mul(2))
-                .saturating_sub(1),
-        );
+        }
+    }
+
+    /// Paint the composer's identity row along the pane's bottom edge.
+    ///
+    /// The model with its effort and the permission mode, and the
+    /// field's state tag, share the row the way the box closes itself:
+    /// the identity takes what the tag leaves, the tag holds its own
+    /// width right-aligned, and an empty tag leaves the identity the
+    /// whole row. A pane with no rows paints nothing at all.
+    fn paint_composer_identity(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        rows: &[String],
+        caret: (u16, u16),
+    ) {
+        let surface = self.theme.ui.surface;
         let info_style = if self.theme.ui.composer_border.is_some() {
             Style::default().fg(self.theme.ui.dim)
         } else {
@@ -480,6 +506,31 @@ impl TuiApp {
                 );
             }
         }
+    }
+
+    /// Paint the field's visible rows and say where they sit.
+    ///
+    /// The window slides with the caret's row: the field's own height
+    /// net of its padding decides how many rows stand, the window
+    /// starts at the caret's row less all but the last of them, and
+    /// the geometry is published to the pointer's hand beside it — the
+    /// same `InputView` a click converts through, so what was painted
+    /// and what is aimed at never disagree. Returns the window's own
+    /// rectangle and its first row, which is where the caret's math
+    /// continues.
+    fn paint_composer_text(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        rows: &[String],
+        text_style: Style,
+        caret_row: u16,
+    ) -> (Rect, usize) {
+        let text_height = INPUT_TEXT_ROWS.min(
+            area.height
+                .saturating_sub(INPUT_VERTICAL_PADDING.saturating_mul(2))
+                .saturating_sub(1),
+        );
         let interior = Rect {
             x: area
                 .x
@@ -507,7 +558,26 @@ impl TuiApp {
             .map(|row| Line::styled(row.as_str(), text_style))
             .collect();
         frame.render_widget(Paragraph::new(lines), interior);
+        (interior, start)
+    }
 
+    /// Paint the caret cell itself, wherever the window left it.
+    ///
+    /// The caret rides the window: its column inside the interior, its
+    /// row counted from the window's first, both clamped to the rows
+    /// the pane owns — a terminal too short for the field still shows
+    /// the caret on a row the field owns. A theme without real colours
+    /// reverses the cell; one with them paints the canvas colour onto
+    /// the input's accent.
+    fn paint_composer_caret(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        interior: Rect,
+        start: usize,
+        caret: (u16, u16),
+    ) {
+        let (caret_row, column) = caret;
         let caret_x = area
             .x
             .saturating_add(INPUT_SIDE_INSET)

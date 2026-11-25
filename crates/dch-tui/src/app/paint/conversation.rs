@@ -17,6 +17,48 @@ use crate::cells::{carries_policy_input, first_retained_offset, for_display, pai
 use super::super::selection::{ViewState, reverse_selection};
 use super::super::{SelectableShape, TuiApp};
 
+/// What this frame's live-region gathering settled.
+///
+/// The row currency of the live half of the stack, handed from the
+/// gather to the window: where the selectable range ends and the live
+/// regions begin, the height the scroll reads the pane against, where
+/// a pinned steer lane stands when steers wait unclaimed, and the two
+/// live regions whose rows paint straight from this frame's read; the
+/// settled segments paint from the caches the lane stores hold.
+struct LiveRegion {
+    /// The row the settled-and-live stack ends on.
+    ///
+    /// The selectable limit: the pointer records it as the edge of
+    /// what a selection may span, and the chrome reads it to place the
+    /// live lanes below the transcript rather than inside it.
+    lane_end: usize,
+
+    /// The whole height the scroll settles against.
+    ///
+    /// Live regions included, so the offset arithmetic and the
+    /// scrollbar measure the pane the way this frame paints it.
+    total_lines: usize,
+
+    /// The steer lane's row range, when unclaimed steers stand pinned.
+    ///
+    /// `None` when no steer waits; the range names the rows the
+    /// pointer must leave out of the selectable transcript, since the
+    /// steers are this frame's currency and not yet conversation.
+    pinned_steer: Option<(usize, usize)>,
+
+    /// The rows of the waiting steers themselves.
+    ///
+    /// Painted last before the timer, straight from this frame's read
+    /// rather than from any cache.
+    pending_steer_rows: Vec<Line<'static>>,
+
+    /// The run's elapsed line.
+    ///
+    /// Kept beside the steers so the segment list paints the timer as
+    /// the live stack's closing row.
+    run_timer: Vec<Line<'static>>,
+}
+
 impl TuiApp {
     /// Render the conversation pane: the transcript's windowed view
     /// and everything live that rides it.
@@ -37,33 +79,7 @@ impl TuiApp {
     /// The view state this records is the click-mapping every later
     /// pointer event trusts.
     pub(in crate::app) fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
-        let padded = Rect {
-            y: area.y.saturating_add(CONVERSATION_TOP_INSET),
-            height: area.height.saturating_sub(CONVERSATION_TOP_INSET),
-            ..area
-        };
-        let (pane, scrollbar_area) = split_scrollbar_gutter(padded);
-        let mark_gutter = (pane.width
-            >= CONVERSATION_MARK_MIN_TEXT
-                .saturating_add(CONVERSATION_MARK_GUTTER)
-                .saturating_add(CONVERSATION_RIGHT_INSET)
-                .saturating_add(CONVERSATION_BOX_MARGIN))
-        .then_some(Rect {
-            width: CONVERSATION_MARK_GUTTER,
-            ..pane
-        });
-        let text_area = mark_gutter.as_ref().map_or(pane, |gutter| Rect {
-            x: gutter.right(),
-            width: pane.width.saturating_sub(CONVERSATION_MARK_GUTTER),
-            ..pane
-        });
-        let text_area = Rect {
-            width: text_area
-                .width
-                .saturating_sub(CONVERSATION_RIGHT_INSET)
-                .saturating_sub(CONVERSATION_BOX_MARGIN),
-            ..text_area
-        };
+        let (pane, scrollbar_area, mark_gutter, text_area) = carve_conversation_areas(area);
         let conversation_height = text_area.height as usize;
         let width = text_area.width.max(1);
         if self.bake.conversation_cache_generation != self.bake.conversation_generation
@@ -72,6 +88,73 @@ impl TuiApp {
             self.bake_conversation_cache(text_area, width);
         }
 
+        let live = self.gather_live_region(width, conversation_height);
+        let skip = self.snap_skip_to_whole_todo_blocks(
+            live.total_lines
+                .saturating_sub(conversation_height)
+                .saturating_sub(self.scroll.scroll_offset),
+            conversation_height,
+        );
+        frame.render_widget(ratatui::widgets::Clear, pane);
+        self.paint_user_turn_chrome(
+            frame,
+            pane,
+            mark_gutter,
+            skip,
+            conversation_height,
+            live.pinned_steer,
+        );
+        let segments: Vec<&[Line<'_>]> = vec![
+            &self.bake.conversation_cache,
+            &self.lane.live_seam_lines,
+            &self.lane.live_thinking_cache,
+            &self.freeze.frozen_lines,
+            &self.freeze.live_lines,
+            &self.lane.live_compaction_cache,
+            &self.lane.live_tools_cache,
+            &live.pending_steer_rows,
+            &live.run_timer,
+        ];
+        let mut visible = visible_window(&segments, skip, conversation_height);
+        self.pointer.last_view = Some(ViewState {
+            area: text_area,
+            skip,
+            total: live.total_lines,
+            selectable: live.lane_end,
+        });
+        if let Some(selection) = &self.pointer.selection {
+            reverse_selection(&mut visible, skip, selection);
+        }
+        for_display_lines(&mut visible);
+        frame.render_widget(Paragraph::new(visible), text_area);
+        if let Some(gutter) = scrollbar_area
+            && let Some((thumb_pos, thumb_len)) =
+                scrollbar_geometry(live.total_lines, conversation_height, skip)
+        {
+            render_scrollbar(
+                frame,
+                gutter,
+                thumb_pos,
+                thumb_len,
+                self.theme.ui.scrollbar_thumb,
+                self.theme.ui.scrollbar_track,
+            );
+        }
+    }
+
+    /// Gather this frame's live-region rows and settle the lane's ends.
+    ///
+    /// The live half of the stack, read at this frame's width: the
+    /// streaming region refreshed, the active tools, thinking,
+    /// compaction, pending-steer, and run-timer rows gathered, and a
+    /// seam kept between the settled cache and the live regions when
+    /// both stand. The row offsets the pointer and the chrome read are
+    /// settled here — the selectable range's end, where a pinned steer
+    /// lane would stand, and the height the scroll reads the pane
+    /// against — and the caches the segments paint from are stored as
+    /// they are read, so the window can be decided before a line of it
+    /// is assembled.
+    fn gather_live_region(&mut self, width: u16, conversation_height: usize) -> LiveRegion {
         let streaming_changed = self.refresh_streaming_region(width);
         let (tools, running_rows) = self.active_tool_lines(width);
         let thinking_rows = self.live_thinking_lines(width);
@@ -133,60 +216,16 @@ impl TuiApp {
             .saturating_add(pending_steer_rows.len())
             .saturating_add(run_timer.len());
         self.settle_scroll_offset(total_lines, conversation_height);
-        let skip = self.snap_skip_to_whole_todo_blocks(
-            total_lines
-                .saturating_sub(conversation_height)
-                .saturating_sub(self.scroll.scroll_offset),
-            conversation_height,
-        );
-        frame.render_widget(ratatui::widgets::Clear, pane);
-        self.paint_user_turn_chrome(
-            frame,
-            pane,
-            mark_gutter,
-            skip,
-            conversation_height,
-            pinned_steer,
-        );
         self.lane.live_seam_lines = seam;
         self.lane.live_thinking_cache = thinking_rows.0;
         self.lane.live_compaction_cache = compaction_rows;
         self.lane.live_tools_cache = tools;
-        let segments: Vec<&[Line<'_>]> = vec![
-            &self.bake.conversation_cache,
-            &self.lane.live_seam_lines,
-            &self.lane.live_thinking_cache,
-            &self.freeze.frozen_lines,
-            &self.freeze.live_lines,
-            &self.lane.live_compaction_cache,
-            &self.lane.live_tools_cache,
-            &pending_steer_rows,
-            &run_timer,
-        ];
-        let mut visible = visible_window(&segments, skip, conversation_height);
-        self.pointer.last_view = Some(ViewState {
-            area: text_area,
-            skip,
-            total: total_lines,
-            selectable: lane_end,
-        });
-        if let Some(selection) = &self.pointer.selection {
-            reverse_selection(&mut visible, skip, selection);
-        }
-        for_display_lines(&mut visible);
-        frame.render_widget(Paragraph::new(visible), text_area);
-        if let Some(gutter) = scrollbar_area
-            && let Some((thumb_pos, thumb_len)) =
-                scrollbar_geometry(total_lines, conversation_height, skip)
-        {
-            render_scrollbar(
-                frame,
-                gutter,
-                thumb_pos,
-                thumb_len,
-                self.theme.ui.scrollbar_thumb,
-                self.theme.ui.scrollbar_track,
-            );
+        LiveRegion {
+            lane_end,
+            total_lines,
+            pinned_steer,
+            pending_steer_rows,
+            run_timer,
         }
     }
 
@@ -265,6 +304,53 @@ impl TuiApp {
             }
         }
     }
+}
+
+/// The four areas the conversation carve hands back.
+///
+/// In order: the pane, the scrollbar's gutter, the mark gutter, and
+/// the text area — what [`carve_conversation_areas`] returns.
+type CarvedAreas = (Rect, Option<Rect>, Option<Rect>, Rect);
+
+/// Carve the conversation's areas out of its allotted rows.
+///
+/// The geometry every conversation paint reads, in order: the pane net
+/// of its top inset; the scrollbar's gutter, one column off the right
+/// edge and `None` only in a one-column pane, reserved whether or not
+/// the document scrolls ([`split_scrollbar_gutter`]); the mark gutter
+/// where the pane is wide enough to spare one beside a minimum of
+/// text, the right inset, and the box margin (its own `Option`); and
+/// the text area net of both gutters, the right inset, and the box
+/// margin — the one area click-mapping and the paragraph paint read.
+fn carve_conversation_areas(area: Rect) -> CarvedAreas {
+    let padded = Rect {
+        y: area.y.saturating_add(CONVERSATION_TOP_INSET),
+        height: area.height.saturating_sub(CONVERSATION_TOP_INSET),
+        ..area
+    };
+    let (pane, scrollbar_area) = split_scrollbar_gutter(padded);
+    let mark_gutter = (pane.width
+        >= CONVERSATION_MARK_MIN_TEXT
+            .saturating_add(CONVERSATION_MARK_GUTTER)
+            .saturating_add(CONVERSATION_RIGHT_INSET)
+            .saturating_add(CONVERSATION_BOX_MARGIN))
+    .then_some(Rect {
+        width: CONVERSATION_MARK_GUTTER,
+        ..pane
+    });
+    let text_area = mark_gutter.as_ref().map_or(pane, |gutter| Rect {
+        x: gutter.right(),
+        width: pane.width.saturating_sub(CONVERSATION_MARK_GUTTER),
+        ..pane
+    });
+    let text_area = Rect {
+        width: text_area
+            .width
+            .saturating_sub(CONVERSATION_RIGHT_INSET)
+            .saturating_sub(CONVERSATION_BOX_MARGIN),
+        ..text_area
+    };
+    (pane, scrollbar_area, mark_gutter, text_area)
 }
 
 /// Split the conversation pane into its text area and scrollbar
@@ -589,6 +675,95 @@ mod tests {
             scrollbar_geometry(100, 10, 999),
             scrollbar_geometry(100, 10, 90),
             "a skip past the end reports the end, never past the track"
+        );
+    }
+
+    #[test]
+    fn the_carve_spares_the_mark_gutter_only_when_the_pane_can() {
+        // The carve's whole geometry, row by row, against a 20-row
+        // area at the origin: the top inset comes off every area, the
+        // scrollbar's gutter is one column off the right edge whenever
+        // the pane is at least two wide, the mark gutter appears only
+        // once the pane can spare it beside a minimum of text, and the
+        // text area is net of both gutters, the right inset, and the
+        // box margin. The 17/18 pair is the threshold: at 17 the pane
+        // is one column too narrow, at 18 the mark gutter stands and
+        // the text area is exactly the minimum width.
+        use super::{
+            CONVERSATION_BOX_MARGIN, CONVERSATION_MARK_GUTTER, CONVERSATION_MARK_MIN_TEXT,
+            CONVERSATION_RIGHT_INSET, CarvedAreas, carve_conversation_areas,
+        };
+        use ratatui::layout::Rect;
+        let row = |width: u16| Rect::new(0, 0, width, 20);
+        let cases: [(u16, CarvedAreas); 5] = [
+            (
+                1,
+                (Rect::new(0, 1, 1, 19), None, None, Rect::new(0, 1, 0, 19)),
+            ),
+            (
+                2,
+                (
+                    Rect::new(0, 1, 1, 19),
+                    Some(Rect::new(1, 1, 1, 19)),
+                    None,
+                    Rect::new(0, 1, 0, 19),
+                ),
+            ),
+            (
+                17,
+                (
+                    Rect::new(0, 1, 16, 19),
+                    Some(Rect::new(16, 1, 1, 19)),
+                    None,
+                    Rect::new(0, 1, 12, 19),
+                ),
+            ),
+            (
+                18,
+                (
+                    Rect::new(0, 1, 17, 19),
+                    Some(Rect::new(17, 1, 1, 19)),
+                    Some(Rect::new(0, 1, 5, 19)),
+                    Rect::new(5, 1, 8, 19),
+                ),
+            ),
+            (
+                120,
+                (
+                    Rect::new(0, 1, 119, 19),
+                    Some(Rect::new(119, 1, 1, 19)),
+                    Some(Rect::new(0, 1, 5, 19)),
+                    Rect::new(5, 1, 110, 19),
+                ),
+            ),
+        ];
+        for (width, carved) in cases {
+            assert_eq!(
+                carve_conversation_areas(row(width)),
+                carved,
+                "the carve's four areas for an area {width} columns wide"
+            );
+        }
+        let (_, _, mark_at_threshold, text_at_threshold) = carve_conversation_areas(row(18));
+        assert_eq!(
+            mark_at_threshold.map(|gutter| gutter.width),
+            Some(CONVERSATION_MARK_GUTTER),
+            "the first width that spares the mark gutter gives it its full width"
+        );
+        assert_eq!(
+            text_at_threshold.width, CONVERSATION_MARK_MIN_TEXT,
+            "and that width's text area is exactly the minimum the threshold protects"
+        );
+        let (_, _, mark_below, _) = carve_conversation_areas(row(17));
+        assert!(
+            mark_below.is_none(),
+            "one column narrower the pane keeps its text and spares no gutter"
+        );
+        let (pane, _, _, text) = carve_conversation_areas(row(120));
+        assert_eq!(
+            text.right().saturating_add(CONVERSATION_RIGHT_INSET),
+            pane.right().saturating_sub(CONVERSATION_BOX_MARGIN),
+            "the text area's right edge leaves exactly the right inset and box margin"
         );
     }
 }
