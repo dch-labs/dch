@@ -370,13 +370,17 @@ impl TuiApp {
 }
 
 /// Where the scroll pin sits in the transcript's own structure: the
-/// message whose rows hold it, the rendering unit within that message (a
-/// source segment, a block), and the row's offset inside the unit beside
-/// the unit's row count when the identity was read.
+/// message whose rows hold it, the rendering block within that message,
+/// the paragraph unit within that block (a source segment, a paragraph of
+/// a text, thinking, or detail block), and the row's offset inside the
+/// unit beside the unit's row count when the identity was read.
 ///
-/// A rewrap at a new width moves every unit's rows but keeps the units, so
-/// the settle maps the identity back onto the same source line; a row
-/// index alone names a different line after every rewrap.
+/// A rewrap at a new width moves every unit's rows but keeps the blocks
+/// and their units, so the settle maps the identity back onto the same
+/// source line; a row index alone names a different line after every
+/// rewrap. The block is named apart from the unit because a fold changes
+/// a block's unit count: counted flat across the message, a folded
+/// thinking block would take a paragraph from every block after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PinIdentity {
     /// The message whose rows hold the pin, as an index into the bake's
@@ -386,9 +390,17 @@ pub(crate) struct PinIdentity {
     /// on both sides of it.
     pub(crate) message: usize,
 
-    /// The rendering unit within that message holding the pin — a
-    /// source segment or a block, as the message's unit starts list
-    /// numbers them.
+    /// The rendering block within that message holding the pin — the
+    /// whole of a user, system, error, or compaction message, or one
+    /// content block or the trailing duration row of an assistant
+    /// message — as the message's block list numbers them.
+    ///
+    /// Blocks survive a rewrap and a fold of another block whole; only
+    /// their rows and paragraph counts change.
+    pub(crate) block: usize,
+
+    /// The paragraph unit within that block holding the pin, as the
+    /// block's unit starts list numbers them.
     ///
     /// Units survive a rewrap whole; only their row counts change, which
     /// is why the pin is carried at this grain and not as a row.
@@ -409,8 +421,8 @@ pub(crate) struct PinIdentity {
 }
 
 /// The merged indexes of one layout: each message's row span and, per
-/// message, the row each of its rendering units opens at — the figures
-/// [`PinIdentity`] is read against.
+/// message and rendering block, the row each of its paragraph units opens
+/// at — the figures [`PinIdentity`] is read against.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BakeLayout {
     /// Each message's row span in the merged cache of that layout.
@@ -419,12 +431,13 @@ pub(crate) struct BakeLayout {
     /// a pinned row sits in, found by the row's place in these spans.
     pub(crate) ranges: Vec<std::ops::Range<usize>>,
 
-    /// Per message, the row each of its rendering units opens at.
+    /// Per message, per rendering block, the row each of the block's
+    /// paragraph units opens at.
     ///
-    /// The second figure: the unit within the message, and — beside the
-    /// message's span — the row's offset inside it and the unit's row
-    /// count.
-    pub(crate) units: Vec<Vec<usize>>,
+    /// The second figure: the block and the unit within it, and — beside
+    /// the message's span — the row's offset inside the unit and the
+    /// unit's row count.
+    pub(crate) units: Vec<Vec<Vec<usize>>>,
 }
 
 /// One block's shape as it stood when a fold or expansion was noted,
@@ -442,6 +455,14 @@ pub(crate) struct ReshapeNote {
     /// redrawn the row maps, and what makes a later click on the same
     /// block find its standing note.
     pub(crate) key: String,
+
+    /// The message the noted occurrence sits in, when the key is a call
+    /// id a retry gave two blocks: the note's rows are read within that
+    /// message alone, so each occurrence moves the pin by its own change.
+    ///
+    /// `None` for a key that already names one block — a thinking
+    /// section's, or a notice's.
+    pub(crate) message: Option<usize>,
 
     /// The rows the block held above `pin` when the note was taken.
     ///

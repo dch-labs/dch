@@ -41,9 +41,10 @@ pub(super) struct BakeOutputs {
 pub(super) struct BakeMeta {
     /// Row spans registered under their tool-call id.
     ///
-    /// Every row a foldable baked tool block produced maps to the
-    /// call it belongs to, so a press on any of them resolves the
-    /// toggle.
+    /// Every row a baked tool block produced maps to the call it belongs
+    /// to — an evicted block's plain summary rows too, so the settle
+    /// measures the block's whole change in length — and a press resolves
+    /// the toggle where retained detail backs it.
     pub(super) tool_summary_lines: HashMap<usize, String>,
 
     /// Row spans registered under their thinking section's key.
@@ -83,15 +84,20 @@ pub(super) struct BakeMeta {
     /// pinned row sits in survives a rewrap, where its row index does not.
     pub(super) message_ranges: Vec<std::ops::Range<usize>>,
 
-    /// Per message, the row each of its rendering units opens at.
+    /// Per message, per rendering block, the row each of the block's
+    /// paragraph units opens at.
     ///
-    /// A unit is one appending group of the bake: a source segment of a
-    /// user or system message, a block of an assistant message, a trailing
-    /// duration row. Bake-absolute rows, the first being the message's own
-    /// start. A rewrap moves the rows and keeps the units, so a pin named
-    /// `(message, unit, offset)` maps onto the same source line at any
-    /// width.
-    pub(super) message_units: Vec<Vec<usize>>,
+    /// A block is the whole of a user, system, error, or compaction
+    /// message, one content block of an assistant message, or its
+    /// trailing duration row; a unit is one appending group of the bake
+    /// within it: a source segment, a paragraph of a text, thinking, or
+    /// detail block. Bake-absolute rows, each block's first being the
+    /// block's own start. A rewrap moves the rows and keeps the blocks
+    /// and their paragraphs, so a pin named `(message, block, unit,
+    /// offset)` maps onto the same source line at any width — and a fold
+    /// that takes paragraphs from one block leaves every block after it
+    /// where it was, where a count of units across the message would not.
+    pub(super) message_units: Vec<Vec<Vec<usize>>>,
 }
 
 impl BakeMeta {
@@ -162,10 +168,15 @@ impl BakeMeta {
             }));
         merged
             .message_units
-            .extend(tail.message_units.into_iter().map(|units| {
-                units
+            .extend(tail.message_units.into_iter().map(|blocks| {
+                blocks
                     .into_iter()
-                    .map(|start| start.saturating_add(tail_base))
+                    .map(|units| {
+                        units
+                            .into_iter()
+                            .map(|start| start.saturating_add(tail_base))
+                            .collect()
+                    })
                     .collect()
             }));
         merged
@@ -366,9 +377,10 @@ pub(super) struct TranscriptBake {
 
     /// Conversation line index to call id, for tool block rows.
     ///
-    /// The click targets: every line of each completed block that
-    /// has retained detail — summary and expansion alike, so a
-    /// click anywhere on an open block folds it. Rebuilt with the
+    /// The click targets: every line of each completed block — an
+    /// evicted block's plain summary rows included, so the settle
+    /// measures it — with a press resolving the toggle where retained
+    /// detail backs it, on summary and expansion alike. Rebuilt with the
     /// conversation cache.
     pub(super) tool_summary_lines: HashMap<usize, String>,
 
@@ -390,16 +402,16 @@ pub(super) struct TranscriptBake {
     /// their rows. Indexes are cache lines, rebuilt with the cache.
     pub(super) message_ranges: Vec<std::ops::Range<usize>>,
 
-    /// Per message, the row each of its rendering units opens at, merged
-    /// over the whole cache.
+    /// Per message, per rendering block, the row each of the block's
+    /// paragraph units opens at, merged over the whole cache.
     ///
     /// The tail's unit starts rebased beside the prefix's, in cache lines
-    /// rebuilt with the cache; a message's first start is its own first
+    /// rebuilt with the cache; a block's first start is its own first
     /// row. Beside the message ranges these place the scroll pin's
-    /// `(message, unit, offset)` identity, which a rewrap carries onto the
-    /// same source line at any width. A unit is one appending group of the
-    /// bake — see [`BakeMeta::message_units`].
-    pub(super) message_units: Vec<Vec<usize>>,
+    /// `(message, block, unit, offset)` identity, which a rewrap carries
+    /// onto the same source line at any width. A block and a unit are
+    /// appending groups of the bake — see [`BakeMeta::message_units`].
+    pub(super) message_units: Vec<Vec<Vec<usize>>>,
 }
 
 impl Default for TranscriptBake {

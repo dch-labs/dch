@@ -145,10 +145,12 @@ impl TuiApp {
     /// Builds the block's verbosity-shaped summary line(s) and, when
     /// the call carries retained expansion data, prepends the fold
     /// marker and appends the expanded detail. Every row a block
-    /// with retained detail produced is registered under the call's
-    /// id, so a press on any of them resolves back to the call it
-    /// belongs to; an evicted block renders plain summary rows no
-    /// press resolves.
+    /// produced is registered under the call's id, so a press on any of
+    /// them resolves back to the call it belongs to — and so the settle
+    /// measures a block whose detail the cap retired by the plain
+    /// summary rows it still renders, not as gone whole. A press on those
+    /// resolves nothing: no retained detail backs a toggle, and
+    /// [`toggle_tool_at`](TuiApp::toggle_tool_at) declines it.
     pub(crate) fn push_tool_block_lines(
         &self,
         block: &ContentBlock,
@@ -244,9 +246,9 @@ impl TuiApp {
                     ));
                 }
             }
-            for index in first..lines.len() {
-                summary_lines.insert(index, call_id.clone());
-            }
+        }
+        for index in first..lines.len() {
+            summary_lines.insert(index, call_id.clone());
         }
     }
 

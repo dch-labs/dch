@@ -646,7 +646,7 @@ impl TuiApp {
         if let Some(id) = self.expansion.auto_expanded_todo.take()
             && self.expansion.expanded_tools.remove(&id)
         {
-            self.note_block_reshape(&id);
+            self.note_call_reshape(&id);
             self.bake.rebake_whole();
         }
         self.conversation.push(message);
@@ -2261,13 +2261,13 @@ impl TuiApp {
             self.scroll.settled_layout = None;
         } else {
             let reader_moved = self.scroll.scroll_offset != self.scroll.settled_offset;
-            let base = if reader_moved && self.remembered_pin() > self.last_frame_top_row() {
-                self.last_frame_top_row()
-                    .min(total_lines.saturating_sub(viewport))
-            } else {
-                self.remembered_pin()
-            };
+            let base = self.pin_base();
             let requested = self.pin_after_reader_move(base);
+            let pinned_block_reshaped = self.scroll.reshaped_blocks.iter().any(|note| {
+                note.len > 0
+                    && note.last_row.saturating_sub(note.len.saturating_sub(1)) <= requested
+                    && requested <= note.last_row
+            });
             let (landed_above, left_above) = self.rows_moved_above_anchor();
             let pin = requested
                 .saturating_add(landed_above)
@@ -2277,7 +2277,9 @@ impl TuiApp {
                 pin
             } else if reader_moved {
                 let layout = self.scroll.settled_layout.as_deref();
-                match layout.and_then(|layout| Self::pin_identity_in(requested, layout)) {
+                match layout.and_then(|layout| {
+                    Self::pin_identity_in(requested, &layout.ranges, &layout.units)
+                }) {
                     Some(identity) => self.pin_row_after_rewrap(identity).unwrap_or(pin),
                     None => pin,
                 }
@@ -2290,11 +2292,7 @@ impl TuiApp {
             self.scroll.scroll_offset = total_lines.saturating_sub(viewport).saturating_sub(pin);
             self.scroll.anchored_row = Some(pin);
             self.scroll.settled_offset = self.scroll.scroll_offset;
-            if reader_moved
-                || landed_above > 0
-                || left_above > 0
-                || self.scroll.pin_identity.is_none()
-            {
+            if reader_moved || pinned_block_reshaped || self.scroll.pin_identity.is_none() {
                 self.scroll.pin_identity = self.pin_identity_at(pin);
             }
             self.scroll.settled_width = width;
@@ -2307,16 +2305,41 @@ impl TuiApp {
         self.pacing.last_layout_viewport = viewport;
     }
 
+    /// The row the settle and [`pinned_row`](Self::pinned_row) move the pin
+    /// from, before the reader's queued notches.
+    ///
+    /// The remembered pin — or, once the reader has moved and the last
+    /// frame could not reach it (the offset saturated), the row that frame
+    /// showed: a notch means a row of the view the reader sees, not of a
+    /// pin hidden below its range. The base is never clamped to the frame
+    /// in hand: the new range limits only the offset, so a requested row
+    /// beyond it is denied and remembered — as any pin the offset cannot
+    /// reach is — until the geometry reaches it. Both callers take this
+    /// base, so a reshape noted ahead of a settle counts its rows against
+    /// the pin the settle will move — a note taken against a hidden
+    /// remembered pin reads a summary the frame shows below the view's top
+    /// as wholly above the pin, and the settle then moves the view by the
+    /// block's growth.
+    fn pin_base(&self) -> usize {
+        let reader_moved = self.scroll.scroll_offset != self.scroll.settled_offset;
+        if reader_moved && self.remembered_pin() > self.last_frame_top_row() {
+            self.last_frame_top_row()
+        } else {
+            self.remembered_pin()
+        }
+    }
+
     /// The row the detached view's top is on, in the last settle's
-    /// coordinates: the remembered pin, moved by whatever has happened to
-    /// the offset since — a wheel notch up takes it a row higher, a notch
-    /// down a row lower, a prompt jump seats it on the prompt — or, before
-    /// any pin is remembered, the paint's own `total − viewport − offset`
-    /// against the last totals. The fold sites measure their blocks against
-    /// this figure and carry it with the note, so the settle re-measures
-    /// against the same pin whatever the reader has done since.
+    /// coordinates: [`pin_base`](Self::pin_base), moved by whatever has
+    /// happened to the offset since — a wheel notch up takes it a row
+    /// higher, a notch down a row lower, a prompt jump seats it on the
+    /// prompt — or, before any pin is remembered, the paint's own
+    /// `total − viewport − offset` against the last totals. The fold sites
+    /// measure their blocks against this figure and carry it with the note,
+    /// so the settle re-measures against the same pin whatever the reader
+    /// has done since.
     fn pinned_row(&self) -> usize {
-        self.pin_after_reader_move(self.remembered_pin())
+        self.pin_after_reader_move(self.pin_base())
     }
 
     /// `base` moved by whatever the reader has done to the offset since
@@ -2365,30 +2388,30 @@ impl TuiApp {
     /// row sits in no baked message — a separator row, or the live region
     /// past the bake.
     fn pin_identity_at(&self, row: usize) -> Option<PinIdentity> {
-        Self::pin_identity_in(
-            row,
-            &BakeLayout {
-                ranges: self.bake.message_ranges.clone(),
-                units: self.bake.message_units.clone(),
-            },
-        )
+        Self::pin_identity_in(row, &self.bake.message_ranges, &self.bake.message_units)
     }
 
-    /// [`pin_identity_at`](Self::pin_identity_at) read against a kept
-    /// layout.
+    /// [`pin_identity_at`](Self::pin_identity_at) read against whichever
+    /// layout's indexes the caller holds — borrowed, never copied.
     ///
-    /// The same reading, against the merged indexes of a layout the
-    /// caller holds rather than the current bake's — the previous
-    /// layout, when a settle has to place a row the reader chose before
-    /// the rebake moved everything.
-    fn pin_identity_in(row: usize, layout: &BakeLayout) -> Option<PinIdentity> {
-        let ranges = &layout.ranges;
+    /// The same reading, against the merged indexes of the current bake
+    /// or of a kept layout — the previous one, when a settle has to place
+    /// a row the reader chose before the rebake moved everything.
+    fn pin_identity_in(
+        row: usize,
+        ranges: &[std::ops::Range<usize>],
+        blocks_of: &[Vec<Vec<usize>>],
+    ) -> Option<PinIdentity> {
         let message = ranges.partition_point(|range| range.end <= row);
         let range = ranges.get(message)?;
         if !range.contains(&row) {
             return None;
         }
-        let units = layout.units.get(message)?;
+        let blocks = blocks_of.get(message)?;
+        let block = blocks
+            .partition_point(|units| units.first().copied().unwrap_or(range.end) <= row)
+            .checked_sub(1)?;
+        let units = blocks.get(block)?;
         let unit = units
             .partition_point(|start| *start <= row)
             .checked_sub(1)?;
@@ -2396,9 +2419,16 @@ impl TuiApp {
         let end = units
             .get(unit.saturating_add(1))
             .copied()
+            .or_else(|| {
+                blocks
+                    .get(block.saturating_add(1))
+                    .and_then(|units| units.first())
+                    .copied()
+            })
             .unwrap_or(range.end);
         Some(PinIdentity {
             message,
+            block,
             unit,
             offset: row.saturating_sub(start),
             unit_rows: end.saturating_sub(start),
@@ -2411,11 +2441,18 @@ impl TuiApp {
     /// under uniform wrapping the same source line, give or take a row.
     fn pin_row_after_rewrap(&self, identity: PinIdentity) -> Option<usize> {
         let range = self.bake.message_ranges.get(identity.message)?;
-        let units = self.bake.message_units.get(identity.message)?;
+        let blocks = self.bake.message_units.get(identity.message)?;
+        let units = blocks.get(identity.block)?;
         let start = *units.get(identity.unit)?;
         let end = units
             .get(identity.unit.saturating_add(1))
             .copied()
+            .or_else(|| {
+                blocks
+                    .get(identity.block.saturating_add(1))
+                    .and_then(|units| units.first())
+                    .copied()
+            })
             .unwrap_or(range.end);
         let rows = end.saturating_sub(start);
         let offset = identity
@@ -2433,8 +2470,8 @@ impl TuiApp {
     /// block in exactly one map. The settle counts a block the pin sat
     /// inside this way, before and after a change, and moves the pin by
     /// the difference.
-    fn rows_above_pin(&self, key: &str, pin: usize) -> usize {
-        self.block_rows(key)
+    fn rows_above_pin(&self, key: &str, message: Option<usize>, pin: usize) -> usize {
+        self.block_rows(key, message)
             .into_iter()
             .filter(|row| *row < pin)
             .count()
@@ -2445,20 +2482,21 @@ impl TuiApp {
     /// The note records both so the settle can tell a block that stood
     /// wholly above the pin — its last row before the pin — from one the
     /// pin sat inside, and apply the right rule to each.
-    fn block_shape(&self, key: &str) -> (usize, usize) {
-        let rows = self.block_rows(key);
+    fn block_shape(&self, key: &str, message: Option<usize>) -> (usize, usize) {
+        let rows = self.block_rows(key, message);
         let last_row = rows.iter().copied().max().unwrap_or(0);
         (rows.len(), last_row)
     }
 
     /// The rows the block registered under `key` holds in the bake's row
-    /// maps.
+    /// maps, within `message` alone when a shared call id has to name one
+    /// of its occurrences.
     ///
     /// Tool, thinking, and compaction blocks alike: the three maps are
     /// read together, since the caller knows the key and not which map
     /// carries it.
-    fn block_rows(&self, key: &str) -> Vec<usize> {
-        [
+    fn block_rows(&self, key: &str, message: Option<usize>) -> Vec<usize> {
+        let mut rows: Vec<usize> = [
             &self.bake.tool_summary_lines,
             &self.bake.thinking_summary_lines,
             &self.bake.compaction_summary_lines,
@@ -2467,7 +2505,14 @@ impl TuiApp {
         .flat_map(|map| map.iter())
         .filter(|(_, id)| id.as_str() == key)
         .map(|(row, _)| *row)
-        .collect()
+        .filter(|row| {
+            message
+                .and_then(|message| self.bake.message_ranges.get(message))
+                .is_none_or(|range| range.contains(row))
+        })
+        .collect();
+        rows.sort_unstable();
+        rows
     }
 
     /// Note, ahead of its `rebake_whole()`, that the block registered
@@ -2482,6 +2527,46 @@ impl TuiApp {
     /// read the same painted map, and the settle must apply the net
     /// change once, not once per click.
     fn note_block_reshape(&mut self, key: &str) {
+        self.note_block_reshape_in(key, None);
+    }
+
+    /// [`note_block_reshape`](Self::note_block_reshape) for a call id a
+    /// retry gave two blocks: every rendered occurrence is noted apart.
+    ///
+    /// A retried call graduates once per attempt under the same id, so
+    /// the transcript can hold two of its blocks, and its toggle is the
+    /// one id, so both change shape together. The occurrence above the
+    /// pin moves it by its own change and the one below by nothing; rows
+    /// pooled under the shared id would span the pin from both sides and
+    /// read as one block neither wholly above it nor wholly below.
+    fn note_call_reshape(&mut self, call_id: &str) {
+        let occurrences: Vec<usize> = self
+            .conversation
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                matches!(
+                    message,
+                    TuiMessage::Assistant { blocks, .. }
+                        if blocks.iter().any(|block| matches!(
+                            block,
+                            ContentBlock::Tool { call_id: id, .. } if id == call_id
+                        ))
+                )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if occurrences.is_empty() {
+            self.note_block_reshape_in(call_id, None);
+        }
+        for message in occurrences {
+            self.note_block_reshape_in(call_id, Some(message));
+        }
+    }
+
+    /// Take the note for one block, `message` naming the occurrence when
+    /// the key is shared.
+    fn note_block_reshape_in(&mut self, key: &str, message: Option<usize>) {
         if self.scroll.stick.follows() {
             return;
         }
@@ -2489,15 +2574,16 @@ impl TuiApp {
             .scroll
             .reshaped_blocks
             .iter()
-            .any(|note| note.key == key)
+            .any(|note| note.key == key && note.message == message)
         {
             return;
         }
         let pin = self.pinned_row();
-        let (len, last_row) = self.block_shape(key);
-        let rows_above = self.rows_above_pin(key, pin);
+        let (len, last_row) = self.block_shape(key, message);
+        let rows_above = self.rows_above_pin(key, message, pin);
         self.scroll.reshaped_blocks.push(ReshapeNote {
             key: key.to_string(),
+            message,
             rows_above,
             pin,
             len,
@@ -2519,17 +2605,25 @@ impl TuiApp {
     /// would stop short inside a block that expanded past it. A block
     /// the pin sat inside is counted row by row against the noted pin,
     /// so a fold and a scroll handled in one batch agree wherever the
-    /// reader has since moved the view.
+    /// reader has since moved the view. A block wholly below the noted pin
+    /// — its first row at or after it — moved nothing above the pin and
+    /// moves the pin by nothing: its rows are read from the post-change map
+    /// the other notes have already shifted, and counting them against the
+    /// pre-change pin would take a block an earlier fold lifted past the
+    /// pinned content for one that landed above it.
     fn rows_moved_above_anchor(&mut self) -> (usize, usize) {
         let notes = std::mem::take(&mut self.scroll.reshaped_blocks);
         let mut landed_above = 0usize;
         let mut left_above = 0usize;
         for note in notes {
-            let (len, _) = self.block_shape(&note.key);
+            let (len, _) = self.block_shape(&note.key, note.message);
+            let first_row = note.last_row.saturating_sub(note.len.saturating_sub(1));
             let (landed, left) = if note.last_row < note.pin {
                 (len.saturating_sub(note.len), note.len.saturating_sub(len))
+            } else if note.len > 0 && first_row > note.pin {
+                (0, 0)
             } else {
-                let after = self.rows_above_pin(&note.key, note.pin);
+                let after = self.rows_above_pin(&note.key, note.message, note.pin);
                 (
                     after.saturating_sub(note.rows_above),
                     note.rows_above.saturating_sub(after),
@@ -2750,7 +2844,13 @@ impl TuiApp {
             }
             *previous_was_user = Some(is_user);
             let message_start = lines.len();
-            let mut units = Vec::new();
+            // One unit list per rendering block: the message itself for a
+            // user, system, error, or compaction message, one per content
+            // block and one for a trailing duration row for an assistant
+            // message. A pin's identity names a block and a paragraph within
+            // it, so a fold that takes paragraphs from one block leaves every
+            // block after it where it was.
+            let mut block_units: Vec<Vec<usize>> = Vec::new();
             match message {
                 TuiMessage::User {
                     text,
@@ -2763,6 +2863,7 @@ impl TuiApp {
                     } else {
                         self.theme.ui.user_message_fg
                     };
+                    let mut units = Vec::new();
                     let tint_start = lines.len();
                     units.push(lines.len());
                     lines.push(Line::default());
@@ -2777,6 +2878,7 @@ impl TuiApp {
                     if !*unsent && !*steered {
                         prompt_marks.push(mark_row);
                     }
+                    block_units.push(units);
                 }
                 TuiMessage::Assistant {
                     blocks,
@@ -2784,6 +2886,9 @@ impl TuiApp {
                     ..
                 } => {
                     for (block_index, block) in blocks.iter().enumerate() {
+                        let mut units = Vec::new();
+                        units.push(lines.len());
+                        let first = lines.len();
                         match block {
                             ContentBlock::Thinking {
                                 text,
@@ -2792,8 +2897,6 @@ impl TuiApp {
                             } => {
                                 let key = format!("m{message_index}b{block_index}");
                                 let expanded = self.expansion.expanded_thinking.contains(&key);
-                                units.push(lines.len());
-                                let first = lines.len();
                                 lines.extend(thinking_section_lines(
                                     text,
                                     *redacted,
@@ -2806,8 +2909,6 @@ impl TuiApp {
                                 note_paragraph_units(lines, first, &mut units);
                             }
                             ContentBlock::Text { text } => {
-                                units.push(lines.len());
-                                let first = lines.len();
                                 lines.extend(markdown::render_markdown(
                                     text,
                                     width,
@@ -2819,8 +2920,6 @@ impl TuiApp {
                                 note_paragraph_units(lines, first, &mut units);
                             }
                             ContentBlock::Tool { .. } => {
-                                units.push(lines.len());
-                                let first = lines.len();
                                 self.push_tool_block_lines(
                                     block,
                                     width,
@@ -2831,9 +2930,10 @@ impl TuiApp {
                                 note_paragraph_units(lines, first, &mut units);
                             }
                         }
+                        block_units.push(units);
                     }
                     if let Some(duration_ms) = duration_ms {
-                        units.push(lines.len());
+                        block_units.push(vec![lines.len()]);
                         lines.push(Line::styled(
                             format!("duration {}", format_duration(*duration_ms)),
                             self.theme.ui.dim,
@@ -2841,6 +2941,7 @@ impl TuiApp {
                     }
                 }
                 TuiMessage::System { text, .. } => {
+                    let mut units = Vec::new();
                     for segment in text.split('\n') {
                         units.push(lines.len());
                         lines.extend(plain_wrapped_lines(
@@ -2849,10 +2950,11 @@ impl TuiApp {
                             self.theme.ui.dim,
                         ));
                     }
+                    block_units.push(units);
                 }
                 TuiMessage::Error { text, .. } => {
                     let rows_above = !lines.is_empty() || start > 0;
-                    units.push(lines.len());
+                    block_units.push(vec![lines.len()]);
                     lines.extend(error_block_lines(
                         text,
                         width,
@@ -2862,7 +2964,7 @@ impl TuiApp {
                 }
                 message @ TuiMessage::Compacted { .. } => {
                     let key = format!("m{message_index}");
-                    units.push(lines.len());
+                    block_units.push(vec![lines.len()]);
                     let first = lines.len();
                     lines.extend(compaction_notice_lines(
                         message,
@@ -2874,7 +2976,7 @@ impl TuiApp {
                 }
             }
             message_ranges.push(message_start..lines.len());
-            message_units.push(units);
+            message_units.push(block_units);
         }
     }
 
