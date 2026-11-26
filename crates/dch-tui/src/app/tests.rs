@@ -30,6 +30,7 @@ use crate::observer::TurnPublication;
 use crate::queue::{PermissionRule, SessionPick};
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 #[test]
 fn the_worst_draw_survives_the_second() {
@@ -622,6 +623,471 @@ fn alt_arrows_walk_the_submitted_prompts() {
         expected(mark(1)),
         "Alt+Down walks back toward the newer prompt"
     );
+}
+
+#[test]
+fn a_detached_pin_holds_its_anchor_over_a_drain_and_a_graduation_below() {
+    // The pane-switch repro: scrolled up out of the tail (so the view
+    // is detached and holding a pin), the agent finishes its work
+    // while the reader is away, one return frame drains the finished
+    // reply into the conversation, and — whatever a repaint does —
+    // the next layout must keep the same line at the top of the view
+    // instead of dragging the view back to the tail or to the top.
+    let mut app = app();
+    let tall = {
+        let mut t = String::new();
+        t.push_str("the oldest answer, with the anchor line in it");
+        for i in 0..40 {
+            let _ = write!(t, "\nolder row {i:02}");
+        }
+        t
+    };
+    app.push_message(TuiMessage::User {
+        text: "ask a thing".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text { text: tall }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 22)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let total0 = app.pacing.last_layout_lines;
+    let viewport = app.pacing.last_layout_viewport;
+    assert!(
+        total0 > viewport,
+        "the test needs content taller than the pane (total={total0}, pane={viewport})"
+    );
+
+    // Scroll one line up: the view detaches and holds at offset 1.
+    app.scroll_the_wheel(true);
+    assert_eq!(
+        app.scroll_offset(),
+        1,
+        "a wheel-up detaches one line from the tail"
+    );
+    // The line the reader holds, by its text — the contract is about this
+    // line, not about a number.
+    let anchored_line = total0.saturating_sub(viewport).saturating_sub(1);
+    let pinned = app
+        .bake
+        .conversation_cache
+        .get(anchored_line)
+        .map(ToString::to_string)
+        .expect("the anchored row is a baked row");
+
+    // The agent's reply finishes while the reader is away.
+    app.state
+        .graduations
+        .lock()
+        .expect("the graduation lock")
+        .push(crate::observer::Graduation::Reply {
+            text: "the reply that finished while the pane was unfocused".to_string(),
+            thinking: None,
+        });
+
+    // The return frame: the loop repaints after a focus regain,
+    // the layout drains, and settles the scroll for the new size.
+    assert!(
+        app.take_full_repaint(),
+        "a focus regain owes a full repaint"
+    );
+    app.drain_shared_state();
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+
+    // The anchored row is still the view's top row: the offset is
+    // whatever seats it there in the grown document — the growth below
+    // the tail plus the one notch, whatever that comes to. (Asserting
+    // the offset against the row's index held only while the reply
+    // added exactly two rows.)
+    let total1 = app.pacing.last_layout_lines;
+    let viewport1 = app.pacing.last_layout_viewport;
+    let offset = app.scroll_offset();
+    assert_eq!(
+        offset,
+        total1
+            .saturating_sub(viewport1)
+            .saturating_sub(anchored_line),
+        "the anchored line (row {anchored_line}) must stay at the top — growth below the tail \
+         cannot drag the view back to the bottom (offset {offset}) or the top"
+    );
+    let top = total1.saturating_sub(viewport1).saturating_sub(offset);
+    assert_eq!(
+        app.bake
+            .conversation_cache
+            .get(top)
+            .map(ToString::to_string)
+            .as_deref(),
+        Some(pinned.as_str()),
+        "the line under the reader is still the view's top row"
+    );
+}
+
+/// The tmux repro pinned as an invariant. The reader is scrolled up,
+/// holding a row — not at the tail. The agent's run is still going: the
+/// plan block a `TodoWrite` result armed for folding sits *above* the
+/// reader's row, and the moment the next tool starts it folds on the
+/// next frame (`settle_todo_expansion` inside `render_layout`) — in the
+/// same frame the new tool's rows land at the tail. The old settle
+/// compensated the document's net change as if every removed row landed
+/// at or below the anchor, so the rows the fold took from *above* the
+/// anchor dragged the view toward the tail by their count and the reader
+/// was yanked off their line.
+///
+/// The pinned invariant is measured, not hardcoded: the foldable block
+/// sits entirely above the anchored row, and the line the reader was
+/// reading — the view's top row before the fold — is still the view's
+/// top row after it. The offset itself may move, by exactly what the
+/// tail gained; the fold must cost it nothing.
+/// An app whose last `TodoWrite` block stands expanded and armed: the
+/// detail sits in the tool store, the block is in the conversation, and
+/// the expand flag and the auto-fold flag both wait — the next frame
+/// with a running tool folds it through `settle_todo_expansion`, and the
+/// next `push_message` folds it at once. Thirty rows follow the block, so
+/// the document outgrows the pane and the block sits above any pin a
+/// reader holds clear of the tail. Returns the app and the block's call
+/// id.
+fn app_with_an_armed_plan_block() -> (TuiApp, String) {
+    let mut app = app();
+    let receipt = [
+        "# Task List",
+        "",
+        "● [t1] read the settle math",
+        "◐ [t2] write the pin test",
+        "○ [t3] document the fix",
+    ]
+    .join("\n");
+    let call_id = "call_todo".to_string();
+    app.retain_tool_detail(&call_id, "{\"todos\":[]}", &receipt);
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "TodoWrite".to_string(),
+            call_id: call_id.clone(),
+            input_preview: String::new(),
+            output_preview: receipt,
+            retained_input: String::new(),
+            success: true,
+            elapsed_secs: 0.1,
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    for i in 0..30 {
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: format!("working row {i}"),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    app.expansion.expanded_tools.insert(call_id.clone());
+    app.expansion.auto_expanded_todo = Some(call_id.clone());
+    assert!(
+        app.expansion.expanded_tools.contains(&call_id),
+        "the armed block keeps its expanded rows for the pending fold"
+    );
+    (app, call_id)
+}
+
+#[test]
+fn a_fold_above_the_anchored_pin_does_not_drag_the_view_down() {
+    let (mut app, call_id) = app_with_an_armed_plan_block();
+
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("first draw");
+
+    let total0 = app.pacing.last_layout_lines;
+    let viewport = app.pacing.last_layout_viewport;
+    assert!(
+        total0 >= viewport + 10,
+        "the document outgrows the pane (total={total0}, pane={viewport})"
+    );
+
+    // The foldable block's baked rows, from the bake's own row map.
+    let block_rows: Vec<usize> = app
+        .bake
+        .tool_summary_lines
+        .iter()
+        .filter(|(_, id)| id.as_str() == call_id)
+        .map(|(row, _)| *row)
+        .collect();
+    assert!(!block_rows.is_empty(), "the block baked its rows");
+    let block_len0 = block_rows.len();
+    let block_end = block_rows.into_iter().max().expect("a row");
+
+    // The reader scrolls up and holds the pin — detached from the tail.
+    for _ in 0..14 {
+        app.scroll_the_wheel(true);
+    }
+    let offset0 = app.scroll_offset();
+    assert!(offset0 > 0, "the wheel-up detaches the view");
+    let anchor0 = total0.saturating_sub(viewport).saturating_sub(offset0);
+    assert!(
+        anchor0 > block_end,
+        "the anchored row ({anchor0}) must sit below the foldable block, \
+         whose rows end at {block_end} — that is the repro geometry"
+    );
+    // The line the reader is holding, by its text — the contract is
+    // about this line, not about a number.
+    let pinned = app
+        .bake
+        .conversation_cache
+        .get(anchor0)
+        .map(ToString::to_string)
+        .expect("the anchored row is a baked row");
+
+    // The agent's run goes on: the next tool starts.
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(crate::message::ActiveTool {
+            call_id: "call_next".to_string(),
+            name: "Bash".to_string(),
+            input_summary: String::new(),
+            start: std::time::Instant::now(),
+        });
+
+    // The next frame: `render_layout` folds the armed block above the
+    // anchor, the new tool's rows land at the tail, and the paint
+    // settles the scroll for the rebaked document.
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("the folding draw");
+
+    let total1 = app.pacing.last_layout_lines;
+    let folded = total0.saturating_sub(total1);
+    assert!(
+        folded >= 2,
+        "the fold removed rows (total {total0} → {total1})"
+    );
+    assert!(
+        app.expansion.auto_expanded_todo.is_none(),
+        "the armed block folded when the next tool started"
+    );
+
+    // The block gave up more rows than the document did: the new
+    // tool's rows landed at the tail in the same frame. Counted off the
+    // row map, the rows that left above the pin are the block's own
+    // difference — not the document's net change.
+    let block_len1 = app
+        .bake
+        .tool_summary_lines
+        .values()
+        .filter(|id| id.as_str() == call_id)
+        .count();
+    let left_above = block_len0.saturating_sub(block_len1);
+    assert!(
+        left_above > folded,
+        "the block above the pin gave up {left_above} rows while the document \
+         netted {folded}: the frame also grew the tail"
+    );
+
+    // The contract: the anchored row is still the view's top row. Its
+    // index rose by the rows that left above it, and the offset moved
+    // only by what the tail gained — never by the fold.
+    let offset1 = app.scroll_offset();
+    let anchored1 = anchor0.saturating_sub(left_above);
+    let top1 = total1.saturating_sub(viewport).saturating_sub(offset1);
+    let top_text = app
+        .bake
+        .conversation_cache
+        .get(top1)
+        .map(ToString::to_string);
+    assert_eq!(
+        top_text.as_deref(),
+        Some(pinned.as_str()),
+        "the line the reader was holding must still be the view's top row after \
+         the fold (anchor {anchor0} → {anchored1}, offset {offset0} → {offset1}, \
+         total {total0} → {total1}, {left_above} rows left above the pin)"
+    );
+    assert_eq!(
+        top1, anchored1,
+        "the view's top row is the anchored row's new index"
+    );
+}
+/// A fold and a scroll handled between two settles must land where the
+/// two handled in separate frames land. The fold site notes its block
+/// against the pin as it stands at the note; the old settle re-measured
+/// the block against the pin as the reader's queued notches had since
+/// moved it, so the block's surviving summary row between the two pins
+/// counted as a row that had left above the pin, and the view came to
+/// rest a row off. The note now carries its own pin. The geometry is the
+/// repro's: rows above the block, the reader's top row inside the
+/// expanded block with block rows above it, and the block folding to its
+/// one summary row.
+#[test]
+fn a_fold_and_a_scroll_in_one_batch_land_where_separate_frames_land() {
+    fn top_row(app: &TuiApp) -> usize {
+        app.pacing
+            .last_layout_lines
+            .saturating_sub(app.pacing.last_layout_viewport)
+            .saturating_sub(app.scroll_offset())
+    }
+
+    fn top_text(app: &TuiApp) -> Option<String> {
+        app.bake
+            .conversation_cache
+            .get(top_row(app))
+            .map(ToString::to_string)
+    }
+
+    /// Rows above and below an expanded, armed `TodoWrite` block, so a
+    /// pin inside the block has the document on both sides of it.
+    fn app_with_an_armed_block_mid_conversation() -> (TuiApp, String) {
+        let mut app = app();
+        for i in 0..30 {
+            app.push_message(TuiMessage::Assistant {
+                blocks: vec![ContentBlock::Text {
+                    text: format!("row above the block {i:02}"),
+                }],
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        }
+        let receipt = [
+            "# Task List",
+            "",
+            "● [t1] read the settle math",
+            "◐ [t2] write the pin test",
+            "○ [t3] document the fix",
+        ]
+        .join("\n");
+        let call_id = "call_todo_mid".to_string();
+        app.retain_tool_detail(&call_id, "{\"todos\":[]}", &receipt);
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "TodoWrite".to_string(),
+                call_id: call_id.clone(),
+                input_preview: String::new(),
+                output_preview: receipt,
+                retained_input: String::new(),
+                success: true,
+                elapsed_secs: 0.1,
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        for i in 0..30 {
+            app.push_message(TuiMessage::Assistant {
+                blocks: vec![ContentBlock::Text {
+                    text: format!("working row {i:02}"),
+                }],
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        }
+        app.expansion.expanded_tools.insert(call_id.clone());
+        app.expansion.auto_expanded_todo = Some(call_id.clone());
+        (app, call_id)
+    }
+
+    /// Draw once, then scroll until the view's top row is the block's
+    /// third row from its end — inside the block, block rows above it —
+    /// and settle there. Returns the pin row and the block's first row.
+    fn seated_inside_the_block(
+        app: &mut TuiApp,
+        call_id: &str,
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    ) -> (usize, usize) {
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("first draw");
+        let total = app.pacing.last_layout_lines;
+        let viewport = app.pacing.last_layout_viewport;
+        let mut block_rows: Vec<usize> = app
+            .bake
+            .tool_summary_lines
+            .iter()
+            .filter(|(_, id)| id.as_str() == call_id)
+            .map(|(row, _)| *row)
+            .collect();
+        block_rows.sort_unstable();
+        let Some(block_start) = block_rows.first().copied() else {
+            panic!("the block baked its rows");
+        };
+        let block_end = block_rows.last().copied().unwrap_or(block_start);
+        assert!(
+            block_end >= block_start + 4,
+            "the block spans several rows ({block_start}..={block_end})"
+        );
+        let pin_row = block_end - 2;
+        for _ in 0..total.saturating_sub(viewport).saturating_sub(pin_row) {
+            app.scroll_the_wheel(true);
+        }
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("the seating draw");
+        assert_eq!(
+            top_row(app),
+            pin_row,
+            "the view's top row is seated inside the block"
+        );
+        (pin_row, block_start)
+    }
+
+    /// The fold `push_message` makes of the armed block: a plain message
+    /// after it.
+    fn push_after_the_fold(app: &mut TuiApp) {
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "after the fold".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+
+    // The reference run: the fold settles in its own frame, then three
+    // notches settle in the next.
+    let (mut reference, call_id) = app_with_an_armed_block_mid_conversation();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    let (pin_row, block_start) = seated_inside_the_block(&mut reference, &call_id, &mut terminal);
+    push_after_the_fold(&mut reference);
+    terminal
+        .draw(|frame| reference.render(frame))
+        .expect("the folding draw");
+    for _ in 0..3 {
+        reference.scroll_the_wheel(true);
+    }
+    terminal
+        .draw(|frame| reference.render(frame))
+        .expect("the scrolling draw");
+    let reference_top = top_row(&reference);
+    let reference_text = top_text(&reference);
+    assert_eq!(
+        reference_top,
+        block_start.saturating_sub(2),
+        "the reference lifts the pin by the block rows that left above it (all but the \
+         summary), then moves three: from {pin_row} past the block's first row {block_start}"
+    );
+
+    // The batch: the same fold and the same three notches, one settle.
+    let (mut batch, call_id) = app_with_an_armed_block_mid_conversation();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    let _ = seated_inside_the_block(&mut batch, &call_id, &mut terminal);
+    push_after_the_fold(&mut batch);
+    for _ in 0..3 {
+        batch.scroll_the_wheel(true);
+    }
+    terminal
+        .draw(|frame| batch.render(frame))
+        .expect("the one batching draw");
+    assert_eq!(
+        top_row(&batch),
+        reference_top,
+        "a fold and a scroll in one batch land on the row separate frames land on"
+    );
+    assert_eq!(top_text(&batch), reference_text, "and on the same line");
 }
 
 #[test]
@@ -4558,5 +5024,340 @@ fn a_boundary_mode_update_moves_the_display_without_the_file() {
         app.config.runner.permission_mode,
         dch_config::PermissionMode::ReadOnly,
         "the display answers /mode for the mode actually in force"
+    );
+}
+
+/// The idle repro: the reader has scrolled up and nothing is streaming.
+/// Switching panes in tmux sizes the hidden pane to the window — wider
+/// and taller, under the default `window-size` — and the pane comes back
+/// at its own size a moment later. The transcript never changed, so the
+/// line under the reader must still be the view's top row when the pane
+/// returns. The old settle ignored the viewport and clamped the offset to
+/// zero at the hidden size (the document fit the bigger viewport whole),
+/// with nothing left to restore on the way back; the settle now keeps the
+/// pinned row and re-derives the offset from it each frame.
+#[test]
+fn a_detached_pin_survives_the_pane_being_resized_while_hidden() {
+    fn top_text(app: &TuiApp) -> Option<String> {
+        let top = app
+            .pacing
+            .last_layout_lines
+            .saturating_sub(app.pacing.last_layout_viewport)
+            .saturating_sub(app.scroll_offset());
+        app.bake
+            .conversation_cache
+            .get(top)
+            .map(ToString::to_string)
+    }
+
+    let mut app = app();
+    let tall = {
+        let mut t = String::new();
+        t.push_str("the oldest answer, with the anchor line in it");
+        for i in 0..60 {
+            let _ = write!(
+                t,
+                "\nolder row {i:02} — long enough to wrap at eighty columns, one line at a hundred and twenty"
+            );
+        }
+        t
+    };
+    app.push_message(TuiMessage::User {
+        text: "ask a thing".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text { text: tall }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    let total0 = app.pacing.last_layout_lines;
+    let viewport0 = app.pacing.last_layout_viewport;
+    assert!(
+        total0 > viewport0 + 40,
+        "the test needs a document well taller than the pane (total={total0}, pane={viewport0})"
+    );
+    for _ in 0..30 {
+        app.scroll_the_wheel(true);
+    }
+    // One frame at the pane's own size seats the pin.
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    let offset0 = app.scroll_offset();
+    let pinned = top_text(&app).expect("the view's top is a baked row");
+    assert!(
+        offset0 >= 20,
+        "the reader is well clear of the tail (offset {offset0})"
+    );
+
+    // Height alone: a taller pane for one frame, then the pane's own size.
+    let mut taller =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+    taller.draw(|frame| app.render(frame)).expect("draw");
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    assert_eq!(
+        app.scroll_offset(),
+        offset0,
+        "a taller viewport and back restores the offset"
+    );
+    assert_eq!(
+        top_text(&app).as_deref(),
+        Some(pinned.as_str()),
+        "the line under the reader is still the view's top row (height-only round trip)"
+    );
+
+    // Both ways: the hidden pane sized to the window — wider, so fewer
+    // wrapped rows, and taller — then the pane's own size.
+    let mut hidden =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 50)).expect("terminal");
+    hidden.draw(|frame| app.render(frame)).expect("draw");
+    assert_eq!(
+        app.scroll_offset(),
+        0,
+        "at the hidden size the document fits the viewport whole and the offset \
+         saturates at zero — the pin must survive it"
+    );
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    assert_eq!(
+        app.scroll_offset(),
+        offset0,
+        "the pane's own size restores the offset"
+    );
+    assert_eq!(
+        top_text(&app).as_deref(),
+        Some(pinned.as_str()),
+        "the line under the reader is still the view's top row after the pane switch"
+    );
+}
+
+/// The denial must not outlive the reader's first move. The resize test
+/// above leaves the pin remembered past what the hidden size can scroll
+/// to — the offset saturating at zero — and never scrolls while denied.
+/// Scrolling there is ordinary use (a tmux zoom, then a wheel notch), and
+/// the old settle read the notch as a move of the hidden pin: the offset
+/// stayed at zero and the view did not move until the pin had walked back
+/// into range, one notch per row. The notch now applies to the row the
+/// reader actually sees, so the view moves on the first notch.
+#[test]
+fn a_wheel_notch_while_the_pin_is_denied_moves_the_view_on_the_first_notch() {
+    fn top_text(app: &TuiApp) -> Option<String> {
+        let top = app
+            .pacing
+            .last_layout_lines
+            .saturating_sub(app.pacing.last_layout_viewport)
+            .saturating_sub(app.scroll_offset());
+        app.bake
+            .conversation_cache
+            .get(top)
+            .map(ToString::to_string)
+    }
+
+    let mut app = app();
+    let tall = {
+        let mut t = String::new();
+        t.push_str("the oldest answer, with the anchor line in it");
+        for i in 0..60 {
+            let _ = write!(
+                t,
+                "\nolder row {i:02} — long enough to wrap at eighty columns, one line at a hundred and twenty"
+            );
+        }
+        t
+    };
+    app.push_message(TuiMessage::User {
+        text: "ask a thing".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text { text: tall }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    for _ in 0..30 {
+        app.scroll_the_wheel(true);
+    }
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    let offset0 = app.scroll_offset();
+    let total0 = app.pacing.last_layout_lines;
+    assert!(
+        offset0 > 0,
+        "the reader is clear of the tail (offset {offset0})"
+    );
+
+    // A pane tall enough that its viewport outgrows the offset: the
+    // document still does not fit whole, but the range can no longer
+    // reach the pin, so the frame denies it.
+    let height = u16::try_from(22 + offset0 + 1).expect("a pane height fits a u16");
+    let mut taller =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height)).expect("terminal");
+    taller.draw(|frame| app.render(frame)).expect("draw");
+    let viewport1 = app.pacing.last_layout_viewport;
+    assert!(
+        total0 > viewport1,
+        "the document still outgrows the taller pane (total {total0}, pane {viewport1})"
+    );
+    assert_eq!(
+        app.scroll_offset(),
+        0,
+        "the taller pane cannot reach the pin: the offset saturates at zero"
+    );
+    let denied_top = top_text(&app).expect("the denied view has a baked top row");
+
+    // One notch up at this size, then its frame: the view moves.
+    app.scroll_the_wheel(true);
+    taller.draw(|frame| app.render(frame)).expect("draw");
+    assert_eq!(
+        app.scroll_offset(),
+        1,
+        "the first notch moves the view one row — not a hidden pin"
+    );
+    assert_ne!(
+        top_text(&app).as_deref(),
+        Some(denied_top.as_str()),
+        "the row at the top of the view changed on the first notch"
+    );
+}
+
+/// The zoom repro: the reader is scrolled up, then zooms the pane
+/// (`prefix z`) and back. Zoom changes the width too, so the bake rewraps
+/// every message — a row index names a different line after the rewrap —
+/// and the old settle seated the remembered row in the new geometry,
+/// landing the view somewhere else entirely. The pin is now also kept as a
+/// place in the transcript (message, unit, offset), mapped across the
+/// rewrap, so the line at the top of the view stays that line: across a
+/// zoom, back, and again after scrolling while zoomed.
+#[test]
+fn a_detached_pin_follows_its_line_across_a_zoom() {
+    fn top_text(app: &TuiApp) -> String {
+        let top = app
+            .pacing
+            .last_layout_lines
+            .saturating_sub(app.pacing.last_layout_viewport)
+            .saturating_sub(app.scroll_offset());
+        app.bake
+            .conversation_cache
+            .get(top)
+            .map_or_else(Default::default, ToString::to_string)
+    }
+    /// The `older row NN` a row's text names, if any.
+    fn older_row_no(text: &str) -> Option<u32> {
+        text.split("older row ")
+            .nth(1)
+            .and_then(|rest| rest.get(..2))
+            .and_then(|digits| digits.parse().ok())
+    }
+
+    let mut app = app();
+    // Paragraphs, so each wraps on its own — two rows at eighty columns,
+    // one at a hundred and sixty, a blank between neighbours — and each
+    // names its line twice, so both of its wrapped rows name it.
+    let tall = (0..160)
+        .map(|i| format!(
+            "older row {i:02} — a first part long enough that the wrap at eighty columns falls before the second naming; older row {i:02} — tail"
+        ))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    app.push_message(TuiMessage::User {
+        text: "ask a thing".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text { text: tall }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    let mut zoomed =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    let total0 = app.pacing.last_layout_lines;
+    let viewport0 = app.pacing.last_layout_viewport;
+    assert!(
+        total0 > viewport0 + 40,
+        "the test needs a document well taller than the pane (total={total0}, pane={viewport0})"
+    );
+    // Well up from the tail — far enough that the line stays seatable at
+    // the zoomed viewport too — then a notch more past any blank or
+    // continuation row the top happens to land on, so the pin names a line.
+    for _ in 0..120 {
+        app.scroll_the_wheel(true);
+    }
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    for _ in 0..4 {
+        if older_row_no(&top_text(&app)).is_some() {
+            break;
+        }
+        app.scroll_the_wheel(true);
+        pane.draw(|frame| app.render(frame)).expect("draw");
+    }
+    let pinned_no = older_row_no(&top_text(&app)).expect("the pinned row names its line");
+    let offset0 = app.scroll_offset();
+    assert!(
+        offset0 >= 20,
+        "the reader is well clear of the tail (offset {offset0})"
+    );
+
+    // Zoom: wider and taller, every paragraph rewrapped. The same line
+    // stays at the top.
+    zoomed.draw(|frame| app.render(frame)).expect("draw");
+    let zoomed_top = top_text(&app);
+    assert_eq!(
+        older_row_no(&zoomed_top),
+        Some(pinned_no),
+        "zooming must keep the reader's line at the top: {zoomed_top:?}"
+    );
+    // Back: the round trip restores the very offset.
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    assert_eq!(
+        app.scroll_offset(),
+        offset0,
+        "the pane's own size restores the offset after the zoom"
+    );
+    assert_eq!(
+        older_row_no(&top_text(&app)),
+        Some(pinned_no),
+        "the line under the reader is still the view's top row after the zoom"
+    );
+
+    // Zoomed again, the reader scrolls on at the zoomed width; the pane
+    // then goes back to its own size. The line they scrolled to — counted
+    // at the zoomed width — is the line they land on.
+    zoomed.draw(|frame| app.render(frame)).expect("draw");
+    for _ in 0..10 {
+        app.scroll_the_wheel(true);
+    }
+    zoomed.draw(|frame| app.render(frame)).expect("draw");
+    for _ in 0..4 {
+        if older_row_no(&top_text(&app)).is_some_and(|no| no < pinned_no) {
+            break;
+        }
+        app.scroll_the_wheel(true);
+        zoomed.draw(|frame| app.render(frame)).expect("draw");
+    }
+    let scrolled_no = older_row_no(&top_text(&app)).expect("the scrolled-to row names its line");
+    assert!(
+        scrolled_no < pinned_no,
+        "the reader scrolled up while zoomed ({scrolled_no} from {pinned_no})"
+    );
+    pane.draw(|frame| app.render(frame)).expect("draw");
+    let back_top = top_text(&app);
+    assert_eq!(
+        older_row_no(&back_top),
+        Some(scrolled_no),
+        "un-zooming after a zoomed scroll must land on the line the reader scrolled to: {back_top:?}"
     );
 }

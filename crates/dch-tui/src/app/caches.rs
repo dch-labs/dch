@@ -76,6 +76,22 @@ pub(super) struct BakeMeta {
     /// Whole-block ranges in bake-absolute rows, for the scroll's
     /// whole-or-nothing todo-block rule.
     pub(super) todo_block_ranges: Vec<std::ops::Range<usize>>,
+
+    /// Each baked message's row span, in bake-absolute rows.
+    ///
+    /// The scroll pin's identity is read against these: the message a
+    /// pinned row sits in survives a rewrap, where its row index does not.
+    pub(super) message_ranges: Vec<std::ops::Range<usize>>,
+
+    /// Per message, the row each of its rendering units opens at.
+    ///
+    /// A unit is one appending group of the bake: a source segment of a
+    /// user or system message, a block of an assistant message, a trailing
+    /// duration row. Bake-absolute rows, the first being the message's own
+    /// start. A rewrap moves the rows and keeps the units, so a pin named
+    /// `(message, unit, offset)` maps onto the same source line at any
+    /// width.
+    pub(super) message_units: Vec<Vec<usize>>,
 }
 
 impl BakeMeta {
@@ -93,6 +109,8 @@ impl BakeMeta {
         self.user_turn_ranges.extend(pass.user_turn_ranges);
         self.user_prompt_marks.extend(pass.user_prompt_marks);
         self.todo_block_ranges.extend(pass.todo_block_ranges);
+        self.message_ranges.extend(pass.message_ranges);
+        self.message_units.extend(pass.message_units);
     }
 
     /// The frame's merged indexes: the baked prefix's plus the tail's,
@@ -136,6 +154,19 @@ impl BakeMeta {
             .todo_block_ranges
             .extend(tail.todo_block_ranges.into_iter().map(|range| {
                 range.start.saturating_add(tail_base)..range.end.saturating_add(tail_base)
+            }));
+        merged
+            .message_ranges
+            .extend(tail.message_ranges.into_iter().map(|range| {
+                range.start.saturating_add(tail_base)..range.end.saturating_add(tail_base)
+            }));
+        merged
+            .message_units
+            .extend(tail.message_units.into_iter().map(|units| {
+                units
+                    .into_iter()
+                    .map(|start| start.saturating_add(tail_base))
+                    .collect()
             }));
         merged
     }
@@ -230,8 +261,10 @@ pub(super) struct LaneCaches {
 /// itself only grows, appending each message's rendered rows once a
 /// newer message follows. The indexes the frame's merged view
 /// carries — tool rows, thinking sections, compaction notices,
-/// user-turn spans, prompt marks, todo blocks — are rebuilt from the
-/// bake's metadata and the tail's on every frame that draws.
+/// user-turn spans, prompt marks, todo blocks, and the message ranges
+/// with their rendering units that the scroll pin's identity reads —
+/// are rebuilt from the bake's metadata and the tail's on every frame
+/// that draws.
 pub(super) struct TranscriptBake {
     /// Rendered lines of the settled conversation.
     ///
@@ -347,6 +380,26 @@ pub(super) struct TranscriptBake {
     /// the plan badge's standing fraction reads as a count the frame
     /// does not carry. Indexes are cache lines, rebuilt with the cache.
     pub(super) todo_block_ranges: Vec<std::ops::Range<usize>>,
+
+    /// Each message's row span in the merged cache.
+    ///
+    /// The baked prefix's spans plus the tail's rebased past the prefix's
+    /// rows, one per message in conversation order, so a pinned row
+    /// resolves to the message it sits in. The scroll pin's identity is
+    /// read against these — a rewrap keeps the messages and moves only
+    /// their rows. Indexes are cache lines, rebuilt with the cache.
+    pub(super) message_ranges: Vec<std::ops::Range<usize>>,
+
+    /// Per message, the row each of its rendering units opens at, merged
+    /// over the whole cache.
+    ///
+    /// The tail's unit starts rebased beside the prefix's, in cache lines
+    /// rebuilt with the cache; a message's first start is its own first
+    /// row. Beside the message ranges these place the scroll pin's
+    /// `(message, unit, offset)` identity, which a rewrap carries onto the
+    /// same source line at any width. A unit is one appending group of the
+    /// bake — see [`BakeMeta::message_units`].
+    pub(super) message_units: Vec<Vec<usize>>,
 }
 
 impl Default for TranscriptBake {
@@ -366,6 +419,8 @@ impl Default for TranscriptBake {
             compaction_summary_lines: HashMap::new(),
             tool_summary_lines: HashMap::new(),
             todo_block_ranges: Vec::new(),
+            message_ranges: Vec::new(),
+            message_units: Vec::new(),
         }
     }
 }
@@ -852,6 +907,8 @@ mod tests {
             subject.bake.thinking_summary_lines.clone(),
             subject.bake.compaction_summary_lines.clone(),
             subject.bake.todo_block_ranges.clone(),
+            subject.bake.message_ranges.clone(),
+            subject.bake.message_units.clone(),
         );
         // Force a whole-transcript rebake through the invalidation the
         // re-shaping paths use — no baked prefix, no baked metadata —
@@ -874,6 +931,8 @@ mod tests {
             subject.bake.thinking_summary_lines.clone(),
             subject.bake.compaction_summary_lines.clone(),
             subject.bake.todo_block_ranges.clone(),
+            subject.bake.message_ranges.clone(),
+            subject.bake.message_units.clone(),
         );
         assert_eq!(
             incremental_meta, full_meta,

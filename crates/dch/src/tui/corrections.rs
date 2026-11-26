@@ -1093,7 +1093,12 @@ mod tests {
         let requests = server.requests.lock().expect("request lock");
         let posted: Vec<&String> = requests
             .iter()
-            .filter(|request| request.starts_with("POST "))
+            .filter(|request| {
+                request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("/chat/completions"))
+            })
             .collect();
         assert_eq!(
             posted.len(),
@@ -1150,7 +1155,12 @@ mod tests {
         let requests = server.requests.lock().expect("request lock");
         let posted: Vec<&String> = requests
             .iter()
-            .filter(|request| request.starts_with("POST "))
+            .filter(|request| {
+                request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("/chat/completions"))
+            })
             .collect();
         assert_eq!(
             posted.len(),
@@ -1212,7 +1222,12 @@ mod tests {
         let requests = server.requests.lock().expect("request lock");
         let posted: Vec<&String> = requests
             .iter()
-            .filter(|request| request.starts_with("POST "))
+            .filter(|request| {
+                request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("/chat/completions"))
+            })
             .collect();
         assert_eq!(
             posted.len(),

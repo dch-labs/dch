@@ -1,19 +1,25 @@
 //! Best-effort discovery of a server's per-request context window.
 //!
-//! Two questions are asked, in order, and the first answer wins. The
+//! The questions are asked in order and the first answer wins. The
 //! llama.cpp family's `/props` document states the server's whole
 //! budget (`n_ctx`) while each request actually gets the share over
 //! `total_slots` — a `--parallel N` server advertises the whole and
-//! serves the slice — so that document comes first. The servers
-//! without one publish each model's window on the OpenAI-compatible
-//! model listing instead: vLLM and its kin spell it `max_model_len`,
-//! llama.cpp-style servers repeat it under `meta.n_ctx`, and the
-//! session's model is matched by its listing id. The probe is
-//! deliberately quiet about failure — a refused connection or an
-//! unexpected shape means "no answer", and the caller falls back to
-//! the configured window, the table of documented cloud-model
-//! windows, or the default. Only loopback endpoints are
-//! asked at all — both routes are the local server's own — and the
+//! serves the slice — so that document comes first. Ollama answers
+//! neither it nor the model listing with a window, so its own routes
+//! are asked next: the model's `/api/show` document when the model
+//! pins its context (`num_ctx` among its parameters), then the
+//! running-models listing (`/api/ps`), whose entry carries the context
+//! the loaded runner serves. The servers without either publish each
+//! model's window on the OpenAI-compatible model listing instead:
+//! vLLM and its kin spell it `max_model_len`, llama.cpp-style servers
+//! repeat it under `meta.n_ctx`, and the session's model is matched by
+//! its listing id. When none of them answers, the `/api/show`
+//! document's training ceiling bounds the caller's own window from
+//! above. The probe is deliberately quiet about failure — a refused
+//! connection or an unexpected shape means "no answer", and the caller
+//! falls back to the configured window, the table of documented
+//! cloud-model windows, or the default. Only loopback endpoints are
+//! asked at all — every route is the local server's own — and the
 //! requests carry no credential: the session's key is for the
 //! provider's API, not for this probe.
 
@@ -21,13 +27,16 @@ use std::time::Duration;
 
 use dch_config::ApiConfig;
 use dch_config::ApiType;
+use dch_config::FALLBACK_CONTEXT_WINDOW;
 use loopctl::api::ApiClient;
 
-/// How long each discovery question waits for its answer.
+/// How long discovery may wait for its answers.
 ///
 /// Discovery rides the runner's construction; a server slow to
 /// answer must not hold a session hostage, so the wait stays short
-/// and a timeout reads as no answer.
+/// and a timeout reads as no answer. The bound is on the questions as
+/// a whole — an endpoint that accepts and never answers (a dead
+/// tunnel) costs one wait, not one per question.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Ask the server this session's client resolved for the window one
@@ -62,17 +71,45 @@ pub(crate) async fn discover_window(config: &ApiConfig, client: &dyn ApiClient) 
 
 /// Ask `config`'s server for the window one request may carry.
 ///
-/// Only the OpenAI-compatible families route here — both discovery
-/// questions are the local-server shape — and `base_url` is the
-/// effective endpoint root, whose trailing `/v1` is stripped to reach
-/// the server itself. The capability document is asked first and the
-/// model listing second; the first answer wins. Returns `None` when
-/// neither question has one.
+/// The questions run as one bounded sequence under
+/// [`PROBE_TIMEOUT`]: a server that accepts connections and never
+/// answers — a dead tunnel — costs one wait, not one per question.
+/// Returns `None` when no question has an answer or the wait runs out.
 pub(crate) async fn probe_context_window(
     config: &ApiConfig,
     base_url: &str,
     model: &str,
 ) -> Option<u64> {
+    probe_within(config, base_url, model, PROBE_TIMEOUT).await
+}
+
+/// [`probe_context_window`] under a deadline the caller states.
+///
+/// The production wait is [`PROBE_TIMEOUT`]; a test states a short one
+/// where the production wait would be the test's whole runtime.
+async fn probe_within(
+    config: &ApiConfig,
+    base_url: &str,
+    model: &str,
+    deadline: Duration,
+) -> Option<u64> {
+    tokio::time::timeout(deadline, ask_in_order(config, base_url, model))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The discovery questions in the module's order; the first answer wins.
+///
+/// Only the OpenAI-compatible families route here — every discovery
+/// question is the local-server shape — and `base_url` is the
+/// effective endpoint root, whose trailing `/v1` is stripped to reach
+/// the server itself. The order: the capability document, the model's
+/// pinned context, the running models' served context, the model
+/// listing, and last the model's ceiling bounding the window `config`
+/// would otherwise assume — [`FALLBACK_CONTEXT_WINDOW`] when it states
+/// none. Returns `None` when no question has an answer.
+async fn ask_in_order(config: &ApiConfig, base_url: &str, model: &str) -> Option<u64> {
     if !matches!(
         config.api_type,
         ApiType::OpenAi | ApiType::Ollama | ApiType::SelfHosted
@@ -84,7 +121,18 @@ pub(crate) async fn probe_context_window(
     if let Some(window) = props_window(root).await {
         return Some(window);
     }
-    listing_window(trimmed, model).await
+    let shown = ollama_model_document(root, model).await;
+    if let Some(window) = shown.as_ref().and_then(ollama_pinned_window) {
+        return Some(window);
+    }
+    if let Some(window) = ollama_loaded_window(root, model).await {
+        return Some(window);
+    }
+    if let Some(window) = listing_window(trimmed, model).await {
+        return Some(window);
+    }
+    let ceiling = shown.as_ref().and_then(ollama_model_ceiling)?;
+    Some(ceiling.min(config.context_window.unwrap_or(FALLBACK_CONTEXT_WINDOW)))
 }
 
 /// Read the llama.cpp family's `/props` document for the per-request
@@ -193,11 +241,124 @@ async fn listing_window(base: &str, model: &str) -> Option<u64> {
     (advertised > 0).then_some(advertised)
 }
 
+/// Fetch Ollama's `/api/show` document for `model`.
+///
+/// The route is a POST carrying the model's name and answers whether or
+/// not the model is loaded, which is what makes the model's own facts —
+/// a pinned context, a training ceiling — knowable before the first
+/// request. A refused connection, a non-loopback root, a non-success
+/// status, or a body that is not JSON is no document.
+async fn ollama_model_document(root: &str, model: &str) -> Option<serde_json::Value> {
+    if !loopback_probe_reachable(root) {
+        tracing::debug!(
+            root,
+            "endpoint is not loopback; skipping the /api/show probe"
+        );
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .ok()?;
+    let response = client
+        .post(format!("{root}/api/show"))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        tracing::debug!(
+            status = %response.status(),
+            "no model document; the next question is asked"
+        );
+        return None;
+    }
+    response.json().await.ok()
+}
+
+/// The context a model pins for itself, read from its `/api/show` document.
+///
+/// Ollama lists a model's parameters one `key value` to a line; a
+/// `num_ctx` line is the context every request for the model is served
+/// with unless the request carries its own, and this session's requests
+/// never do — so the pin is the answer whatever the model's load state.
+/// A document without the parameter, or with a value that is not a
+/// positive whole number, pins nothing.
+fn ollama_pinned_window(document: &serde_json::Value) -> Option<u64> {
+    let parameters = document.get("parameters")?.as_str()?;
+    parameters
+        .lines()
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .find(|(key, _)| *key == "num_ctx")
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .filter(|window| *window > 0)
+}
+
+/// The largest context the model's `/api/show` document claims.
+///
+/// The training context is keyed by architecture (`qwen35.context_length`),
+/// so the value is matched by the key's last segment. The ceiling is read
+/// only when the document states no `num_ctx` and no listing named a
+/// served window, so it is the model's one stated number — a training
+/// limit rather than a served one — and it only ever bounds the window
+/// the caller would otherwise assume, from above.
+fn ollama_model_ceiling(document: &serde_json::Value) -> Option<u64> {
+    let info = document.get("model_info")?.as_object()?;
+    info.iter()
+        .filter(|(key, _)| key.rsplit('.').next() == Some("context_length"))
+        .filter_map(|(_, entry)| entry.as_u64())
+        .find(|length| *length > 0)
+}
+
+/// Read Ollama's running-models listing for the context `model` is served with.
+///
+/// `/api/ps` names each loaded model beside the context its runner was
+/// given — the figure the session's next request is served with
+/// whenever that runner was loaded by a request shaped like this
+/// session's, one without a context of its own. The entry is matched by
+/// `name` or `model`; an unloaded model, a listing without the figure,
+/// or any failure is no answer, and the later questions are asked.
+async fn ollama_loaded_window(root: &str, model: &str) -> Option<u64> {
+    if !loopback_probe_reachable(root) {
+        tracing::debug!(
+            root,
+            "endpoint is not loopback; skipping the running-models probe"
+        );
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .ok()?;
+    let response = client.get(format!("{root}/api/ps")).send().await.ok()?;
+    if !response.status().is_success() {
+        tracing::debug!(
+            status = %response.status(),
+            "no running-models listing; the next question is asked"
+        );
+        return None;
+    }
+    let listing: serde_json::Value = response.json().await.ok()?;
+    listing
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|entry| {
+            ["name", "model"]
+                .iter()
+                .any(|key| entry.get(*key).and_then(serde_json::Value::as_str) == Some(model))
+        })
+        .and_then(|entry| entry.get("context_length"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|window| *window > 0)
+}
+
 /// Whether a discovery probe may dial `root` at all.
 ///
-/// Both discovery routes — the capability document and the model
-/// listing — are the local server's own; a cloud endpoint serves
-/// neither, and probing there would spend an extra request on a host
+/// Every discovery route — the capability document, the model
+/// listing, and Ollama's model document and running models — is the
+/// local server's own; a cloud endpoint serves none, and probing
+/// there would spend an extra request on a host
 /// that never asked. The gate parses
 /// `root` with the same URL parser the dialing client uses, so it
 /// judges the host the request would actually reach: in an authority
@@ -244,7 +405,9 @@ mod tests {
         // error is never paid for by shaving the number it measures
         // against. Every family's answer rides whole.
         let (port, _) = serve_bodies(vec![
-            r#"{"unrelated": true}"#.to_string(),
+            miss(),
+            miss(),
+            miss(),
             r#"{"object":"list","data":[{"id":"endpoint-only","max_model_len":16384}]}"#
                 .to_string(),
         ]);
@@ -388,6 +551,11 @@ mod tests {
             api_type,
             ..ApiConfig::default()
         }
+    }
+
+    /// A route's body when it has no window to answer with.
+    fn miss() -> String {
+        r#"{"unrelated": true}"#.to_string()
     }
 
     /// A client whose only interesting answer is the endpoint it resolved.
@@ -609,7 +777,9 @@ mod tests {
         // slots-shared `n_ctx` under `meta.n_ctx` rides whole — no
         // phantom division, no silent scaling.
         let (port, _) = serve_bodies(vec![
-            r#"{"unrelated": true}"#.to_string(),
+            miss(),
+            miss(),
+            miss(),
             r#"{"object":"list","data":[{"id":"m","meta":{"n_ctx":65536}}]}"#.to_string(),
         ]);
         let config = probe_config(ApiType::Ollama);
@@ -626,7 +796,9 @@ mod tests {
         // The vLLM-shaped server has no /props document at all; its
         // model listing is the only place the window is published.
         let (port, _) = serve_bodies(vec![
-            r#"{"unrelated": true}"#.to_string(),
+            miss(),
+            miss(),
+            miss(),
             r#"{"object":"list","data":[{"id":"test-model","max_model_len":262144,"meta":{"n_ctx":262144}}]}"#
                 .to_string(),
         ]);
@@ -646,7 +818,9 @@ mod tests {
     #[tokio::test]
     async fn the_listing_prefers_max_model_len_and_falls_back_to_meta_n_ctx() {
         let (port, _) = serve_bodies(vec![
-            r#"{"unrelated": true}"#.to_string(),
+            miss(),
+            miss(),
+            miss(),
             r#"{"object":"list","data":[{"id":"m","max_model_len":131072,"meta":{"n_ctx":262144}}]}"#
                 .to_string(),
         ]);
@@ -658,7 +832,9 @@ mod tests {
         );
 
         let (port, _) = serve_bodies(vec![
-            r#"{"unrelated": true}"#.to_string(),
+            miss(),
+            miss(),
+            miss(),
             r#"{"object":"list","data":[{"id":"m","meta":{"n_ctx":4096}}]}"#.to_string(),
         ]);
         let config = probe_config(ApiType::OpenAi);
@@ -676,7 +852,7 @@ mod tests {
             {"id":"test-model","max_model_len":222}
         ]}"#
         .to_string();
-        let (port, _) = serve_bodies(vec![r#"{"unrelated": true}"#.to_string(), listing]);
+        let (port, _) = serve_bodies(vec![miss(), miss(), miss(), listing]);
         let config = probe_config(ApiType::OpenAi);
         assert_eq!(
             probe_context_window(
@@ -694,7 +870,7 @@ mod tests {
             {"id":"another-model","max_model_len":222}
         ]}"#
         .to_string();
-        let (port, _) = serve_bodies(vec![r#"{"unrelated": true}"#.to_string(), listing]);
+        let (port, _) = serve_bodies(vec![miss(), miss(), miss(), listing]);
         let config = probe_config(ApiType::OpenAi);
         assert_eq!(
             probe_context_window(
@@ -711,7 +887,9 @@ mod tests {
     #[tokio::test]
     async fn a_sole_listing_entry_answers_for_any_model_name() {
         let (port, _) = serve_bodies(vec![
-            r#"{"unrelated": true}"#.to_string(),
+            miss(),
+            miss(),
+            miss(),
             r#"{"object":"list","data":[{"id":"whatever","max_model_len":8192}]}"#.to_string(),
         ]);
         let config = probe_config(ApiType::Ollama);
@@ -730,7 +908,9 @@ mod tests {
     #[tokio::test]
     async fn the_listing_is_asked_at_the_v1_route_when_the_base_has_none() {
         let (port, seen) = serve_bodies(vec![
-            r#"{"unrelated": true}"#.to_string(),
+            miss(),
+            miss(),
+            miss(),
             r#"{"object":"list","data":[{"id":"test-model","max_model_len":16384}]}"#.to_string(),
         ]);
         let config = probe_config(ApiType::OpenAi);
@@ -798,6 +978,181 @@ mod tests {
             Some(16_384),
             "the live server's answer outranks the table's, unscaled - \
              this family reports usage and calibrates"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_pinned_context_answers_before_the_running_models_are_asked() {
+        // A model whose parameters carry `num_ctx` is served that
+        // context by every request without one of its own, loaded or
+        // not, so the pin outranks whatever the running models would
+        // say. The Ollama-shaped questions serve the whole
+        // OpenAI-compatible family: a profile typed `openai` at the
+        // same local server is asked them too.
+        let (port, seen) = serve_bodies(vec![
+            miss(),
+            r#"{"parameters":"repeat_penalty 1\nnum_ctx 32768\n","model_info":{"qwen35.context_length":262144}}"#
+                .to_string(),
+        ]);
+        let config = probe_config(ApiType::OpenAi);
+        assert_eq!(
+            probe_context_window(
+                &config,
+                &format!("http://127.0.0.1:{port}/v1"),
+                "test-model"
+            )
+            .await,
+            Some(32_768),
+            "the model's own num_ctx is the context every request of this session is served"
+        );
+        let requests = seen.lock().expect("capture lock").clone();
+        assert!(
+            requests.iter().any(|line| line.contains("POST /api/show")),
+            "the model document is asked on Ollama's own route: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|line| line.contains("/api/ps")),
+            "a pinned context leaves the running models unasked: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loaded_model_answers_with_the_context_it_is_served_at() {
+        // `/api/ps` carries the loaded runner's context beside each
+        // model's name; the session's own entry answers, a neighbour's
+        // never does, and the model listing is not asked once it has.
+        let (port, seen) = serve_bodies(vec![
+            miss(),
+            miss(),
+            r#"{"models":[{"name":"other:latest","context_length":65536},{"name":"test-model","model":"test-model:latest","context_length":4096}]}"#
+                .to_string(),
+        ]);
+        let config = probe_config(ApiType::Ollama);
+        assert_eq!(
+            probe_context_window(
+                &config,
+                &format!("http://127.0.0.1:{port}/v1"),
+                "test-model"
+            )
+            .await,
+            Some(4_096),
+            "the loaded session model's served context answers, not its neighbour's"
+        );
+        let requests = seen.lock().expect("capture lock").clone();
+        assert!(
+            requests.iter().any(|line| line.contains("GET /api/ps")),
+            "the running models are asked for the served context: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|line| line.contains("/v1/models")),
+            "the model listing is not asked once the running models answer: {requests:?}"
+        );
+
+        let (port, _) = serve_bodies(vec![
+            miss(),
+            miss(),
+            r#"{"models":[{"model":"test-model","context_length":16384}]}"#.to_string(),
+        ]);
+        let config = probe_config(ApiType::SelfHosted);
+        assert_eq!(
+            probe_context_window(&config, &format!("http://127.0.0.1:{port}"), "test-model").await,
+            Some(16_384),
+            "an entry keyed by `model` alone is still the session model's"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_model_ceiling_bounds_the_window_the_caller_would_assume() {
+        // No pin, no loaded entry, no listing figure: the `/api/show`
+        // document's training ceiling is all the server states. A
+        // ceiling below the caller's assumption narrows it; one above
+        // leaves the assumption standing — never more than the model
+        // holds, and never a guess at what a default-sized server
+        // serves.
+        for (ceiling, stated, expected) in [
+            (8_192_u64, None, 8_192_u64),
+            (262_144, None, FALLBACK_CONTEXT_WINDOW),
+            (262_144, Some(50_000), 50_000),
+        ] {
+            let shown = format!(
+                r#"{{"parameters":"repeat_penalty 1","model_info":{{"qwen35.context_length":{ceiling}}}}}"#
+            );
+            let (port, _) = serve_bodies(vec![
+                miss(),
+                shown,
+                miss(),
+                r#"{"object":"list","data":[]}"#.to_string(),
+            ]);
+            let mut config = probe_config(ApiType::Ollama);
+            config.context_window = stated;
+            assert_eq!(
+                probe_context_window(
+                    &config,
+                    &format!("http://127.0.0.1:{port}/v1"),
+                    "test-model"
+                )
+                .await,
+                Some(expected),
+                "the ceiling bounds the assumed window from above: ceiling {ceiling}, stated {stated:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pinned_context_that_is_not_a_positive_whole_number_pins_nothing() {
+        // `num_ctx abc` is no context; with no loaded entry and no
+        // listing figure left to ask, the server has no answer.
+        let (port, _) = serve_bodies(vec![
+            miss(),
+            r#"{"parameters":"num_predict 5\nnum_ctx abc\n"}"#.to_string(),
+            miss(),
+            miss(),
+        ]);
+        let config = probe_config(ApiType::Ollama);
+        assert_eq!(
+            probe_context_window(
+                &config,
+                &format!("http://127.0.0.1:{port}/v1"),
+                "test-model"
+            )
+            .await,
+            None,
+            "an unreadable pin is no pin; the questions after it decide"
+        );
+    }
+    /// Bind an ephemeral port and never accept a connection on it: the
+    /// dead-tunnel shape, where every question connects and then waits.
+    fn bind_silent() -> std::net::TcpListener {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+        std::thread::spawn(|| std::thread::sleep(Duration::from_secs(30)));
+        listener
+    }
+
+    #[tokio::test]
+    async fn a_server_that_accepts_and_never_answers_costs_one_wait_not_four() {
+        // Four questions to an endpoint that connects and never
+        // answers: the deadline bounds the sequence as a whole, so the
+        // probe is back within one wait with no answer — a bound per
+        // question would spend four, and runner construction pays it.
+        let listener = bind_silent();
+        let port = listener
+            .local_addr()
+            .expect("bound socket has an address")
+            .port();
+        let config = probe_config(ApiType::Ollama);
+        let root = format!("http://127.0.0.1:{port}");
+        let deadline = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let answer = probe_within(&config, &root, "endpoint-only", deadline).await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            answer, None,
+            "an endpoint with no answers leaves the window to the caller"
+        );
+        assert!(
+            elapsed < deadline * 3,
+            "the sequence costs one wait, not one per question: took {elapsed:?} under a \
+             {deadline:?} deadline"
         );
     }
 }

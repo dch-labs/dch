@@ -43,7 +43,11 @@ impl DchConfig {
     /// edit fixed it. A symlinked target (stow, a dotfiles repo) is
     /// resolved before anything is staged: the rename replaces the
     /// file the link names, never the link itself, so the managed copy
-    /// the user keeps is the one that changes. A staged write that
+    /// the user keeps is the one that changes. A link whose target is
+    /// missing is refused before anything is staged — the error names
+    /// the link, and the link stands — because writing at the link's
+    /// own path would replace it with a plain file and leave the
+    /// managed copy missing. A staged write that
     /// fails removes itself — a stray can carry a credential, and its
     /// pid-and-sequence name could collide with a pid-reusing
     /// successor (a container's dch is often pid 1 against a
@@ -53,8 +57,9 @@ impl DchConfig {
     /// # Errors
     ///
     /// Returns an error when validation refuses the document, when
-    /// serialization fails, when the directory cannot be created, or
-    /// when the staged write or rename does — the target file itself is
+    /// serialization fails, when the directory cannot be created, when
+    /// the target is a symbolic link that resolves to nothing, or when
+    /// the staged write or rename does — the target file itself is
     /// never touched until the rename succeeds.
     pub fn save_to_dir(&self, dir: &Path) -> Result<(), DchConfigError> {
         static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -66,7 +71,19 @@ impl DchConfig {
             dir.join("config.toml")
         };
         std::fs::create_dir_all(dir)?;
-        let target = std::fs::canonicalize(&chosen).unwrap_or(chosen);
+        let target = match std::fs::canonicalize(&chosen) {
+            Ok(resolved) => resolved,
+            Err(_) if is_dangling_symlink(&chosen) => {
+                return Err(DchConfigError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "{} is a symbolic link whose target is missing; the link was left in place",
+                        chosen.display()
+                    ),
+                )));
+            }
+            Err(_) => chosen,
+        };
         let staging = target.with_file_name(format!(
             ".{}.{}.{}.{}.tmp",
             target
@@ -132,8 +149,10 @@ impl DchConfig {
     /// before the staged bytes do, leaving a zero-length live file
     /// after a crash — pushing the data out first closes that window,
     /// so the atomicity the caller claims holds against the wall, not
-    /// only the process. Platforms without file modes write plainly —
-    /// the mode contract is unix's to keep.
+    /// only the process. The sequence is the same on every platform —
+    /// exclusive create, write, sync, removal on a failure — and only
+    /// the mode is unix's to set, where there is an owner-only bit to
+    /// keep.
     ///
     /// # Errors
     ///
@@ -142,29 +161,56 @@ impl DchConfig {
     /// created, so nothing partial and nothing secret is stranded — an
     /// open that itself fails owns no file and removes nothing.
     fn write_staging_file(staging: &Path, document: &str) -> std::io::Result<()> {
+        Self::write_staging_file_with(staging, document, std::fs::File::sync_all)
+    }
+
+    /// [`write_staging_file`](Self::write_staging_file) with the push to
+    /// durable storage supplied by the caller.
+    ///
+    /// `sync` stands where the staged bytes are pushed out —
+    /// [`std::fs::File::sync_all`] when the save runs for real, and
+    /// whatever a caller needs to stand in for it otherwise. A failure
+    /// at the write or at `sync` removes the staging file this call
+    /// created before the error returns; an open that fails owns no
+    /// file and removes nothing — so the removal is one code path
+    /// whatever the push is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the create, the write, or `sync` raises.
+    fn write_staging_file_with(
+        staging: &Path,
+        document: &str,
+        sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::io::Write as _;
             use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(staging)?;
-            if let Err(err) = file
-                .write_all(document.as_bytes())
-                .and_then(|()| file.sync_all())
-            {
-                drop(std::fs::remove_file(staging));
-                return Err(err);
-            }
-            Ok(())
+            options.mode(0o600);
         }
-        #[cfg(not(unix))]
+        let mut file = options.open(staging)?;
+        if let Err(err) = file
+            .write_all(document.as_bytes())
+            .and_then(|()| sync(&file))
         {
-            std::fs::write(staging, document)
+            drop(std::fs::remove_file(staging));
+            return Err(err);
         }
+        Ok(())
     }
+}
+
+/// Whether `path` is a symbolic link that resolves to nothing.
+///
+/// The one shape of path that exists yet defeats `canonicalize`: the
+/// link stands, the file it names does not. A save at the link's own
+/// path would replace it with a plain file and leave the managed copy
+/// missing, which is why [`DchConfig::save_to_dir`] refuses instead.
+fn is_dangling_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
 #[cfg(test)]
@@ -220,6 +266,48 @@ mod save_roundtrip {
         assert!(
             saved.contains("\"new\""),
             "the managed copy changed: {saved}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_dangling_symlink_is_refused_and_the_link_stands() {
+        // The same stow- or dotfiles-managed config with its managed
+        // file missing — the checkout is absent, the mount is not up.
+        // Saving at the link's own path would replace the link with a
+        // plain file and leave the managed copy missing for good, so
+        // the save refuses before staging anything, names the link, and
+        // leaves the directory exactly as it found it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("managed-config.toml");
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&missing, &link).expect("a dangling symlink");
+
+        let err = DchConfig::default()
+            .save_to_dir(dir.path())
+            .expect_err("a save through a dangling link is refused");
+        assert!(
+            err.to_string().contains("symbolic link"),
+            "the refusal names the link: {err}"
+        );
+        let meta = std::fs::symlink_metadata(&link).expect("the link stands");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the save left the link a link"
+        );
+        assert!(
+            !missing.exists(),
+            "nothing was written at the missing destination"
+        );
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("the dir reads")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["config.toml".to_string()],
+            "the refused save staged nothing and left nothing behind"
         );
     }
 
@@ -286,12 +374,13 @@ mod save_roundtrip {
         // last-writer-wins, never to a hybrid: each save stages under
         // its own name, so no interleaving can leave half of one
         // document inside another's rename.
+        const ROUNDS: u64 = 40;
         let dir = tempfile::tempdir().expect("tempdir");
         let mut handles = Vec::new();
         for which in 0..2_u64 {
             let root = dir.path().to_path_buf();
             handles.push(std::thread::spawn(move || {
-                for round in 0..40_u64 {
+                for round in 0..ROUNDS {
                     let mut config = DchConfig::default();
                     config.api.model = format!("model-{which}-{round}");
                     config
@@ -305,12 +394,24 @@ mod save_roundtrip {
         }
         let landed = std::fs::read_to_string(dir.path().join("config.toml"))
             .expect("a whole document landed");
-        let parsed = toml::from_str::<DchConfig>(&landed)
-            .expect("the winner is one writer's whole document, never a splice");
+        // The last save to land is one writer's final round, so the
+        // file must be that writer's whole document, byte for byte —
+        // either winner, nothing else. A splice, or a truncation at a
+        // table boundary, differs from both; the default-filled parse
+        // would forgive it, which is why the oracle is the text.
+        let mut final_documents = Vec::new();
+        for which in 0..2_u64 {
+            let mut config = DchConfig::default();
+            config.api.model = format!("model-{which}-{}", ROUNDS - 1);
+            final_documents.push(
+                config
+                    .to_toml_string()
+                    .expect("the final document serializes"),
+            );
+        }
         assert!(
-            parsed.api.model.starts_with("model-"),
-            "the landed model is one of the savers' own: {}",
-            parsed.api.model
+            final_documents.contains(&landed),
+            "the landed file is one writer's whole final document, never a splice or a cut: {landed}"
         );
     }
 
@@ -439,6 +540,48 @@ mod save_roundtrip {
             mode & 0o777,
             0o600,
             "owner-only from the first byte, whatever the umask leaves open"
+        );
+    }
+
+    #[test]
+    fn a_staged_write_whose_disk_push_fails_removes_the_staging_file() {
+        // The removal half of the staging contract, driven at the step
+        // that fails in practice — the push to the disk — because a
+        // plain write on a healthy filesystem does not fail on demand.
+        // The staged file may carry a credential, so nothing partial
+        // and nothing secret may stay behind.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = dir.path().join(".config.toml.stage");
+        let err = DchConfig::write_staging_file_with(&staging, "[api]\nmodel = \"m\"\n", |_| {
+            Err(std::io::Error::other("the disk push failed"))
+        })
+        .expect_err("a failed push fails the staged write");
+        assert_eq!(
+            err.to_string(),
+            "the disk push failed",
+            "the push's own error is the one reported"
+        );
+        assert!(
+            !staging.exists(),
+            "the staged file removed itself — a stray can carry a credential"
+        );
+    }
+
+    #[test]
+    fn a_staging_path_already_taken_is_refused_and_left_alone() {
+        // create_new refuses a path something already holds, and the
+        // refusal owns no file: the removal must take only what this
+        // save created, never the stray or foreign file at the name.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = dir.path().join(".config.toml.stage");
+        std::fs::write(&staging, "someone else's file").expect("the path is taken");
+        let err = DchConfig::write_staging_file(&staging, "[api]\n")
+            .expect_err("a taken staging path is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&staging).expect("the taken file stands"),
+            "someone else's file",
+            "the refusal removed nothing it did not create"
         );
     }
 }

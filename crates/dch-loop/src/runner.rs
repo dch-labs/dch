@@ -7150,6 +7150,8 @@ mod tests {
         // no answer.
         let server = SseServer::start(vec![
             r#"{"unrelated": true}"#.to_string(),
+            r#"{"unrelated": true}"#.to_string(),
+            r#"{"unrelated": true}"#.to_string(),
             r#"{"object":"list","data":[{"id":"test-model","max_model_len":262144,"meta":{"n_ctx":262144}}]}"#
                 .to_string(),
             sse_text_turn("answer"),
@@ -7177,9 +7179,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unset_window_adopts_the_known_model_table() {
         // A cloud provider publishes no window anywhere its client can
-        // ask; after both live questions go unanswered, the
+        // ask; after every live question goes unanswered, the
         // documented-model table sizes the session.
         let server = SseServer::start(vec![
+            r#"{"unrelated": true}"#.to_string(),
+            r#"{"unrelated": true}"#.to_string(),
             r#"{"unrelated": true}"#.to_string(),
             r#"{"object":"list","data":[{"id":"other-model"}]}"#.to_string(),
             sse_text_turn("answer"),

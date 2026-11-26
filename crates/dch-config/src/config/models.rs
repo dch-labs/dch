@@ -113,9 +113,12 @@ impl ModelProfile {
     /// Pure over the two values, so the caller decides whether the result
     /// replaces the config's bundle. Fields the entry leaves unset keep
     /// `base`'s value; [`cleared`] is how an entry drops one it names empty.
+    /// The model itself is handed over trimmed — the spelling the entry
+    /// knows, without the space beside it — so a name assembled in code
+    /// with padding still reaches the provider as the model alone.
     fn apply_onto(&self, base: &ApiConfig) -> ApiConfig {
         ApiConfig {
-            model: self.model.clone(),
+            model: self.model.trim().to_string(),
             base_url: self
                 .base_url
                 .clone()
@@ -179,16 +182,15 @@ impl DchConfig {
     /// closed set — only entry names are selectable, so only entry
     /// names are listed, top first in the file's order. It is the set
     /// [`select_model`](Self::select_model) checks a requested name
-    /// against and what its error lists. Empty for every config
+    /// against and what its error lists. Each name is spoken trimmed —
+    /// the entry's own spelling minus whatever padding an entry
+    /// assembled in code may carry. Empty for every config
     /// without entries: that is the open case, where a requested name
     /// passes through unvalidated instead of being refused for
     /// matching nothing.
     #[must_use]
     pub fn model_names(&self) -> Vec<&str> {
-        self.models
-            .iter()
-            .map(|entry| entry.model.as_str())
-            .collect()
+        self.models.iter().map(|entry| entry.model.trim()).collect()
     }
 
     /// Point the run at one of the configured `[[models]]` entries.
@@ -271,7 +273,7 @@ impl DchConfig {
         let selected = self
             .models
             .iter()
-            .find(|entry| entry.model.eq_ignore_ascii_case(wanted))
+            .find(|entry| entry.model.trim().eq_ignore_ascii_case(wanted))
             .cloned();
         match selected {
             Some(entry) => {
@@ -433,6 +435,53 @@ context_window = 210_000
         assert_eq!(
             config.api.model, "glm-5.3",
             "the match is forgiving, but what the provider receives is the spelling it knows"
+        );
+    }
+
+    #[test]
+    fn a_padded_entry_assembled_in_code_selects_and_sends_its_trimmed_name() {
+        // trim_model_names folds the padding away at load, so a file-fed
+        // config never carries it — a config assembled in code can. The
+        // explicit match then reads the name trimmed, as the default
+        // selection and the duplicate check already do, and the name
+        // that rides the provider request is the entry's own spelling
+        // minus the space beside it.
+        let mut config = config_with_two_models();
+        config.models[1].model = "  Qwen-Fast  ".to_string();
+        config
+            .select_model(Some("qwen-fast"))
+            .expect("the trimmed name selects the padded entry, ignoring case");
+        assert_eq!(
+            config.api.model, "Qwen-Fast",
+            "the entry's spelling goes to the provider — never the padding"
+        );
+        assert_eq!(
+            config.api.context_window,
+            Some(210_000),
+            "and it is that entry's bundle the run reads"
+        );
+    }
+
+    #[test]
+    fn a_refusal_offers_a_padded_entry_by_its_trimmed_name() {
+        // The list a refusal prints is the list a request is matched
+        // against, and both speak the trimmed name: an entry assembled
+        // in code with padding is offered under the one spelling a
+        // user can actually type, not the spelling stored.
+        let mut config = config_with_two_models();
+        config.models[1].model = "  Qwen-Fast  ".to_string();
+        assert_eq!(
+            config.model_names(),
+            vec!["glm-5.3", "Qwen-Fast"],
+            "model_names speaks the entry's spelling minus the padding"
+        );
+        let message = config
+            .select_model(Some("cloude-haiku"))
+            .expect_err("an unknown name is refused")
+            .to_string();
+        assert!(
+            message.contains("Qwen-Fast") && !message.contains("  Qwen-Fast"),
+            "the refusal lists the trimmed spelling, not the padding: {message}"
         );
     }
 

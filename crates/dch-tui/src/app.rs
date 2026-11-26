@@ -45,7 +45,7 @@ use self::permissions::PermissionState;
 use self::questions::QuestionState;
 use self::queue::QueueState;
 use self::run::FramePacing;
-use self::selection::{ScrollPosture, SelectionState, Stick, take_locked};
+use self::selection::{PinIdentity, ScrollPosture, SelectionState, Stick, take_locked};
 use self::session_commands::{ConfigWrites, Pickers, ThemeBrowse};
 use self::stream::FreezeCache;
 use self::todos::{ExpansionState, PlanState};
@@ -644,6 +644,7 @@ impl TuiApp {
         if let Some(id) = self.expansion.auto_expanded_todo.take()
             && self.expansion.expanded_tools.remove(&id)
         {
+            self.note_block_reshape(&id);
             self.bake.rebake_whole();
         }
         self.conversation.push(message);
@@ -2165,6 +2166,8 @@ impl TuiApp {
         self.bake.user_turn_ranges = merged.user_turn_ranges;
         self.bake.user_prompt_marks = merged.user_prompt_marks;
         self.bake.todo_block_ranges = merged.todo_block_ranges;
+        self.bake.message_ranges = merged.message_ranges;
+        self.bake.message_units = merged.message_units;
         self.bake.conversation_cache_generation = self.bake.conversation_generation;
     }
 
@@ -2231,28 +2234,229 @@ impl TuiApp {
     /// Settle the scroll offset for this frame's layout.
     ///
     /// A pinned view sits at the newest line: the offset resets to
-    /// zero and growth below the viewport carries it along. A
-    /// detached view holds its anchor: the offset is compensated for
-    /// the document growing or shrinking since the last frame and
-    /// clamped to the scrollable height, so the same lines stay in
-    /// view while content streams in below or collapses away.
+    /// zero. A detached view holds a *pin* — the row at the top of the
+    /// view — and the offset is re-derived from it every frame:
+    /// `total − viewport − pin`, saturating at zero. So the view survives
+    /// whatever the frame does to its geometry: content streaming in
+    /// below the pin or collapsing away above or below it (rows a fold
+    /// moves *above* the pin move the pin itself,
+    /// [`rows_moved_above_anchor`](Self::rows_moved_above_anchor)), and a
+    /// viewport that changes under the view — a pane tmux resized while
+    /// it was hidden. The saturation can only deny the pin for a frame,
+    /// never lose it: the pin is remembered while the offset cannot reach
+    /// it, and the offset restores it when the geometry allows again. A
+    /// pane that changes *width* rewraps every message, so the pin is also
+    /// kept as a place in the transcript — message, unit, offset
+    /// ([`PinIdentity`]) — and mapped onto the rebaked rows, where its row
+    /// index alone would name a different line.
     fn settle_scroll_offset(&mut self, total_lines: usize, viewport: usize) {
         if self.scroll.stick.follows() {
             self.scroll.scroll_offset = 0;
+            self.scroll.anchored_row = None;
+            self.scroll.settled_offset = 0;
+            self.scroll.pin_identity = None;
+            self.scroll.reshaped_blocks.clear();
         } else {
-            let delta = total_lines.abs_diff(self.pacing.last_layout_lines);
-            if total_lines >= self.pacing.last_layout_lines {
-                self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_add(delta);
+            let reader_moved = self.scroll.scroll_offset != self.scroll.settled_offset;
+            let base = if reader_moved && self.remembered_pin() > self.last_frame_top_row() {
+                self.last_frame_top_row()
+                    .min(total_lines.saturating_sub(viewport))
             } else {
-                self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_sub(delta);
+                self.remembered_pin()
+            };
+            let pin = self.pin_after_reader_move(base);
+            let (landed_above, left_above) = self.rows_moved_above_anchor();
+            let pin = pin.saturating_add(landed_above).saturating_sub(left_above);
+            let width = usize::from(self.bake.conversation_cache_width);
+            let pin = if width == self.scroll.settled_width {
+                pin
+            } else {
+                match self.scroll.pin_identity {
+                    Some(identity) => self.pin_row_after_rewrap(identity).unwrap_or(pin),
+                    None => pin,
+                }
+            };
+            self.scroll.scroll_offset = total_lines.saturating_sub(viewport).saturating_sub(pin);
+            self.scroll.anchored_row = Some(pin);
+            self.scroll.settled_offset = self.scroll.scroll_offset;
+            if reader_moved
+                || landed_above > 0
+                || left_above > 0
+                || self.scroll.pin_identity.is_none()
+            {
+                self.scroll.pin_identity = self.pin_identity_at(pin);
             }
-            self.scroll.scroll_offset = self
-                .scroll
-                .scroll_offset
-                .min(total_lines.saturating_sub(viewport));
+            self.scroll.settled_width = width;
         }
         self.pacing.last_layout_lines = total_lines;
         self.pacing.last_layout_viewport = viewport;
+    }
+
+    /// The row the detached view's top is on, in the last settle's
+    /// coordinates: the remembered pin, moved by whatever has happened to
+    /// the offset since — a wheel notch up takes it a row higher, a notch
+    /// down a row lower, a prompt jump seats it on the prompt — or, before
+    /// any pin is remembered, the paint's own `total − viewport − offset`
+    /// against the last totals. The fold sites measure their blocks against
+    /// this figure and carry it with the note, so the settle re-measures
+    /// against the same pin whatever the reader has done since.
+    fn pinned_row(&self) -> usize {
+        self.pin_after_reader_move(self.remembered_pin())
+    }
+
+    /// `base` moved by whatever the reader has done to the offset since
+    /// the last settle: a notch up takes it a row higher, a notch down a
+    /// row lower.
+    fn pin_after_reader_move(&self, base: usize) -> usize {
+        let up = self
+            .scroll
+            .scroll_offset
+            .saturating_sub(self.scroll.settled_offset);
+        let down = self
+            .scroll
+            .settled_offset
+            .saturating_sub(self.scroll.scroll_offset);
+        base.saturating_add(down).saturating_sub(up)
+    }
+
+    /// The pin as the last settle left it, before whatever the reader has
+    /// done to the offset since: the remembered row, or — before any pin
+    /// is remembered — the paint's own `total − viewport − offset`
+    /// against the last totals.
+    fn remembered_pin(&self) -> usize {
+        match self.scroll.anchored_row {
+            Some(row) => row,
+            None => self.last_frame_top_row(),
+        }
+    }
+
+    /// The row that actually sat at the top of the last frame.
+    ///
+    /// The last totals less the viewport less the offset that frame
+    /// displayed with — the saturated offset, where the frame could not
+    /// reach the remembered pin — so this is the row the reader saw,
+    /// whatever the remembered pin says.
+    fn last_frame_top_row(&self) -> usize {
+        self.pacing
+            .last_layout_lines
+            .saturating_sub(self.pacing.last_layout_viewport)
+            .saturating_sub(self.scroll.settled_offset)
+    }
+
+    /// Where the pin sits in the transcript's own structure, for the
+    /// frame's bake: the message whose rows hold it, the rendering unit
+    /// within that message (a source segment, a block), and the row's
+    /// offset inside the unit beside the unit's row count. `None` when the
+    /// row sits in no baked message — a separator row, or the live region
+    /// past the bake.
+    fn pin_identity_at(&self, row: usize) -> Option<PinIdentity> {
+        let ranges = &self.bake.message_ranges;
+        let message = ranges.partition_point(|range| range.end <= row);
+        let range = ranges.get(message)?;
+        if !range.contains(&row) {
+            return None;
+        }
+        let units = self.bake.message_units.get(message)?;
+        let unit = units
+            .partition_point(|start| *start <= row)
+            .checked_sub(1)?;
+        let start = *units.get(unit)?;
+        let end = units
+            .get(unit.saturating_add(1))
+            .copied()
+            .unwrap_or(range.end);
+        Some(PinIdentity {
+            message,
+            unit,
+            offset: row.saturating_sub(start),
+            unit_rows: end.saturating_sub(start),
+        })
+    }
+
+    /// The row the pin's identity names under the current bake, after a
+    /// rewrap moved every unit's rows: the unit opens at its new start,
+    /// and the offset scales by the unit's new row count over the old —
+    /// under uniform wrapping the same source line, give or take a row.
+    fn pin_row_after_rewrap(&self, identity: PinIdentity) -> Option<usize> {
+        let range = self.bake.message_ranges.get(identity.message)?;
+        let units = self.bake.message_units.get(identity.message)?;
+        let start = *units.get(identity.unit)?;
+        let end = units
+            .get(identity.unit.saturating_add(1))
+            .copied()
+            .unwrap_or(range.end);
+        let rows = end.saturating_sub(start);
+        let offset = identity
+            .offset
+            .saturating_mul(rows)
+            .checked_div(identity.unit_rows)
+            .unwrap_or_default()
+            .min(rows.saturating_sub(1));
+        Some(start.saturating_add(offset))
+    }
+
+    /// The rows the block registered under `key` in the bake's row maps
+    /// holds above `pin` — tool, thinking, and compaction blocks alike,
+    /// a key naming one block in exactly one map.
+    fn rows_above_pin(&self, key: &str, pin: usize) -> usize {
+        [
+            &self.bake.tool_summary_lines,
+            &self.bake.thinking_summary_lines,
+            &self.bake.compaction_summary_lines,
+        ]
+        .into_iter()
+        .flat_map(|map| map.iter())
+        .filter(|(row, id)| id.as_str() == key && **row < pin)
+        .count()
+    }
+
+    /// Note, ahead of its `rebake_whole()`, that the block registered
+    /// under `key` is about to fold or open.
+    ///
+    /// A pinned view has no anchor to hold and takes no note. A
+    /// detached one records the block's rows above the anchor as they
+    /// stand in the map the rebake is about to redraw — the whole
+    /// block, summary and expansion alike, since the map registers both
+    /// postures and the settle needs the difference, not the detail.
+    fn note_block_reshape(&mut self, key: &str) {
+        if self.scroll.stick.follows() {
+            return;
+        }
+        let pin = self.pinned_row();
+        let before = self.rows_above_pin(key, pin);
+        self.scroll
+            .reshaped_blocks
+            .push((key.to_string(), before, pin));
+    }
+
+    /// Consume the reshape notes: how many rows the noted blocks added
+    /// above the pin since their notes, and how many they removed —
+    /// measured against the maps as the rebake left them, each against
+    /// the pin its note carried, in the last settle's coordinates.
+    ///
+    /// Each removed row above the pin lifts the pinned row one row in the
+    /// document; each added one lowers it. The settle moves the pin by
+    /// exactly that, so the pinned row stays the view's top row. The
+    /// noted pin is the one to measure against, not the pin as the
+    /// reader's notches since the note have moved it: a fold and a
+    /// scroll handled in one batch would otherwise count the block's
+    /// surviving rows between the two pins as rows that had left.
+    fn rows_moved_above_anchor(&mut self) -> (usize, usize) {
+        let notes = std::mem::take(&mut self.scroll.reshaped_blocks);
+        if notes.is_empty() {
+            return (0, 0);
+        }
+        let mut landed_above = 0usize;
+        let mut left_above = 0usize;
+        for (key, before, noted_pin) in notes {
+            let after = self.rows_above_pin(&key, noted_pin);
+            if after >= before {
+                landed_above = landed_above.saturating_add(after.saturating_sub(before));
+            } else {
+                left_above = left_above.saturating_add(before.saturating_sub(after));
+            }
+        }
+        (landed_above, left_above)
     }
 
     /// Take what the observer finished since the last frame.
@@ -2451,6 +2655,8 @@ impl TuiApp {
             user_turn_ranges: user_turns,
             user_prompt_marks: prompt_marks,
             todo_block_ranges: todo_blocks,
+            message_ranges,
+            message_units,
         } = meta;
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
@@ -2461,37 +2667,32 @@ impl TuiApp {
                 lines.push(Line::default());
             }
             *previous_was_user = Some(is_user);
+            let message_start = lines.len();
+            let mut units = Vec::new();
             match message {
                 TuiMessage::User {
-                    text, unsent: true, ..
+                    text,
+                    steered,
+                    unsent,
+                    ..
                 } => {
+                    let tint = if *unsent {
+                        self.theme.ui.dim
+                    } else {
+                        self.theme.ui.user_message_fg
+                    };
                     let tint_start = lines.len();
+                    units.push(lines.len());
                     lines.push(Line::default());
                     let mark_row = lines.len();
                     for segment in text.split('\n') {
-                        lines.extend(plain_wrapped_lines(
-                            segment,
-                            usize::from(width),
-                            self.theme.ui.dim,
-                        ));
+                        units.push(lines.len());
+                        lines.extend(plain_wrapped_lines(segment, usize::from(width), tint));
                     }
+                    units.push(lines.len());
                     lines.push(Line::default());
                     user_turns.push((tint_start, lines.len(), mark_row));
-                }
-                TuiMessage::User { text, steered, .. } => {
-                    let tint_start = lines.len();
-                    lines.push(Line::default());
-                    let mark_row = lines.len();
-                    for segment in text.split('\n') {
-                        lines.extend(plain_wrapped_lines(
-                            segment,
-                            usize::from(width),
-                            self.theme.ui.user_message_fg,
-                        ));
-                    }
-                    lines.push(Line::default());
-                    user_turns.push((tint_start, lines.len(), mark_row));
-                    if !*steered {
+                    if !*unsent && !*steered {
                         prompt_marks.push(mark_row);
                     }
                 }
@@ -2509,6 +2710,7 @@ impl TuiApp {
                             } => {
                                 let key = format!("m{message_index}b{block_index}");
                                 let expanded = self.expansion.expanded_thinking.contains(&key);
+                                units.push(lines.len());
                                 let first = lines.len();
                                 lines.extend(thinking_section_lines(
                                     text,
@@ -2519,8 +2721,11 @@ impl TuiApp {
                                     self.theme.ui.dim,
                                 ));
                                 index_summary_rows(thinking_lines, first, lines.len(), &key);
+                                note_paragraph_units(lines, first, &mut units);
                             }
                             ContentBlock::Text { text } => {
+                                units.push(lines.len());
+                                let first = lines.len();
                                 lines.extend(markdown::render_markdown(
                                     text,
                                     width,
@@ -2529,8 +2734,11 @@ impl TuiApp {
                                     self.theme.ui.assistant_message_fg,
                                     None,
                                 ));
+                                note_paragraph_units(lines, first, &mut units);
                             }
                             ContentBlock::Tool { .. } => {
+                                units.push(lines.len());
+                                let first = lines.len();
                                 self.push_tool_block_lines(
                                     block,
                                     width,
@@ -2538,10 +2746,12 @@ impl TuiApp {
                                     summary_lines,
                                     todo_blocks,
                                 );
+                                note_paragraph_units(lines, first, &mut units);
                             }
                         }
                     }
                     if let Some(duration_ms) = duration_ms {
+                        units.push(lines.len());
                         lines.push(Line::styled(
                             format!("duration {}", format_duration(*duration_ms)),
                             self.theme.ui.dim,
@@ -2550,6 +2760,7 @@ impl TuiApp {
                 }
                 TuiMessage::System { text, .. } => {
                     for segment in text.split('\n') {
+                        units.push(lines.len());
                         lines.extend(plain_wrapped_lines(
                             segment,
                             usize::from(width),
@@ -2558,11 +2769,8 @@ impl TuiApp {
                     }
                 }
                 TuiMessage::Error { text, .. } => {
-                    // Rows stand above unless the block opens the
-                    // document itself — the tail bake re-renders the
-                    // last message alone, so the segment's own emptiness
-                    // proves nothing about the pane.
                     let rows_above = !lines.is_empty() || start > 0;
+                    units.push(lines.len());
                     lines.extend(error_block_lines(
                         text,
                         width,
@@ -2572,6 +2780,7 @@ impl TuiApp {
                 }
                 message @ TuiMessage::Compacted { .. } => {
                     let key = format!("m{message_index}");
+                    units.push(lines.len());
                     let first = lines.len();
                     lines.extend(compaction_notice_lines(
                         message,
@@ -2582,6 +2791,8 @@ impl TuiApp {
                     index_summary_rows(compaction_lines, first, lines.len(), &key);
                 }
             }
+            message_ranges.push(message_start..lines.len());
+            message_units.push(units);
         }
     }
 
@@ -2675,6 +2886,37 @@ struct FrameLayout {
 /// Comparing two shapes says whether the lane renumbered; the counts
 /// themselves never leave the frame that computed them.
 type SelectableShape = (usize, usize, usize, usize, usize, usize, usize);
+
+/// Open a unit at every paragraph that starts in the rows a block just
+/// appended: each non-blank row following a blank one.
+///
+/// A long text, thinking, or detail block rewraps paragraph by paragraph,
+/// and a rewrap maps the scroll pin's offset across its unit in proportion
+/// to the unit's rows — within one paragraph that lands on the same line,
+/// where across a whole block the blank rows between paragraphs would skew
+/// the proportion onto a neighbour.
+fn note_paragraph_units(lines: &[Line<'static>], first: usize, units: &mut Vec<usize>) {
+    let Some(rows) = lines.get(first..) else {
+        return;
+    };
+    for (offset, pair) in rows.windows(2).enumerate() {
+        let [before, at] = pair else {
+            continue;
+        };
+        if line_is_blank(before) && !line_is_blank(at) {
+            units.push(first.saturating_add(offset).saturating_add(1));
+        }
+    }
+}
+
+/// Whether a row carries nothing but whitespace.
+///
+/// The paragraph seam [`note_paragraph_units`] opens units at: a row
+/// whose every span trims to nothing reads as blank on the terminal,
+/// whatever padding the renderer put in it.
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
+}
 
 /// The three-pane layout always splits into three rects; the
 /// fallback keeps rendering total if a shorter split ever appears.

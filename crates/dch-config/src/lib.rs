@@ -49,69 +49,148 @@ pub use self::config::{DchConfig, DchConfigError, config_dir};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
-    /// Collect the key names a serialized value carries, descending
-    /// tables and arrays of tables.
+    /// Collect the qualified knob paths a serialized value carries,
+    /// descending tables and arrays of tables.
     ///
-    /// Sections, their fields, and the fields inside each array entry
-    /// all count as knobs, so a nested field the surface walk never
-    /// saw is demanded like any other.
-    fn collect_knobs(value: &serde_json::Value, names: &mut Vec<String>) {
+    /// A path is the chain of keys from the root, dot-separated, with
+    /// `[]` where the walk entered an array: `api.model`,
+    /// `models[].model`, `runner.role_overrides[].prompt`. Sections,
+    /// their fields, and the fields inside each array entry all count,
+    /// so a nested field the surface walk never saw is demanded like
+    /// any other — and a field in one table cannot stand in for its
+    /// namesake in another. The paths held as arrays are returned
+    /// beside the names, so a sample's headers qualify the same way.
+    fn collect_knobs(value: &serde_json::Value) -> (Vec<String>, BTreeSet<String>) {
+        let (mut names, mut arrays) = (Vec::new(), BTreeSet::new());
+        walk_knobs(value, &mut Vec::new(), &mut names, &mut arrays);
+        (names, arrays)
+    }
+
+    /// The recursion behind [`collect_knobs`], carrying the path so far.
+    fn walk_knobs(
+        value: &serde_json::Value,
+        path: &mut Vec<String>,
+        names: &mut Vec<String>,
+        arrays: &mut BTreeSet<String>,
+    ) {
         match value {
             serde_json::Value::Object(table) => {
                 for (key, inner) in table {
-                    names.push(key.clone());
-                    collect_knobs(inner, names);
+                    path.push(key.clone());
+                    names.push(path.join("."));
+                    walk_knobs(inner, path, names, arrays);
+                    path.pop();
                 }
             }
             serde_json::Value::Array(entries) => {
+                if path.is_empty() {
+                    return;
+                }
+                arrays.insert(path.join("."));
+                if let Some(last) = path.last_mut() {
+                    last.push_str("[]");
+                }
                 for entry in entries {
-                    collect_knobs(entry, names);
+                    walk_knobs(entry, path, names, arrays);
+                }
+                if let Some(last) = path.last_mut() {
+                    last.truncate(last.len() - 2);
                 }
             }
             _ => {}
         }
     }
 
-    /// Whether the sample spells `name` as a configuration key.
+    /// The knob paths the sample spells as configuration keys.
     ///
-    /// A line counts only where the knob appears in one of TOML's key
-    /// spellings — `name =`, a `[section]` header, or an
-    /// `[[array.entry]]` header — commented or not. A prose mention
-    /// satisfies none of them, which is the teeth the sweep exists
-    /// for.
-    fn sample_documents(sample: &str, name: &str) -> bool {
-        sample.lines().any(|line| {
+    /// A line counts only in TOML's key spellings — a `[section]` or
+    /// `[[array]]` header, and a `key =` assignment under the header in
+    /// force — commented or not; each documents the path it spells and
+    /// every table above it, with `[]` after each inner segment `arrays`
+    /// holds as an array, so a header names the path the walk does. A
+    /// prose mention satisfies none of these, which is the teeth the
+    /// sweep exists for. An inline table documents the key it is
+    /// assigned to: its inner names are a map's entries, not knobs of
+    /// the schema.
+    fn documented_paths(sample: &str, arrays: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut documented = BTreeSet::new();
+        let mut table = Vec::new();
+        for line in sample.lines() {
             let trimmed = line.trim();
             let spelled = trimmed.strip_prefix("# ").unwrap_or(trimmed);
             if let Some(header) = spelled.strip_prefix('[') {
-                return header
-                    .trim_end_matches(']')
-                    .trim_matches(['[', ']'])
-                    .split('.')
-                    .any(|segment| segment == name);
+                // `[table]` and `[[array]]` alike: the brackets are
+                // trimmed off both ends, the dots name the path
+                let header = header.trim_end_matches(']').trim_start_matches('[');
+                table = split_path(header);
+                record_path(&mut documented, arrays, &table);
+                continue;
             }
-            spelled.starts_with(&format!("{name} =")) || spelled.starts_with(&format!("{name}="))
-        })
+            let Some((key, _)) = spelled.split_once('=') else {
+                continue;
+            };
+            let mut path = table.clone();
+            path.extend(split_path(key));
+            if !path.iter().any(String::is_empty) {
+                record_path(&mut documented, arrays, &path);
+            }
+        }
+        documented
     }
 
-    /// Knobs of `config` the sample never spells as a key.
+    /// A dotted TOML path, split into trimmed segments.
+    fn split_path(dotted: &str) -> Vec<String> {
+        dotted
+            .split('.')
+            .map(|segment| segment.trim().to_string())
+            .collect()
+    }
+
+    /// Mark `path` and every table above it as documented.
+    fn record_path(documented: &mut BTreeSet<String>, arrays: &BTreeSet<String>, path: &[String]) {
+        for depth in 1..=path.len() {
+            let (mut plain, mut qualified) = (Vec::new(), Vec::new());
+            for (position, segment) in path.iter().enumerate().take(depth) {
+                plain.push(segment.clone());
+                // the final segment names the knob itself, so an
+                // array's own key keeps its plain spelling
+                let inner = position + 1 < depth && arrays.contains(&plain.join("."));
+                qualified.push(if inner {
+                    format!("{segment}[]")
+                } else {
+                    segment.clone()
+                });
+            }
+            documented.insert(qualified.join("."));
+        }
+    }
+
+    /// Knobs of `config` the sample never spells as a key in their own
+    /// table.
     ///
     /// The report drives the example-config sweep: an empty list is
     /// the passing verdict, and each entry names a knob whose
     /// documentation is missing or merely prose.
     fn undocumented_knobs(sample: &str, config: &DchConfig) -> Vec<String> {
-        let mut names = Vec::new();
-        collect_knobs(
-            &serde_json::to_value(config).expect("the config serializes"),
-            &mut names,
-        );
+        let rendered = serde_json::to_value(config).expect("the config serializes");
+        let (mut names, arrays) = collect_knobs(&rendered);
         names.sort();
         names.dedup();
+        let documented = documented_paths(sample, &arrays);
         names
             .into_iter()
-            .filter(|name| !sample_documents(sample, name))
+            .filter(|name| !documented.contains(name))
             .collect()
+    }
+
+    /// Whether the sample spells `path` — a qualified knob path — as a
+    /// key in its own table.
+    fn documents(sample: &str, config: &DchConfig, path: &str) -> bool {
+        let rendered = serde_json::to_value(config).expect("the config serializes");
+        let (_, arrays) = collect_knobs(&rendered);
+        documented_paths(sample, &arrays).contains(path)
     }
 
     /// The default config plus one role override and one technology.
@@ -149,7 +228,13 @@ mod tests {
             "# language = \"rust\"\n",
         );
         let report = undocumented_knobs(without_nested, &fixture);
-        for nested in ["prompt", "build", "test", "lint", "conventions"] {
+        for nested in [
+            "runner.role_overrides[].prompt",
+            "project.techs[].build",
+            "project.techs[].test",
+            "project.techs[].lint",
+            "project.techs[].conventions",
+        ] {
             assert!(
                 report.iter().any(|name| name == nested),
                 "the walk demands the nested `{nested}` a flat sweep never saw: {report:?}"
@@ -167,10 +252,16 @@ mod tests {
             "# conventions = \"none\"\n",
         );
         let report = undocumented_knobs(with_nested, &fixture);
-        for nested in ["prompt", "build", "test", "lint", "conventions"] {
+        for nested in [
+            "runner.role_overrides[].prompt",
+            "project.techs[].build",
+            "project.techs[].test",
+            "project.techs[].lint",
+            "project.techs[].conventions",
+        ] {
             assert!(
                 !report.iter().any(|name| name == nested),
-                "a key-shaped `{nested} =` line documents the nested knob: {report:?}"
+                "a key-shaped `{nested} =` line under its own table documents the knob: {report:?}"
             );
         }
     }
@@ -180,15 +271,45 @@ mod tests {
         let prose = "# raise compact_threshold when sessions run long\n";
         let report = undocumented_knobs(prose, &DchConfig::default());
         assert!(
-            report.iter().any(|name| name == "compact_threshold"),
+            report.iter().any(|name| name == "runner.compact_threshold"),
             "a prose mention is not a key-shaped spelling: {report:?}"
         );
-        let keyed = "# compact_threshold = 80\n";
+        let keyed = "[runner]\n# compact_threshold = 80\n";
         let report = undocumented_knobs(keyed, &DchConfig::default());
         assert!(
-            !report.iter().any(|name| name == "compact_threshold"),
-            "the key-shaped spelling documents the knob: {report:?}"
+            !report.iter().any(|name| name == "runner.compact_threshold"),
+            "the key-shaped spelling under its table documents the knob: {report:?}"
         );
+    }
+
+    #[test]
+    fn a_field_in_one_table_does_not_document_its_namesake_in_another() {
+        // Knobs are qualified paths: `[api] model` is not `[[models]]`
+        // model, and the project-wide `conventions` is not a
+        // technology's. A sample that spells one must still owe the
+        // other, or the sweep would pass an example that quietly
+        // dropped a profile field.
+        let sample = concat!(
+            "[api]\n",
+            "model = \"qwen\"\n",
+            "# [[models]]\n",
+            "# api_type = \"anthropic\"\n",
+            "[project]\n",
+            "conventions = \"none\"\n",
+        );
+        let report = undocumented_knobs(sample, &config_with_nested_entries());
+        for owed in ["models[].model", "project.techs[].conventions"] {
+            assert!(
+                report.iter().any(|name| name == owed),
+                "the namesake in another table does not document `{owed}`: {report:?}"
+            );
+        }
+        for spelled in ["api.model", "models[].api_type", "project.conventions"] {
+            assert!(
+                !report.iter().any(|name| name == spelled),
+                "`{spelled}` is spelled under its own table: {report:?}"
+            );
+        }
     }
 
     #[test]
@@ -199,13 +320,17 @@ mod tests {
         let report = undocumented_knobs(&sample, &config_with_nested_entries());
         assert!(
             report.is_empty(),
-            "every knob the walk can see must appear in a key-shaped spelling: {report:?}"
+            "every knob the walk can see must appear as a key in its own table: {report:?}"
         );
         // reasoning_effort skip-serializes when unset, so the walk
-        // cannot see it; its presence is asserted by name.
+        // cannot see it; its presence is asserted by path.
         assert!(
-            sample_documents(&sample, "reasoning_effort"),
-            "example.config must document the `reasoning_effort` knob"
+            documents(
+                &sample,
+                &config_with_nested_entries(),
+                "api.reasoning_effort"
+            ),
+            "example.config must document the `reasoning_effort` knob under `[api]`"
         );
     }
 
