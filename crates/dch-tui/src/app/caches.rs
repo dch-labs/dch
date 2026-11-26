@@ -863,7 +863,13 @@ mod tests {
     fn the_incremental_bake_matches_a_full_rebuild() {
         // The optimization may not change what the reader sees: the
         // incrementally baked cache and a from-scratch rebuild of the
-        // same conversation render identical lines.
+        // same conversation render identical lines, indexes included.
+        // The first two messages bake into the prefix under a frame, and
+        // the third then lands as the tail: the incremental path extends
+        // an existing bake, so the prefix's handshake
+        // (`BakeMeta::adopt`) has to keep the earlier entries and rebase
+        // the new ones onto them — an adopt that replaced them would
+        // pass a test that never drew before the last message.
         let mut subject = TuiApp::new(dch_config::DchConfig::default());
         let now = chrono::Utc::now();
         subject.push_message(TuiMessage::User {
@@ -890,14 +896,15 @@ mod tests {
             timestamp: now,
             duration_ms: Some(1200),
         });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
         subject.push_message(TuiMessage::User {
             text: "again".to_string(),
             timestamp: now,
             steered: false,
             unsent: false,
         });
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| subject.render(frame)).unwrap();
         let incremental = subject.bake.conversation_cache.clone();
         let incremental_meta = (

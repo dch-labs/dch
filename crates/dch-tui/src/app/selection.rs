@@ -408,6 +408,65 @@ pub(crate) struct PinIdentity {
     pub(crate) unit_rows: usize,
 }
 
+/// The merged indexes of one layout: each message's row span and, per
+/// message, the row each of its rendering units opens at — the figures
+/// [`PinIdentity`] is read against.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BakeLayout {
+    /// Each message's row span in the merged cache of that layout.
+    ///
+    /// The first figure the pin's identity is read against: the message
+    /// a pinned row sits in, found by the row's place in these spans.
+    pub(crate) ranges: Vec<std::ops::Range<usize>>,
+
+    /// Per message, the row each of its rendering units opens at.
+    ///
+    /// The second figure: the unit within the message, and — beside the
+    /// message's span — the row's offset inside it and the unit's row
+    /// count.
+    pub(crate) units: Vec<Vec<usize>>,
+}
+
+/// One block's shape as it stood when a fold or expansion was noted,
+/// ahead of the rebake that redraws the row maps.
+///
+/// The settle re-reads the block after the rebake and moves the pin by
+/// the difference; every figure is in the last settle's coordinates,
+/// the pin included, so the two measurements agree wherever the reader
+/// has since moved the view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReshapeNote {
+    /// The bake key the block is registered under.
+    ///
+    /// What the settle re-reads the block by once the rebake has
+    /// redrawn the row maps, and what makes a later click on the same
+    /// block find its standing note.
+    pub(crate) key: String,
+
+    /// The rows the block held above `pin` when the note was taken.
+    ///
+    /// The before of the row-by-row count a block the pin sat inside is
+    /// measured by; the after is read at the settle against the same pin.
+    pub(crate) rows_above: usize,
+
+    /// The row the note's figures were counted against: the view's top
+    /// row as the reader had it when the block changed.
+    pub(crate) pin: usize,
+
+    /// The block's row count when the note was taken.
+    ///
+    /// The before of the whole-length count a block wholly above the pin
+    /// is measured by: every row it gained or lost lands above the pin.
+    pub(crate) len: usize,
+
+    /// The block's last row when the note was taken.
+    ///
+    /// Before `pin`, the block stood wholly above it and the whole-length
+    /// rule applies; at or after it, the pin sat inside the block and the
+    /// rows are counted one by one.
+    pub(crate) last_row: usize,
+}
+
 /// The conversation view's scrolling posture: the offset above the
 /// newest line and whether the view follows content or holds.
 ///
@@ -431,18 +490,17 @@ pub(crate) struct ScrollPosture {
     pub(crate) stick: Stick,
 
     /// Blocks that changed shape since the last settle while the view
-    /// was detached: `(bake key, rows the block held above the anchor
-    /// before the change, the pin they were counted against)`. Every
-    /// fold and expansion site notes its block ahead of its
-    /// `rebake_whole()`; the next settle, running after the rebake has
-    /// redrawn the row maps, re-reads each block's rows above the pin
-    /// its note carried and spares the offset exactly the rows that
-    /// moved there — so a block folding or opening above the pin leaves
-    /// the pinned row in place instead of dragging the view by the
-    /// block's whole change, and a reader's notches queued behind the
-    /// note cannot skew the count: the settle measures against the pin
-    /// the note did, whatever the reader has done since.
-    pub(crate) reshaped_blocks: Vec<(String, usize, usize)>,
+    /// was detached, one [`ReshapeNote`] per block. Every fold and
+    /// expansion site notes its block ahead of its `rebake_whole()`,
+    /// and the first note for a block stands until the settle however
+    /// many times it is clicked before a draw — every click reads the
+    /// same painted map, so the settle must not apply one fold once per
+    /// click. The next settle, running after the rebake has redrawn the
+    /// row maps, re-reads each block against its note and spares the
+    /// offset exactly the rows that moved above the pin, so a block
+    /// folding or opening above the pin leaves the pinned row in place
+    /// instead of dragging the view by the block's whole change.
+    pub(crate) reshaped_blocks: Vec<ReshapeNote>,
 
     /// The row the detached view held at its top when the settle last
     /// ran, in that frame's coordinates; `None` while pinned. The settle
@@ -463,6 +521,15 @@ pub(crate) struct ScrollPosture {
     /// maps it across a width change, where the pin's row index would
     /// name a different line.
     pub(crate) pin_identity: Option<PinIdentity>,
+
+    /// The merged message ranges and unit starts the last settle's pin
+    /// was read against — the previous layout, kept whole.
+    ///
+    /// A reader who queues a notch against that layout and then draws at
+    /// a new width asks for a row of it; the settle reads the row's place
+    /// here before mapping the place onto the rebaked rows, so the notch
+    /// survives the rewrap instead of being replaced by the old pin.
+    pub(crate) settled_layout: Option<Box<BakeLayout>>,
 
     /// The bake width the last settle saw.
     ///

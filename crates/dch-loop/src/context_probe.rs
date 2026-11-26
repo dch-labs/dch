@@ -316,8 +316,10 @@ fn ollama_model_ceiling(document: &serde_json::Value) -> Option<u64> {
 /// given — the figure the session's next request is served with
 /// whenever that runner was loaded by a request shaped like this
 /// session's, one without a context of its own. The entry is matched by
-/// `name` or `model`; an unloaded model, a listing without the figure,
-/// or any failure is no answer, and the later questions are asked.
+/// `name` or `model`, an omitted tag reading as `:latest` on both sides
+/// ([`with_implicit_tag`]); an unloaded model, a listing without the
+/// figure, or any failure is no answer, and the later questions are
+/// asked.
 async fn ollama_loaded_window(root: &str, model: &str) -> Option<u64> {
     if !loopback_probe_reachable(root) {
         tracing::debug!(
@@ -339,18 +341,38 @@ async fn ollama_loaded_window(root: &str, model: &str) -> Option<u64> {
         return None;
     }
     let listing: serde_json::Value = response.json().await.ok()?;
+    let wanted = with_implicit_tag(model);
     listing
         .get("models")?
         .as_array()?
         .iter()
         .find(|entry| {
-            ["name", "model"]
-                .iter()
-                .any(|key| entry.get(*key).and_then(serde_json::Value::as_str) == Some(model))
+            ["name", "model"].iter().any(|key| {
+                entry
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| with_implicit_tag(name) == wanted)
+            })
         })
         .and_then(|entry| entry.get("context_length"))
         .and_then(serde_json::Value::as_u64)
         .filter(|window| *window > 0)
+}
+
+/// `name` with Ollama's implicit tag made explicit.
+///
+/// Ollama reads a name without a tag as `:latest`, and its
+/// running-models listing spells the entry the tagged way — a
+/// configured `mistral` is the `mistral:latest` it reports. Only the
+/// last path segment carries a tag: a `host:port` prefix is an address,
+/// not a tag.
+fn with_implicit_tag(name: &str) -> String {
+    let tagged = name.rsplit('/').next().unwrap_or(name).contains(':');
+    if tagged {
+        name.to_string()
+    } else {
+        format!("{name}:latest")
+    }
 }
 
 /// Whether a discovery probe may dial `root` at all.
@@ -1059,6 +1081,30 @@ mod tests {
             Some(16_384),
             "an entry keyed by `model` alone is still the session model's"
         );
+    }
+
+    #[tokio::test]
+    async fn an_untagged_model_matches_its_latest_entry_in_the_running_models() {
+        // Ollama treats an omitted tag as `latest` and spells the loaded
+        // entry the tagged way, so a configured `mistral` must meet the
+        // `mistral:latest` the listing reports, and a configured
+        // `mistral:latest` the bare `mistral` — an exact-string match
+        // would miss either and let the session outgrow the loaded
+        // context.
+        for (configured, loaded) in [("mistral", "mistral:latest"), ("mistral:latest", "mistral")] {
+            let (port, _) = serve_bodies(vec![
+                miss(),
+                miss(),
+                format!(r#"{{"models":[{{"name":"{loaded}","context_length":32768}}]}}"#),
+            ]);
+            let config = probe_config(ApiType::Ollama);
+            assert_eq!(
+                probe_context_window(&config, &format!("http://127.0.0.1:{port}/v1"), configured)
+                    .await,
+                Some(32_768),
+                "a configured {configured:?} meets the loaded {loaded:?}"
+            );
+        }
     }
 
     #[tokio::test]

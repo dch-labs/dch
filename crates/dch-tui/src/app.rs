@@ -45,7 +45,9 @@ use self::permissions::PermissionState;
 use self::questions::QuestionState;
 use self::queue::QueueState;
 use self::run::FramePacing;
-use self::selection::{PinIdentity, ScrollPosture, SelectionState, Stick, take_locked};
+use self::selection::{
+    BakeLayout, PinIdentity, ReshapeNote, ScrollPosture, SelectionState, Stick, take_locked,
+};
 use self::session_commands::{ConfigWrites, Pickers, ThemeBrowse};
 use self::stream::FreezeCache;
 use self::todos::{ExpansionState, PlanState};
@@ -2256,6 +2258,7 @@ impl TuiApp {
             self.scroll.settled_offset = 0;
             self.scroll.pin_identity = None;
             self.scroll.reshaped_blocks.clear();
+            self.scroll.settled_layout = None;
         } else {
             let reader_moved = self.scroll.scroll_offset != self.scroll.settled_offset;
             let base = if reader_moved && self.remembered_pin() > self.last_frame_top_row() {
@@ -2270,6 +2273,12 @@ impl TuiApp {
             let width = usize::from(self.bake.conversation_cache_width);
             let pin = if width == self.scroll.settled_width {
                 pin
+            } else if reader_moved {
+                let layout = self.scroll.settled_layout.as_deref();
+                match layout.and_then(|layout| Self::pin_identity_in(pin, layout)) {
+                    Some(identity) => self.pin_row_after_rewrap(identity).unwrap_or(pin),
+                    None => pin,
+                }
             } else {
                 match self.scroll.pin_identity {
                     Some(identity) => self.pin_row_after_rewrap(identity).unwrap_or(pin),
@@ -2287,6 +2296,10 @@ impl TuiApp {
                 self.scroll.pin_identity = self.pin_identity_at(pin);
             }
             self.scroll.settled_width = width;
+            self.scroll.settled_layout = Some(Box::new(BakeLayout {
+                ranges: self.bake.message_ranges.clone(),
+                units: self.bake.message_units.clone(),
+            }));
         }
         self.pacing.last_layout_lines = total_lines;
         self.pacing.last_layout_viewport = viewport;
@@ -2350,13 +2363,30 @@ impl TuiApp {
     /// row sits in no baked message — a separator row, or the live region
     /// past the bake.
     fn pin_identity_at(&self, row: usize) -> Option<PinIdentity> {
-        let ranges = &self.bake.message_ranges;
+        Self::pin_identity_in(
+            row,
+            &BakeLayout {
+                ranges: self.bake.message_ranges.clone(),
+                units: self.bake.message_units.clone(),
+            },
+        )
+    }
+
+    /// [`pin_identity_at`](Self::pin_identity_at) read against a kept
+    /// layout.
+    ///
+    /// The same reading, against the merged indexes of a layout the
+    /// caller holds rather than the current bake's — the previous
+    /// layout, when a settle has to place a row the reader chose before
+    /// the rebake moved everything.
+    fn pin_identity_in(row: usize, layout: &BakeLayout) -> Option<PinIdentity> {
+        let ranges = &layout.ranges;
         let message = ranges.partition_point(|range| range.end <= row);
         let range = ranges.get(message)?;
         if !range.contains(&row) {
             return None;
         }
-        let units = self.bake.message_units.get(message)?;
+        let units = layout.units.get(message)?;
         let unit = units
             .partition_point(|start| *start <= row)
             .checked_sub(1)?;
@@ -2395,10 +2425,37 @@ impl TuiApp {
         Some(start.saturating_add(offset))
     }
 
-    /// The rows the block registered under `key` in the bake's row maps
-    /// holds above `pin` — tool, thinking, and compaction blocks alike,
-    /// a key naming one block in exactly one map.
+    /// The rows the block registered under `key` holds above `pin`.
+    ///
+    /// Tool, thinking, and compaction blocks alike — a key names one
+    /// block in exactly one map. The settle counts a block the pin sat
+    /// inside this way, before and after a change, and moves the pin by
+    /// the difference.
     fn rows_above_pin(&self, key: &str, pin: usize) -> usize {
+        self.block_rows(key)
+            .into_iter()
+            .filter(|row| *row < pin)
+            .count()
+    }
+
+    /// The block's row count and its last row, as the row maps stand.
+    ///
+    /// The note records both so the settle can tell a block that stood
+    /// wholly above the pin — its last row before the pin — from one the
+    /// pin sat inside, and apply the right rule to each.
+    fn block_shape(&self, key: &str) -> (usize, usize) {
+        let rows = self.block_rows(key);
+        let last_row = rows.iter().copied().max().unwrap_or(0);
+        (rows.len(), last_row)
+    }
+
+    /// The rows the block registered under `key` holds in the bake's row
+    /// maps.
+    ///
+    /// Tool, thinking, and compaction blocks alike: the three maps are
+    /// read together, since the caller knows the key and not which map
+    /// carries it.
+    fn block_rows(&self, key: &str) -> Vec<usize> {
         [
             &self.bake.tool_summary_lines,
             &self.bake.thinking_summary_lines,
@@ -2406,27 +2463,44 @@ impl TuiApp {
         ]
         .into_iter()
         .flat_map(|map| map.iter())
-        .filter(|(row, id)| id.as_str() == key && **row < pin)
-        .count()
+        .filter(|(_, id)| id.as_str() == key)
+        .map(|(row, _)| *row)
+        .collect()
     }
 
     /// Note, ahead of its `rebake_whole()`, that the block registered
     /// under `key` is about to fold or open.
     ///
     /// A pinned view has no anchor to hold and takes no note. A
-    /// detached one records the block's rows above the anchor as they
-    /// stand in the map the rebake is about to redraw — the whole
-    /// block, summary and expansion alike, since the map registers both
-    /// postures and the settle needs the difference, not the detail.
+    /// detached one records the block's shape as it stands in the map
+    /// the rebake is about to redraw — the whole block, summary and
+    /// expansion alike, since the map registers both postures and the
+    /// settle needs the difference, not the detail. A block already
+    /// noted keeps its first note: clicks queued behind a slow frame all
+    /// read the same painted map, and the settle must apply the net
+    /// change once, not once per click.
     fn note_block_reshape(&mut self, key: &str) {
         if self.scroll.stick.follows() {
             return;
         }
-        let pin = self.pinned_row();
-        let before = self.rows_above_pin(key, pin);
-        self.scroll
+        if self
+            .scroll
             .reshaped_blocks
-            .push((key.to_string(), before, pin));
+            .iter()
+            .any(|note| note.key == key)
+        {
+            return;
+        }
+        let pin = self.pinned_row();
+        let (len, last_row) = self.block_shape(key);
+        let rows_above = self.rows_above_pin(key, pin);
+        self.scroll.reshaped_blocks.push(ReshapeNote {
+            key: key.to_string(),
+            rows_above,
+            pin,
+            len,
+            last_row,
+        });
     }
 
     /// Consume the reshape notes: how many rows the noted blocks added
@@ -2436,25 +2510,31 @@ impl TuiApp {
     ///
     /// Each removed row above the pin lifts the pinned row one row in the
     /// document; each added one lowers it. The settle moves the pin by
-    /// exactly that, so the pinned row stays the view's top row. The
-    /// noted pin is the one to measure against, not the pin as the
-    /// reader's notches since the note have moved it: a fold and a
-    /// scroll handled in one batch would otherwise count the block's
-    /// surviving rows between the two pins as rows that had left.
+    /// exactly that, so the pinned row stays the view's top row. A block
+    /// that stood wholly above the noted pin moves it by its whole
+    /// change in length — every row it gained or lost lands above the
+    /// pin, and counting the rows that sit above the pin's old index
+    /// would stop short inside a block that expanded past it. A block
+    /// the pin sat inside is counted row by row against the noted pin,
+    /// so a fold and a scroll handled in one batch agree wherever the
+    /// reader has since moved the view.
     fn rows_moved_above_anchor(&mut self) -> (usize, usize) {
         let notes = std::mem::take(&mut self.scroll.reshaped_blocks);
-        if notes.is_empty() {
-            return (0, 0);
-        }
         let mut landed_above = 0usize;
         let mut left_above = 0usize;
-        for (key, before, noted_pin) in notes {
-            let after = self.rows_above_pin(&key, noted_pin);
-            if after >= before {
-                landed_above = landed_above.saturating_add(after.saturating_sub(before));
+        for note in notes {
+            let (len, _) = self.block_shape(&note.key);
+            let (landed, left) = if note.last_row < note.pin {
+                (len.saturating_sub(note.len), note.len.saturating_sub(len))
             } else {
-                left_above = left_above.saturating_add(before.saturating_sub(after));
-            }
+                let after = self.rows_above_pin(&note.key, note.pin);
+                (
+                    after.saturating_sub(note.rows_above),
+                    note.rows_above.saturating_sub(after),
+                )
+            };
+            landed_above = landed_above.saturating_add(landed);
+            left_above = left_above.saturating_add(left);
         }
         (landed_above, left_above)
     }
