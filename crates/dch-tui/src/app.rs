@@ -2267,15 +2267,17 @@ impl TuiApp {
             } else {
                 self.remembered_pin()
             };
-            let pin = self.pin_after_reader_move(base);
+            let requested = self.pin_after_reader_move(base);
             let (landed_above, left_above) = self.rows_moved_above_anchor();
-            let pin = pin.saturating_add(landed_above).saturating_sub(left_above);
+            let pin = requested
+                .saturating_add(landed_above)
+                .saturating_sub(left_above);
             let width = usize::from(self.bake.conversation_cache_width);
             let pin = if width == self.scroll.settled_width {
                 pin
             } else if reader_moved {
                 let layout = self.scroll.settled_layout.as_deref();
-                match layout.and_then(|layout| Self::pin_identity_in(pin, layout)) {
+                match layout.and_then(|layout| Self::pin_identity_in(requested, layout)) {
                     Some(identity) => self.pin_row_after_rewrap(identity).unwrap_or(pin),
                     None => pin,
                 }

@@ -5435,6 +5435,80 @@ fn a_queued_notch_survives_a_frame_that_rewraps_the_transcript() {
     );
 }
 
+/// A notch queued against one layout survives a frame that both folds a
+/// block above the pin and rewraps the transcript. The reader, detached
+/// below an open block, wheels up once in the same batch a push folds the
+/// block, and the frame draws at a wider pane: the fold lifts the
+/// requested row by the rows that left above it, and the rewrap moves
+/// every row again. The settle reads the requested row's place in the
+/// layout the reader saw — before the fold's move — and maps that place
+/// onto the rebaked rows, which already hold both moves. The old settle
+/// read the moved index against the old layout instead, naming a row of
+/// the still-open block, and the view landed on the block's summary. The
+/// resize-only paths keep their behavior: the notch and zoom tests above
+/// and below.
+#[test]
+fn a_queued_notch_survives_a_frame_that_folds_a_block_and_rewraps() {
+    let (mut app, call_id) = app_with_a_plan_block_mid_conversation(true);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("first draw");
+    let block = block_rows_of(&app, &call_id);
+    let block_end = *block.last().expect("the block baked rows");
+    let open_rows = block.len();
+    // Below the open block, among short single-row lines that wrap the same
+    // at either width, so a row keeps its index across the rewrap.
+    let seat = block_end.saturating_add(3);
+    seat_the_pin_at(&mut app, seat, &mut terminal);
+    let width_before = app.scroll.settled_width;
+    let expected_line = app
+        .bake
+        .conversation_cache
+        .get(seat - 1)
+        .map(ToString::to_string)
+        .expect("the row one above the seat is baked");
+    assert!(
+        expected_line.contains("working row"),
+        "the requested row is a plain line below the block: {expected_line:?}"
+    );
+
+    // One batch: a push folds the open block — its rows leave above the
+    // seat — the reader wheels up once, and the frame draws wider.
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "after the fold".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    app.scroll_the_wheel(true);
+    let mut wider =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 22)).expect("terminal");
+    wider
+        .draw(|frame| app.render(frame))
+        .expect("the folding, rewrapping draw");
+    assert_ne!(
+        app.scroll.settled_width, width_before,
+        "the wider pane rewrapped the bake"
+    );
+    assert!(
+        !app.expansion.expanded_tools.contains(&call_id),
+        "the push folded the block"
+    );
+    assert_eq!(
+        top_text(&app).as_deref(),
+        Some(expected_line.as_str()),
+        "the queued notch lands on the line the reader asked for, past the fold and the rewrap"
+    );
+    assert_eq!(
+        top_row(&app),
+        seat - open_rows,
+        "the row one above the seat, lifted by the open rows that left above it"
+    );
+}
+
 /// The zoom repro: the reader is scrolled up, then zooms the pane
 /// (`prefix z`) and back. Zoom changes the width too, so the bake rewraps
 /// every message — a row index names a different line after the rewrap —
