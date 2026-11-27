@@ -6034,6 +6034,170 @@ fn a_thinking_section_folding_above_the_pin_leaves_the_pinned_line_in_place() {
 }
 
 #[test]
+fn a_block_closed_and_reopened_before_a_rewrapping_frame_keeps_the_pin_s_place_inside_its_unit() {
+    // An open tool block whose detail wraps at eighty columns, the pin on
+    // its last wrapped row. Clicking the pinned row shuts the block and
+    // clicking it again opens it, both before a frame that draws wider:
+    // the shape the frame finds is the one it left, so the pin keeps its
+    // place inside its unit, and the pane's own width restores the row.
+    let mut app = app();
+    push_plain_rows(&mut app, "row above", 10);
+    let call_id = "call_wrapped".to_string();
+    let detail = (0..3)
+        .map(|i| {
+            format!(
+                "detail line {i} — long enough that the wrap at eighty columns falls before its \
+                 second naming, two rows there and one at a hundred and sixty; detail line {i} — tail"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.retain_tool_detail(&call_id, "{\"path\":\"x\"}", &detail);
+    app.expansion.expanded_tools.insert(call_id.clone());
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Read".to_string(),
+            call_id: call_id.clone(),
+            input_preview: "x".to_string(),
+            output_preview: "detail line 0".to_string(),
+            retained_input: String::new(),
+            success: true,
+            elapsed_secs: 0.1,
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    push_plain_rows(&mut app, "row below", 30);
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("first draw");
+    let rows = block_rows_of(&app, &call_id);
+    assert!(
+        rows.len() >= 7,
+        "the summary and three wrapped detail lines at eighty columns: {rows:?}"
+    );
+    // The last detail line's wrapped tail — the row its second naming sits on.
+    let seat = rows
+        .iter()
+        .rev()
+        .copied()
+        .find(|row| {
+            app.bake
+                .conversation_cache
+                .get(*row)
+                .is_some_and(|line| line.to_string().contains("detail line 2 — tail"))
+        })
+        .expect("the last detail line's tail is a baked row");
+    let expected_line = app
+        .bake
+        .conversation_cache
+        .get(seat)
+        .map(ToString::to_string)
+        .expect("the pinned row is baked");
+    seat_the_pin_at(&mut app, seat, &mut pane);
+
+    // Shut and open the block before the frame, by its pinned row.
+    assert!(
+        click_baked_row(&mut app, seat),
+        "the first click lands on the block"
+    );
+    assert!(
+        !app.expansion.expanded_tools.contains(&call_id),
+        "the block is shut"
+    );
+    assert!(
+        click_baked_row(&mut app, seat),
+        "the second click lands on the block"
+    );
+    assert!(
+        app.expansion.expanded_tools.contains(&call_id),
+        "the block is open again, the shape the frame will find unchanged"
+    );
+    let mut wider =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 22)).expect("terminal");
+    wider
+        .draw(|frame| app.render(frame))
+        .expect("the rewrapping draw");
+    assert!(
+        block_rows_of(&app, &call_id).len() < rows.len(),
+        "the detail wraps to fewer rows at the wider pane"
+    );
+
+    pane.draw(|frame| app.render(frame))
+        .expect("the restoring draw");
+    assert_eq!(
+        top_text(&app).as_deref(),
+        Some(expected_line.as_str()),
+        "the pane's own width restores the row inside its unit the reader sat on"
+    );
+}
+
+#[test]
+fn a_notch_and_a_resize_in_one_frame_keep_the_requested_row_inside_its_unit() {
+    // A paragraph that wraps to two rows at eighty columns and one at a
+    // hundred and sixty. The reader sits on its first row, wheels down
+    // onto its second, and the frame draws wider: the requested row's
+    // place is read in the old layout and mapped onto the new — one row
+    // — and the identity stored must stay the requested row's, in the old
+    // unit's terms, so the pane's own width restores the second row.
+    let mut app = app();
+    push_plain_rows(&mut app, "row above", 20);
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "wrapped row 01 — a first part long enough that the wrap at eighty columns \
+                   falls before the second naming; wrapped row 01 — tail"
+                .to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let wrapped_index = app.conversation.len() - 1;
+    push_plain_rows(&mut app, "row below", 40);
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("first draw");
+    let segment = app.bake.message_ranges[wrapped_index].clone();
+    assert_eq!(
+        segment.len(),
+        2,
+        "the paragraph wraps to two rows: {segment:?}"
+    );
+    let second_line = app
+        .bake
+        .conversation_cache
+        .get(segment.start + 1)
+        .map(ToString::to_string)
+        .expect("the second row is baked");
+    assert!(
+        second_line.contains("tail"),
+        "the second row carries the tail: {second_line:?}"
+    );
+    seat_the_pin_at(&mut app, segment.start, &mut pane);
+
+    // One batch: a notch down onto the second row, and a wider frame.
+    app.scroll_the_wheel(false);
+    let mut wider =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 22)).expect("terminal");
+    wider
+        .draw(|frame| app.render(frame))
+        .expect("the rewrapping draw");
+    assert!(
+        top_text(&app).is_some_and(|line| line.contains("wrapped row 01")),
+        "the wider frame lands on the paragraph, its two rows now one: {:?}",
+        top_text(&app)
+    );
+
+    // The pane's own width: the second row is the view's top again.
+    pane.draw(|frame| app.render(frame))
+        .expect("the restoring draw");
+    assert_eq!(
+        top_text(&app).as_deref(),
+        Some(second_line.as_str()),
+        "the requested second row, not the first row the mapping rounded to"
+    );
+}
+
+#[test]
 fn an_occurrence_the_last_frame_did_not_paint_takes_no_note() {
     let mut app = app();
     push_plain_rows(&mut app, "row above", 15);

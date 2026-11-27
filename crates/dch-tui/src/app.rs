@@ -2288,16 +2288,12 @@ impl TuiApp {
             let reader_moved = self.scroll.scroll_offset != self.scroll.settled_offset;
             let base = self.pin_base();
             let requested = self.pin_after_reader_move(base);
-            let pinned_block_reshaped = self.scroll.reshaped_blocks.iter().any(|note| {
-                note.len > 0
-                    && note.last_row.saturating_sub(note.len.saturating_sub(1)) <= requested
-                    && requested <= note.last_row
-            });
             let (landed_above, left_above) = self.rows_moved_above_anchor();
             let pin = requested
                 .saturating_add(landed_above)
                 .saturating_sub(left_above);
             let width = usize::from(self.bake.conversation_cache_width);
+            let mut retained = None;
             let pin = if width == self.scroll.settled_width {
                 pin
             } else if reader_moved {
@@ -2305,7 +2301,13 @@ impl TuiApp {
                 match layout.and_then(|layout| {
                     Self::pin_identity_in(requested, &layout.ranges, &layout.units)
                 }) {
-                    Some(identity) => self.pin_row_after_rewrap(identity).unwrap_or(pin),
+                    Some(identity) => match self.pin_row_after_rewrap(identity) {
+                        Some(row) => {
+                            retained = Some(identity);
+                            row
+                        }
+                        None => pin,
+                    },
                     None => pin,
                 }
             } else {
@@ -2317,8 +2319,15 @@ impl TuiApp {
             self.scroll.scroll_offset = total_lines.saturating_sub(viewport).saturating_sub(pin);
             self.scroll.anchored_row = Some(pin);
             self.scroll.settled_offset = self.scroll.scroll_offset;
-            if reader_moved || pinned_block_reshaped || self.scroll.pin_identity.is_none() {
-                self.scroll.pin_identity = self.pin_identity_at(pin);
+            let pinned_unit_changed = match (&self.scroll.pin_identity, self.pin_identity_at(pin)) {
+                (Some(kept), Some(now)) => {
+                    kept.message != now.message || kept.block != now.block || kept.unit != now.unit
+                }
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if reader_moved || pinned_unit_changed || self.scroll.pin_identity.is_none() {
+                self.scroll.pin_identity = retained.or_else(|| self.pin_identity_at(pin));
             }
             self.scroll.settled_width = width;
             self.scroll.settled_layout = Some(Box::new(BakeLayout {

@@ -89,7 +89,6 @@ impl DchConfig {
             Err(_) => chosen,
         };
         let staging = target.with_file_name(Self::staging_name(
-            &target,
             SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             Self::staging_nonce(),
         ));
@@ -101,21 +100,20 @@ impl DchConfig {
         Ok(())
     }
 
-    /// The staging file's name beside `target`: the target's own name,
-    /// the pid, the per-process `sequence`, and a time `nonce`.
+    /// The staging file's name: a fixed hidden prefix, the pid, the
+    /// per-process `sequence`, and a time `nonce`.
     ///
-    /// The pid and the sequence alone collide with a stray left by an
-    /// earlier process whose pid a container reuses — every fresh
-    /// container is pid 1 against the same persistent home — so the name
-    /// carries the nonce as well, and no stray can stand at a successor's
-    /// name whatever sequence the successor draws.
-    fn staging_name(target: &Path, sequence: u64, nonce: u64) -> String {
+    /// Nothing of the target's own name is in it: a managed file may
+    /// carry a basename near the filesystem's component limit, and the
+    /// staging file beside it must not add to it. The pid and the
+    /// sequence alone collide with a stray left by an earlier process
+    /// whose pid a container reuses — every fresh container is pid 1
+    /// against the same persistent home — so the name carries the nonce
+    /// as well, and no stray can stand at a successor's name whatever
+    /// sequence the successor draws.
+    fn staging_name(sequence: u64, nonce: u64) -> String {
         format!(
-            ".{}.{}.{}.{}.tmp",
-            target
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or("config.toml"),
+            ".dch-save.{}.{}.{}.tmp",
             std::process::id(),
             sequence,
             nonce,
@@ -502,23 +500,62 @@ mod save_roundtrip {
     }
 
     #[test]
+    fn a_staging_name_fits_a_filename_component_whatever_the_target_is_called() {
+        // A managed file may carry a basename near the filesystem's
+        // component limit; the staging file beside it adds nothing to it,
+        // its name being a fixed prefix with the pid, the sequence, and
+        // the nonce — at the widest figures those take.
+        for (sequence, nonce) in [(0_u64, 1_u64), (u64::MAX, u64::MAX)] {
+            let name = DchConfig::staging_name(sequence, nonce);
+            assert!(name.len() <= 255, "fits a 255-byte component: {name:?}");
+            assert!(
+                name.starts_with(".dch-save.") && name.rsplit('.').next() == Some("tmp"),
+                "a fixed hidden prefix, a tmp suffix: {name}"
+            );
+            assert!(
+                !name.contains("mmmm"),
+                "the target's own name is no part of it: {name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_link_to_a_long_managed_name_lands() {
+        // The managed copy's basename sits near the component limit; the
+        // staging file beside it must still carry a name the filesystem
+        // takes, or the save fails on a file that is itself valid.
+        let managed = tempfile::tempdir().expect("managed tempdir");
+        let real = managed.path().join(format!("{}.toml", "m".repeat(240)));
+        std::fs::write(&real, "[api]\nmodel = \"old\"\n").expect("managed file");
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::os::unix::fs::symlink(&real, dir.path().join("config.toml")).expect("symlink");
+
+        let mut config = DchConfig::default();
+        config.api.model = "new".to_string();
+        config
+            .save_to_dir(dir.path())
+            .expect("the save lands beside a long managed name");
+        let saved = std::fs::read_to_string(&real).expect("the managed file");
+        assert!(
+            saved.contains("\"new\""),
+            "the managed copy changed: {saved}"
+        );
+    }
+
+    #[test]
     fn a_staging_name_carries_a_nonce_no_stray_can_be_planted_without() {
         // A stray left by a crashed, pid-reusing predecessor sits at the
         // pid-and-sequence name with no nonce; whatever sequence this
         // process draws, the nonce keeps the fresh save's name its own.
-        let target = Path::new("/home/reader/.dch/config.toml");
         for sequence in 0..64_u64 {
-            let stray = format!(".config.toml.{}.{}.tmp", std::process::id(), sequence);
+            let stray = format!(".dch-save.{}.{}.tmp", std::process::id(), sequence);
             assert_ne!(
-                DchConfig::staging_name(target, sequence, 1_728_000_000_000_000_000_u64),
+                DchConfig::staging_name(sequence, 1_728_000_000_000_000_000_u64),
                 stray,
                 "sequence {sequence}: the fresh name is not the stray's"
             );
         }
-        assert!(
-            DchConfig::staging_name(target, 7, 9).starts_with(".config.toml."),
-            "the name stays a hidden sibling of the target"
-        );
     }
 
     #[test]
@@ -531,7 +568,7 @@ mod save_roundtrip {
         let dir = tempfile::tempdir().expect("tempdir");
         let stray = dir
             .path()
-            .join(format!(".config.toml.{}.0.tmp", std::process::id()));
+            .join(format!(".dch-save.{}.0.tmp", std::process::id()));
         std::fs::write(&stray, "half a document from a crashed process").expect("stray");
 
         let mut config = DchConfig::default();
