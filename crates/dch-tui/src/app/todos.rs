@@ -45,14 +45,20 @@ impl TuiApp {
         let line = view
             .skip
             .saturating_add(usize::from(row.saturating_sub(view.area.y)));
-        let call_id = self
-            .bake
-            .tool_summary_lines
-            .get(&line)
-            .or_else(|| self.tools.tool_running_lines.get(&line))
-            .cloned()
+        let baked = self.bake.tool_summary_lines.get(&line).cloned();
+        let call_id = baked
+            .clone()
+            .or_else(|| self.tools.tool_running_lines.get(&line).cloned())
             .unwrap_or_default();
         if call_id.is_empty() {
+            return false;
+        }
+        // A baked block whose detail the cap retired still registers its
+        // plain summary rows — the settle measures the block by them — but
+        // no press resolves there: nothing backs a toggle. A running call
+        // toggles before any detail is retained, so the check is the baked
+        // rows' alone.
+        if baked.is_some() && !self.tools.tool_details.contains_key(&call_id) {
             return false;
         }
         let expanding = !self.expansion.expanded_tools.remove(&call_id);
@@ -61,8 +67,10 @@ impl TuiApp {
         }
         if self.tools.tool_details.contains_key(&call_id) {
             if expanding {
+                self.keep_the_seen_layout();
                 self.scroll.stick = Stick::Hold;
             }
+            self.note_call_reshape(&call_id);
             self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
             self.bake.rebake_whole();
             self.pointer.selection = None;
@@ -132,9 +140,11 @@ impl TuiApp {
         };
         let expanding = !self.expansion.expanded_thinking.remove(&key);
         if expanding {
-            self.expansion.expanded_thinking.insert(key);
+            self.expansion.expanded_thinking.insert(key.clone());
+            self.keep_the_seen_layout();
             self.scroll.stick = Stick::Hold;
         }
+        self.note_block_reshape(&key);
         self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
         self.bake.rebake_whole();
         self.pointer.selection = None;
@@ -225,9 +235,11 @@ impl TuiApp {
         };
         let expanding = !self.expansion.expanded_compactions.remove(&key);
         if expanding {
-            self.expansion.expanded_compactions.insert(key);
+            self.expansion.expanded_compactions.insert(key.clone());
+            self.keep_the_seen_layout();
             self.scroll.stick = Stick::Hold;
         }
+        self.note_block_reshape(&key);
         self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
         self.bake.rebake_whole();
         self.pointer.selection = None;
@@ -260,6 +272,7 @@ impl TuiApp {
             let folded = self.expansion.expanded_tools.remove(&id);
             self.expansion.auto_expanded_todo = None;
             if folded {
+                self.note_call_reshape(&id);
                 self.bake.conversation_generation =
                     self.bake.conversation_generation.saturating_add(1);
                 self.bake.rebake_whole();
@@ -358,6 +371,7 @@ impl TuiApp {
         {
             self.tools.tool_details.remove(&retired);
             if self.expansion.expanded_tools.remove(&retired) {
+                self.note_call_reshape(&retired);
                 self.bake.conversation_generation =
                     self.bake.conversation_generation.saturating_add(1);
                 self.bake.rebake_whole();

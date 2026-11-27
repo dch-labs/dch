@@ -41,9 +41,10 @@ pub(super) struct BakeOutputs {
 pub(super) struct BakeMeta {
     /// Row spans registered under their tool-call id.
     ///
-    /// Every row a foldable baked tool block produced maps to the
-    /// call it belongs to, so a press on any of them resolves the
-    /// toggle.
+    /// Every row a baked tool block produced maps to the call it belongs
+    /// to — an evicted block's plain summary rows too, so the settle
+    /// measures the block's whole change in length — and a press resolves
+    /// the toggle where retained detail backs it.
     pub(super) tool_summary_lines: HashMap<usize, String>,
 
     /// Row spans registered under their thinking section's key.
@@ -76,6 +77,27 @@ pub(super) struct BakeMeta {
     /// Whole-block ranges in bake-absolute rows, for the scroll's
     /// whole-or-nothing todo-block rule.
     pub(super) todo_block_ranges: Vec<std::ops::Range<usize>>,
+
+    /// Each baked message's row span, in bake-absolute rows.
+    ///
+    /// The scroll pin's identity is read against these: the message a
+    /// pinned row sits in survives a rewrap, where its row index does not.
+    pub(super) message_ranges: Vec<std::ops::Range<usize>>,
+
+    /// Per message, per rendering block, the row each of the block's
+    /// paragraph units opens at.
+    ///
+    /// A block is the whole of a user, system, error, or compaction
+    /// message, one content block of an assistant message, or its
+    /// trailing duration row; a unit is one appending group of the bake
+    /// within it: a source segment, a paragraph of a text, thinking, or
+    /// detail block. Bake-absolute rows, each block's first being the
+    /// block's own start. A rewrap moves the rows and keeps the blocks
+    /// and their paragraphs, so a pin named `(message, block, unit,
+    /// offset)` maps onto the same source line at any width — and a fold
+    /// that takes paragraphs from one block leaves every block after it
+    /// where it was, where a count of units across the message would not.
+    pub(super) message_units: Vec<Vec<Vec<usize>>>,
 }
 
 impl BakeMeta {
@@ -93,6 +115,8 @@ impl BakeMeta {
         self.user_turn_ranges.extend(pass.user_turn_ranges);
         self.user_prompt_marks.extend(pass.user_prompt_marks);
         self.todo_block_ranges.extend(pass.todo_block_ranges);
+        self.message_ranges.extend(pass.message_ranges);
+        self.message_units.extend(pass.message_units);
     }
 
     /// The frame's merged indexes: the baked prefix's plus the tail's,
@@ -136,6 +160,24 @@ impl BakeMeta {
             .todo_block_ranges
             .extend(tail.todo_block_ranges.into_iter().map(|range| {
                 range.start.saturating_add(tail_base)..range.end.saturating_add(tail_base)
+            }));
+        merged
+            .message_ranges
+            .extend(tail.message_ranges.into_iter().map(|range| {
+                range.start.saturating_add(tail_base)..range.end.saturating_add(tail_base)
+            }));
+        merged
+            .message_units
+            .extend(tail.message_units.into_iter().map(|blocks| {
+                blocks
+                    .into_iter()
+                    .map(|units| {
+                        units
+                            .into_iter()
+                            .map(|start| start.saturating_add(tail_base))
+                            .collect()
+                    })
+                    .collect()
             }));
         merged
     }
@@ -230,8 +272,10 @@ pub(super) struct LaneCaches {
 /// itself only grows, appending each message's rendered rows once a
 /// newer message follows. The indexes the frame's merged view
 /// carries — tool rows, thinking sections, compaction notices,
-/// user-turn spans, prompt marks, todo blocks — are rebuilt from the
-/// bake's metadata and the tail's on every frame that draws.
+/// user-turn spans, prompt marks, todo blocks, and the message ranges
+/// with their rendering units that the scroll pin's identity reads —
+/// are rebuilt from the bake's metadata and the tail's on every frame
+/// that draws.
 pub(super) struct TranscriptBake {
     /// Rendered lines of the settled conversation.
     ///
@@ -333,9 +377,10 @@ pub(super) struct TranscriptBake {
 
     /// Conversation line index to call id, for tool block rows.
     ///
-    /// The click targets: every line of each completed block that
-    /// has retained detail — summary and expansion alike, so a
-    /// click anywhere on an open block folds it. Rebuilt with the
+    /// The click targets: every line of each completed block — an
+    /// evicted block's plain summary rows included, so the settle
+    /// measures it — with a press resolving the toggle where retained
+    /// detail backs it, on summary and expansion alike. Rebuilt with the
     /// conversation cache.
     pub(super) tool_summary_lines: HashMap<usize, String>,
 
@@ -347,6 +392,26 @@ pub(super) struct TranscriptBake {
     /// the plan badge's standing fraction reads as a count the frame
     /// does not carry. Indexes are cache lines, rebuilt with the cache.
     pub(super) todo_block_ranges: Vec<std::ops::Range<usize>>,
+
+    /// Each message's row span in the merged cache.
+    ///
+    /// The baked prefix's spans plus the tail's rebased past the prefix's
+    /// rows, one per message in conversation order, so a pinned row
+    /// resolves to the message it sits in. The scroll pin's identity is
+    /// read against these — a rewrap keeps the messages and moves only
+    /// their rows. Indexes are cache lines, rebuilt with the cache.
+    pub(super) message_ranges: Vec<std::ops::Range<usize>>,
+
+    /// Per message, per rendering block, the row each of the block's
+    /// paragraph units opens at, merged over the whole cache.
+    ///
+    /// The tail's unit starts rebased beside the prefix's, in cache lines
+    /// rebuilt with the cache; a block's first start is its own first
+    /// row. Beside the message ranges these place the scroll pin's
+    /// `(message, block, unit, offset)` identity, which a rewrap carries
+    /// onto the same source line at any width. A block and a unit are
+    /// appending groups of the bake — see [`BakeMeta::message_units`].
+    pub(super) message_units: Vec<Vec<Vec<usize>>>,
 }
 
 impl Default for TranscriptBake {
@@ -366,6 +431,8 @@ impl Default for TranscriptBake {
             compaction_summary_lines: HashMap::new(),
             tool_summary_lines: HashMap::new(),
             todo_block_ranges: Vec::new(),
+            message_ranges: Vec::new(),
+            message_units: Vec::new(),
         }
     }
 }
@@ -808,7 +875,13 @@ mod tests {
     fn the_incremental_bake_matches_a_full_rebuild() {
         // The optimization may not change what the reader sees: the
         // incrementally baked cache and a from-scratch rebuild of the
-        // same conversation render identical lines.
+        // same conversation render identical lines, indexes included.
+        // The first two messages bake into the prefix under a frame, and
+        // the third then lands as the tail: the incremental path extends
+        // an existing bake, so the prefix's handshake
+        // (`BakeMeta::adopt`) has to keep the earlier entries and rebase
+        // the new ones onto them — an adopt that replaced them would
+        // pass a test that never drew before the last message.
         let mut subject = TuiApp::new(dch_config::DchConfig::default());
         let now = chrono::Utc::now();
         subject.push_message(TuiMessage::User {
@@ -835,14 +908,15 @@ mod tests {
             timestamp: now,
             duration_ms: Some(1200),
         });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
         subject.push_message(TuiMessage::User {
             text: "again".to_string(),
             timestamp: now,
             steered: false,
             unsent: false,
         });
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| subject.render(frame)).unwrap();
         let incremental = subject.bake.conversation_cache.clone();
         let incremental_meta = (
@@ -852,6 +926,8 @@ mod tests {
             subject.bake.thinking_summary_lines.clone(),
             subject.bake.compaction_summary_lines.clone(),
             subject.bake.todo_block_ranges.clone(),
+            subject.bake.message_ranges.clone(),
+            subject.bake.message_units.clone(),
         );
         // Force a whole-transcript rebake through the invalidation the
         // re-shaping paths use — no baked prefix, no baked metadata —
@@ -874,6 +950,8 @@ mod tests {
             subject.bake.thinking_summary_lines.clone(),
             subject.bake.compaction_summary_lines.clone(),
             subject.bake.todo_block_ranges.clone(),
+            subject.bake.message_ranges.clone(),
+            subject.bake.message_units.clone(),
         );
         assert_eq!(
             incremental_meta, full_meta,

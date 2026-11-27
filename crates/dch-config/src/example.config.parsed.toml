@@ -1,0 +1,53 @@
+models = []
+
+[api]
+model = "qwen3.8:27b"
+base_url = ""
+api_type = "ollama"
+max_tokens = 32000
+request_timeout_secs = 120
+prompt_cache = true
+
+[display]
+no_color = false
+verbosity = "normal"
+theme = "default"
+strip_position = "composer"
+strip_style = "breathe"
+path_style = "full"
+splash_colors = "auto"
+mouse_capture = true
+caret_display = "blink"
+diff_layout = "inline"
+diff_palette = "classic"
+
+[runner]
+max_turns = 200
+turn_timeout_secs = 300
+rate_limit_delay_secs = 15
+auto_compact = true
+compact_threshold = 80
+compactor = "qa"
+permission_mode = "auto"
+parallel_tool_dispatch = true
+role = "general"
+role_overrides = []
+unsafe_paths = false
+read_max_lines = 1200
+read_max_bytes = 49152
+max_tool_output_chars = 65536
+
+[project]
+techs = []
+
+[telemetry]
+level = "info"
+json_logs = false
+
+[security]
+redact_secrets = true
+
+[mcp]
+servers = []
+
+[permissions]

@@ -1,8 +1,8 @@
 //! Context windows for the models whose provider publishes none.
 //!
 //! The live probe asks the session's own server; the cloud providers
-//! answer neither question — their model listings carry ids and dates
-//! and nothing else — so a session on one of them lands on the
+//! answer none of the questions — their model listings carry ids and
+//! dates and nothing else — so a session on one of them lands on the
 //! fallback window unless someone states a number. This table is the
 //! someone: the documented windows of the models providers describe in
 //! prose and refuse to describe on the wire. It is consulted only
@@ -30,6 +30,8 @@ const KNOWN_WINDOWS: &[(&str, u64)] = &[
     // https://docs.z.ai/guides/vlm/glm-5.3-flash
     ("glm-5.3-flash", 1_000_000),
     ("glm-5.3-flashx", 1_000_000),
+    // https://docs.z.ai/guides/llm/glm-5.4
+    ("glm-5.4", 1_000_000),
 ];
 
 /// The documented window for `model`, if the table knows it.
