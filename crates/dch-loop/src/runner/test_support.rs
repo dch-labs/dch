@@ -592,6 +592,35 @@ pub(super) fn recorded_requests(server: &SseServer) -> Vec<String> {
     server.requests.lock().map_or_default(|reqs| reqs.clone())
 }
 
+/// The content of the tool result a recorded request replays for
+/// `call_id`.
+///
+/// Reads the request's JSON body and selects the message with the tool
+/// role and that `tool_call_id`, so a pin judges the result the model is
+/// fed for that one call; across the whole request a marker's presence
+/// or absence proves nothing, since the replayed tool call carries its
+/// own copy of the arguments.
+///
+/// Returns `None` when the request carries no such message.
+pub(super) fn tool_result_content(request: &str, call_id: &str) -> Option<String> {
+    let body = request.split("\r\n\r\n").nth(1)?;
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    parsed
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .find(|message| {
+            message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                && message
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(call_id)
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 /// The roles of every message in a recorded request whose text
 /// contains `needle`.
 ///

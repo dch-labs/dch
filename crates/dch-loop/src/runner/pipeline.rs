@@ -155,7 +155,7 @@ mod tests {
     use crate::runner::Runner;
     use crate::runner::test_support::{
         SseServer, recorded_requests, sample_context, sse_read_tool_call_turn, sse_text_turn,
-        sse_tool_call_turn, wire_config,
+        sse_tool_call_turn, tool_result_content, wire_config,
     };
     use dch_tools::builtin_registry;
     use loopctl::engine::BareLoop;
@@ -1031,10 +1031,18 @@ mod tests {
         // landed MultiEdit must refresh every touched file's baseline the
         // same way a landed Write does — otherwise the model's own batch
         // registers as an external change against its follow-up write.
+        // Both files are read first, so each holds a baseline for the
+        // batch to refresh; a batch that left them stale would hold every
+        // follow-up write.
         let dir = TempDir::new().expect("tempdir");
         std::fs::write(dir.path().join("a.txt"), "alpha\n").expect("seed a");
         std::fs::write(dir.path().join("b.txt"), "beta\n").expect("seed b");
         let pipeline = fs_pipeline(dir.path(), false);
+
+        for file in ["a.txt", "b.txt"] {
+            let read = drive(&pipeline, "Read", serde_json::json!({"path": file})).await;
+            assert!(!read.is_error, "the read of {file} lands: {}", read.output);
+        }
 
         let batch = drive(
             &pipeline,
@@ -1047,24 +1055,40 @@ mod tests {
             }),
         )
         .await;
-        assert!(!batch.is_error, "{}", batch.output);
-
-        let follow_up = drive(
-            &pipeline,
-            "Write",
-            serde_json::json!({"file_path": "b.txt", "content": "rewritten\n"}),
-        )
-        .await;
         assert!(
-            !follow_up.is_error,
-            "the model's own batch must not read as an external change: {}",
-            follow_up.output
+            !batch.is_error,
+            "the batch lands against the read baselines: {}",
+            batch.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap_or_default(),
+            "ALPHA\n",
+            "the batch changed a.txt"
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("b.txt")).unwrap_or_default(),
-            "rewritten\n",
-            "the follow-up write lands its content"
+            "BETA\n",
+            "the batch changed b.txt"
         );
+
+        for (file, content) in [("a.txt", "rewritten a\n"), ("b.txt", "rewritten b\n")] {
+            let follow_up = drive(
+                &pipeline,
+                "Write",
+                serde_json::json!({"file_path": file, "content": content}),
+            )
+            .await;
+            assert!(
+                !follow_up.is_error,
+                "the model's own batch must not read as an external change against {file}: {}",
+                follow_up.output
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(file)).unwrap_or_default(),
+                content,
+                "the follow-up write to {file} lands its content"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2086,8 +2110,14 @@ mod tests {
         assert_eq!(run.output.as_deref(), Some("done"));
         let requests = recorded_requests(&server);
         assert!(
-            requests.len() >= 2 && requests[1].contains("[REDACTED:"),
-            "the tool result fed back to the model must be scrubbed: {requests:?}"
+            requests.len() >= 2,
+            "the follow-up request replays the conversation: {requests:?}"
+        );
+        let result = tool_result_content(&requests[1], "call_1")
+            .expect("the follow-up request replays the tool result by its call id");
+        assert!(
+            result.contains("[REDACTED:") && !result.contains(leak),
+            "the tool result fed back to the model is scrubbed, the token gone from it: {result:?}"
         );
     }
 
@@ -2116,8 +2146,14 @@ mod tests {
         assert_eq!(run.output.as_deref(), Some("done"));
         let requests = recorded_requests(&server);
         assert!(
-            requests.len() >= 2 && !requests[1].contains("[REDACTED:"),
-            "with redaction off the result must pass through unscrubbed: {requests:?}"
+            requests.len() >= 2,
+            "the follow-up request replays the conversation: {requests:?}"
+        );
+        let result = tool_result_content(&requests[1], "call_1")
+            .expect("the follow-up request replays the tool result by its call id");
+        assert!(
+            result.contains(leak) && !result.contains("[REDACTED:"),
+            "with redaction off the result passes through verbatim, the token in it: {result:?}"
         );
     }
 

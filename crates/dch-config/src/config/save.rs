@@ -120,7 +120,8 @@ impl DchConfig {
         )
     }
 
-    /// A time-based nonce for the staging name.
+    /// A time-based nonce for the staging name: the clock's nanoseconds
+    /// since the epoch, read now.
     ///
     /// The pid and the per-process sequence alone collide with a stray
     /// left by an earlier process whose pid a container reuses — every
@@ -128,8 +129,18 @@ impl DchConfig {
     /// nonce makes the name unique across process generations, so a
     /// stale `.tmp` can never refuse a successor's first save.
     fn staging_nonce() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        Self::nonce_at(std::time::SystemTime::now())
+    }
+
+    /// The nonce for one reading of the clock: its nanoseconds since the
+    /// Unix epoch.
+    ///
+    /// A reading before the epoch is `0`, and a count past what a `u64`
+    /// holds saturates at [`u64::MAX`], so every clock yields a nonce
+    /// and the mapping never fails; two readings map in the clock's own
+    /// order.
+    fn nonce_at(now: std::time::SystemTime) -> u64 {
+        now.duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| {
                 u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
             })
@@ -544,17 +555,45 @@ mod save_roundtrip {
     }
 
     #[test]
-    fn the_staging_nonce_advances_with_the_clock() {
+    fn the_staging_nonce_is_the_clock_s_nanoseconds_since_the_epoch() {
         // The nonce is the one component of the staging name a crashed,
         // pid-reusing predecessor cannot have written, and it is worth
-        // that only if it moves: two readings a beat apart differ, the
-        // later the greater.
-        let first = DchConfig::staging_nonce();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = DchConfig::staging_nonce();
+        // that only if it follows the clock: the conversion is pinned on
+        // controlled readings.
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+        assert_eq!(DchConfig::nonce_at(UNIX_EPOCH), 0, "the epoch itself");
+        assert_eq!(
+            DchConfig::nonce_at(UNIX_EPOCH + Duration::from_nanos(1)),
+            1,
+            "one nanosecond past it"
+        );
+        assert_eq!(
+            DchConfig::nonce_at(UNIX_EPOCH + Duration::from_secs(5)),
+            5_000_000_000,
+            "whole seconds map whole"
+        );
+        assert_eq!(
+            DchConfig::nonce_at(
+                UNIX_EPOCH
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("a pre-epoch reading")
+            ),
+            0,
+            "a reading before the epoch is the floor"
+        );
+        // u64::MAX nanoseconds is about 584 years; one second past that
+        // count is still a clock reading the system can hold.
+        assert_eq!(
+            DchConfig::nonce_at(UNIX_EPOCH + Duration::from_secs(u64::MAX / 1_000_000_000 + 1)),
+            u64::MAX,
+            "a nanosecond count past the u64 range saturates"
+        );
+        let earlier = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let later = earlier + Duration::from_millis(1);
         assert!(
-            second > first,
-            "a later reading of the clock is the greater nonce: {first} then {second}"
+            DchConfig::nonce_at(later) > DchConfig::nonce_at(earlier),
+            "two controlled readings map in the clock's own order"
         );
     }
 

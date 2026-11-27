@@ -5,6 +5,7 @@
 //! permission mode, and tool ceilings; [`Role`] with its prose bodies
 //! is the `role` knob's vocabulary.
 
+use crate::DchConfigError;
 use crate::PermissionMode;
 
 /// Which role the agent takes on — *who* it acts as for this session.
@@ -547,6 +548,39 @@ const DEFAULT_READ_MAX_BYTES: usize = 49_152;
 /// legitimate documentation read lands whole, small enough that one flooded
 /// call cannot spend a model's whole conversation.
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 65_536;
+
+/// The range check on `repetition_min_period_bytes`, shared by the
+/// loader and the runner's builder.
+///
+/// `0` disarms the guard and stands. Any other value must sit within the
+/// library's window — at or above its period floor, since four copies of
+/// a shorter window fit inside ordinary text and the guard would abort
+/// legitimate generation, and at or below its period cap, since the
+/// guard never scans a window that long and would silently never fire.
+///
+/// # Errors
+///
+/// Returns [`DchConfigError::Invalid`] naming the value and the bound it
+/// violates.
+pub fn check_repetition_min_period_bytes(period: usize) -> Result<(), DchConfigError> {
+    let library = loopctl::stream::repetition::RepetitionGuardConfig::default();
+    if period != 0 && period < library.min_period_bytes {
+        return Err(DchConfigError::Invalid(format!(
+            "repetition_min_period_bytes = {period} is below the library's {}-byte floor (0 disarms the \
+             guard): four copies of a shorter window fit inside ordinary text, so the guard would abort \
+             legitimate generation",
+            library.min_period_bytes
+        )));
+    }
+    if period > library.max_period_bytes {
+        return Err(DchConfigError::Invalid(format!(
+            "repetition_min_period_bytes = {period} is above the library's {}-byte period cap: the guard \
+             never scans a window that long, so it would silently never fire — disarm it with 0 instead",
+            library.max_period_bytes
+        )));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

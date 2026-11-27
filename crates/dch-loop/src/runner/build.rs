@@ -424,6 +424,14 @@ impl RunnerBuilder<'_> {
     ///   `[[mcp.servers]]` entry fails to spawn or handshake, or the dispatch
     ///   pipeline cannot be built.
     pub async fn build(self) -> Result<Runner, RunnerError> {
+        // Judged first, before a client is built or a server dialled: a
+        // config assembled in code never passed through the loader's
+        // validation, and the guard would otherwise be armed outside the
+        // library's window without a word.
+        dch_config::check_repetition_min_period_bytes(
+            self.config.runner.repetition_min_period_bytes,
+        )
+        .map_err(|err| RunnerError::Config(err.to_string()))?;
         let context = Arc::new(
             RunnerContext::new(self.workdir.clone())
                 .with_resolve_policy(resolve_policy_for(&self.config.runner)),
@@ -1826,11 +1834,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_explicit_window_beats_the_probe() {
-        let server = SseServer::start(vec![
-            r#"{"n_ctx": 262144, "total_slots": 4}"#.to_string(),
-            sse_text_turn("answer"),
-        ])
-        .await;
+        // An explicit window skips discovery altogether: the builder asks
+        // nothing, and the run's completion is the server's first and only
+        // request, answered with the turn the script holds for it.
+        let server = SseServer::start(vec![sse_text_turn("answer")]).await;
         let dir = TempDir::new().expect("tempdir");
         let mut config = wire_config(server.port, 7);
         config.api.context_window = Some(90_000);
@@ -1843,10 +1850,67 @@ mod tests {
             90_000,
             "a deliberate config override wins over discovery"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+        assert!(
+            recorded_requests(&server).is_empty(),
+            "an explicit window skips discovery: the builder asked nothing: {:?}",
+            recorded_requests(&server)
+        );
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
             .await
             .expect("run completes")
             .expect("run succeeds");
+        assert_eq!(
+            run.output.as_deref(),
+            Some("answer"),
+            "the run's answer arrives"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            1,
+            "the run's completion is the one request: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repetition_floor_outside_the_library_range_refuses_the_build() {
+        // A config assembled in code never passed through the loader's
+        // validation, so the builder judges the floor itself, first of
+        // all: 0 disarms the guard and stands; any other value must sit
+        // within the library's window, and a refusal dials nothing.
+        let server = SseServer::start(Vec::new()).await;
+        let dir = TempDir::new().expect("tempdir");
+        for (period, bound) in [(47_usize, "48-byte floor"), (4_097, "4096-byte period cap")] {
+            let mut config = wire_config(server.port, 7);
+            config.api.context_window = Some(90_000);
+            config.runner.repetition_min_period_bytes = period;
+            let err = Runner::builder(&config, dir.path())
+                .build()
+                .await
+                .err()
+                .expect("a floor outside the library's range refuses the build");
+            assert!(
+                matches!(
+                    &err,
+                    RunnerError::Config(message)
+                        if message.contains(&format!("repetition_min_period_bytes = {period}"))
+                            && message.contains(bound)
+                ),
+                "the refusal names the value and the bound: {err:?}"
+            );
+        }
+        let mut config = wire_config(server.port, 7);
+        config.api.context_window = Some(90_000);
+        config.runner.repetition_min_period_bytes = 0;
+        Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("0 disarms the guard and builds");
+        assert!(
+            recorded_requests(&server).is_empty(),
+            "no request was made for any of these builds: {:?}",
+            recorded_requests(&server)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
