@@ -544,16 +544,39 @@ mod save_roundtrip {
     }
 
     #[test]
-    fn a_staging_name_carries_a_nonce_no_stray_can_be_planted_without() {
+    fn the_staging_nonce_advances_with_the_clock() {
+        // The nonce is the one component of the staging name a crashed,
+        // pid-reusing predecessor cannot have written, and it is worth
+        // that only if it moves: two readings a beat apart differ, the
+        // later the greater.
+        let first = DchConfig::staging_nonce();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = DchConfig::staging_nonce();
+        assert!(
+            second > first,
+            "a later reading of the clock is the greater nonce: {first} then {second}"
+        );
+    }
+
+    #[test]
+    fn a_staging_name_carries_the_nonce_in_its_name() {
         // A stray left by a crashed, pid-reusing predecessor sits at the
-        // pid-and-sequence name with no nonce; whatever sequence this
-        // process draws, the nonce keeps the fresh save's name its own.
+        // pid-and-sequence name, and whatever sequence this process
+        // draws, the nonce is what keeps the fresh save's name its own:
+        // the nonce is part of the name, not beside it, so two nonces
+        // give two names for one sequence — and neither is the stray's.
+        // That the nonce moves between readings is its own test.
         for sequence in 0..64_u64 {
             let stray = format!(".dch-save.{}.{}.tmp", std::process::id(), sequence);
+            let named = DchConfig::staging_name(sequence, 1);
             assert_ne!(
-                DchConfig::staging_name(sequence, 1_728_000_000_000_000_000_u64),
-                stray,
+                named, stray,
                 "sequence {sequence}: the fresh name is not the stray's"
+            );
+            assert_ne!(
+                named,
+                DchConfig::staging_name(sequence, 2),
+                "sequence {sequence}: a different nonce is a different name"
             );
         }
     }
@@ -561,10 +584,11 @@ mod save_roundtrip {
     #[test]
     fn a_stray_staging_file_cannot_wedge_a_later_save() {
         // The pid-and-sequence name alone collides with a stray left by
-        // a crashed process whose pid a container reuses: the successor
-        // creates `create_new` and fails AlreadyExists forever. The
-        // nonce makes the fresh save's staging name its own, so the
-        // stray sits untouched beside a save that lands anyway.
+        // a crashed process whose pid a container reuses: the successor's
+        // first save would draw the same name and fail AlreadyExists.
+        // The nonce keeps the fresh save's name its own (the name test
+        // above pins that half); this is the other half — the stray
+        // stands untouched beside a save that lands.
         let dir = tempfile::tempdir().expect("tempdir");
         let stray = dir
             .path()

@@ -25,6 +25,7 @@ diff_palette = "classic"
 max_turns = 200
 turn_timeout_secs = 300
 rate_limit_delay_secs = 15
+repetition_min_period_bytes = 384
 auto_compact = true
 compact_threshold = 80
 compactor = "qa"

@@ -1,18 +1,16 @@
 //! The Unrestricted resolve policy's first-write cell, at the dch level.
 //!
-//! Every other write-guard pin builds its `FileSession` with the default
-//! `Contained` policy, so the two steps `Unrestricted` takes on the way
-//! to a write — creating the parent directory itself, and keying the
-//! baseline on the canonicalized physical file — were pinned only inside
-//! the dependency. Driven here through the production registry: a nested
-//! first write through a symlinked directory lands, a read through the
-//! physical spelling arms the same baseline, an external change made
-//! behind one spelling is seen from the other, and a re-read through one
+//! Driven through the production registry with a `FileSession` built
+//! under `Unrestricted`: a nested first write through a symlinked
+//! directory creates the parent and lands, a read through the physical
+//! spelling arms the same baseline, an external change made behind one
+//! spelling refuses a write through the other, and a re-read through one
 //! spelling clears the other's write — the step that tells one shared
-//! key apart from a key per spelling. (`Contained` creates a
-//! missing parent too, through its own descriptor-pinned walk, so parent
-//! creation is not the contrast between the policies; the canonical key
-//! is — under `Contained` the two spellings are two baselines.)
+//! canonical key apart from a key per spelling, the contrast with
+//! `Contained`, under which the two spellings are two baselines.
+//! (`Contained` creates a missing parent too, through its own
+//! descriptor-pinned walk, so parent creation is not the contrast
+//! between the policies.)
 
 #![allow(
     clippy::expect_used,
@@ -161,9 +159,9 @@ async fn an_unrestricted_first_write_creates_the_parent_and_keys_its_baseline_ca
         "v2"
     );
 
-    // the last read through the physical spelling, the change made behind
-    // it, and the write through the link: only the shared canonical key
-    // lets the link's write see the physical read's baseline
+    // A change made behind the physical spelling refuses the write through
+    // the link — under either keying, since the link's own baseline is as
+    // stale as the shared one
     let reread = read(&pipeline, &session, dir.path(), "real/deep/nested.txt").await;
     assert!(!reread.is_error, "{}", reread.output);
     std::fs::write(&physical, "external").expect("an external change behind the physical path");

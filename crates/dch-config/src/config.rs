@@ -314,7 +314,8 @@ impl DchConfig {
     /// # Errors
     ///
     /// Returns [`DchConfigError::Invalid`] when a runner value sits below
-    /// the floor its consumer enforces, when the read ceiling exceeds the
+    /// the floor its consumer enforces or outside the repetition guard's
+    /// scannable range, when the read ceiling exceeds the
     /// dispatch output cap, when `reasoning_effort` is not a rung of the
     /// ladder, when a model entry names no model or repeats a name
     /// ([`validate_models`](Self::validate_models)), or when a permission
@@ -335,6 +336,23 @@ impl DchConfig {
                  would retry a throttled endpoint immediately, before the burst the \
                  provider is throttling has begun to clear",
                 self.runner.rate_limit_delay_secs
+            )));
+        }
+        let period = self.runner.repetition_min_period_bytes;
+        let library = loopctl::stream::repetition::RepetitionGuardConfig::default();
+        if period != 0 && period < library.min_period_bytes {
+            return Err(DchConfigError::Invalid(format!(
+                "repetition_min_period_bytes = {period} is below the library's {}-byte floor (0 disarms the \
+                 guard): four copies of a shorter window fit inside ordinary text, so the guard would abort \
+                 legitimate generation",
+                library.min_period_bytes
+            )));
+        }
+        if period > library.max_period_bytes {
+            return Err(DchConfigError::Invalid(format!(
+                "repetition_min_period_bytes = {period} is above the library's {}-byte period cap: the guard \
+                 never scans a window that long, so it would silently never fire — disarm it with 0 instead",
+                library.max_period_bytes
             )));
         }
         let cap = self.runner.max_tool_output_chars;
