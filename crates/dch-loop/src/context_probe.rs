@@ -106,12 +106,12 @@ async fn probe_within(
 /// effective endpoint root, whose trailing `/v1` is stripped to reach
 /// the server itself. The order: the capability document, the model's
 /// pinned context, the running models' served context, the model
-/// listing, and last the model's ceiling bounding the window `config`
-/// would otherwise assume — [`FALLBACK_CONTEXT_WINDOW`] when it states
-/// none — bounds that window from above when it sits below it; a ceiling
-/// at or above it is no answer, since it narrows nothing and a discovery
-/// would claim a number the caller supplied itself. Returns `None` when
-/// no question has an answer.
+/// listing, and last the model's training ceiling, which bounds from
+/// above the window `config` would otherwise assume —
+/// [`FALLBACK_CONTEXT_WINDOW`] when it states none. A ceiling below
+/// that window is the answer; one at or above it is no answer, since it
+/// narrows nothing and a discovery would claim a number the caller
+/// supplied itself. Returns `None` when no question has an answer.
 async fn ask_in_order(config: &ApiConfig, base_url: &str, model: &str) -> Option<u64> {
     if !matches!(
         config.api_type,
@@ -981,8 +981,7 @@ mod tests {
         assert_eq!(
             discover_window(&config, &client).await,
             Some(1_000_000),
-            "the table answers for a provider that publishes nothing, \
-             unscaled - this family reports usage and calibrates"
+            "the table answers whole for a provider that publishes nothing"
         );
         // The table's answer rides whole for the usage-less family
         // too: the figure is the model's documented window, honest as
@@ -1018,8 +1017,7 @@ mod tests {
         assert_eq!(
             discover_window(&config, &client).await,
             Some(16_384),
-            "the live server's answer outranks the table's, unscaled - \
-             this family reports usage and calibrates"
+            "the live server's answer outranks the table's, and rides whole"
         );
     }
 
@@ -1279,10 +1277,9 @@ mod tests {
     }
     /// Bind an ephemeral port and never accept a connection on it: the
     /// dead-tunnel shape, where every question connects and then waits.
+    /// The listener is the caller's to keep alive for the probe's run.
     fn bind_silent() -> std::net::TcpListener {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
-        std::thread::spawn(|| std::thread::sleep(Duration::from_secs(30)));
-        listener
+        std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind")
     }
 
     #[tokio::test]

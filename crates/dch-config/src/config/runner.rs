@@ -5,6 +5,7 @@
 //! permission mode, and tool ceilings; [`Role`] with its prose bodies
 //! is the `role` knob's vocabulary.
 
+use crate::DchConfigError;
 use crate::PermissionMode;
 
 /// Which role the agent takes on — *who* it acts as for this session.
@@ -326,6 +327,23 @@ pub struct RunnerConfig {
     /// `[runner] rate_limit_delay_secs`.
     pub rate_limit_delay_secs: u64,
 
+    /// Smallest byte window the repetition guard treats as a loop period.
+    ///
+    /// The stream repetition guard aborts a model call whose text ends in
+    /// one byte window repeated verbatim four times running. The library
+    /// floors the window at 48 bytes, and a byte-level window cannot tell
+    /// the horizontal border of an ASCII-art box from a loop: the border
+    /// is one character repeated, a box-drawing horizontal is three bytes
+    /// in UTF-8, and sixty-four of them are exactly four 48-byte windows.
+    /// The default floors the window at 384 bytes instead: four windows
+    /// hold 512 such characters, so a border would have to be 512 wide to
+    /// trip, while a genuine stanza loop still trips, after about 1.5
+    /// `KiB` of output rather than 192 bytes. `0` disarms the guard; any
+    /// other value below the library's 48-byte floor or above its
+    /// 4096-byte period cap fails the load. Defaults to `384`. Loaded from
+    /// `[runner] repetition_min_period_bytes`.
+    pub repetition_min_period_bytes: usize,
+
     /// Whether to auto-compact the conversation when it grows large.
     ///
     /// When true, the session compacts itself once it crosses
@@ -490,6 +508,7 @@ impl Default for RunnerConfig {
             max_turns: 200,
             turn_timeout_secs: 300,
             rate_limit_delay_secs: 15,
+            repetition_min_period_bytes: 384,
             auto_compact: true,
             compact_threshold: 80,
             compactor: CompactorSelection::Qa,
@@ -529,6 +548,39 @@ const DEFAULT_READ_MAX_BYTES: usize = 49_152;
 /// legitimate documentation read lands whole, small enough that one flooded
 /// call cannot spend a model's whole conversation.
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 65_536;
+
+/// The range check on `repetition_min_period_bytes`, shared by the
+/// loader and the runner's builder.
+///
+/// `0` disarms the guard and stands. Any other value must sit within the
+/// library's window — at or above its period floor, since four copies of
+/// a shorter window fit inside ordinary text and the guard would abort
+/// legitimate generation, and at or below its period cap, since the
+/// guard never scans a window that long and would silently never fire.
+///
+/// # Errors
+///
+/// Returns [`DchConfigError::Invalid`] naming the value and the bound it
+/// violates.
+pub fn check_repetition_min_period_bytes(period: usize) -> Result<(), DchConfigError> {
+    let library = loopctl::stream::repetition::RepetitionGuardConfig::default();
+    if period != 0 && period < library.min_period_bytes {
+        return Err(DchConfigError::Invalid(format!(
+            "repetition_min_period_bytes = {period} is below the library's {}-byte floor (0 disarms the \
+             guard): four copies of a shorter window fit inside ordinary text, so the guard would abort \
+             legitimate generation",
+            library.min_period_bytes
+        )));
+    }
+    if period > library.max_period_bytes {
+        return Err(DchConfigError::Invalid(format!(
+            "repetition_min_period_bytes = {period} is above the library's {}-byte period cap: the guard \
+             never scans a window that long, so it would silently never fire — disarm it with 0 instead",
+            library.max_period_bytes
+        )));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -582,6 +634,80 @@ mod tests {
         assert_eq!(
             config.runner.rate_limit_delay_secs, 30,
             "a tuned floor loads verbatim — the knob the quota window asks for"
+        );
+    }
+
+    #[test]
+    fn the_default_repetition_floor_is_well_above_an_ascii_art_border() {
+        // Sixty-four box-drawing horizontals are 192 bytes — four of the
+        // library's 48-byte windows — so the library floor reads a border
+        // as a loop; four default dch windows hold 512 such glyphs.
+        assert_eq!(
+            DchConfig::default().runner.repetition_min_period_bytes,
+            384,
+            "the default floor is 384 bytes"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_a_repetition_floor_below_the_library_minimum() {
+        let err =
+            DchConfig::from_toml_str("[runner]\nrepetition_min_period_bytes = 47\n").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DchConfigError::Invalid(message)
+                    if message.contains("repetition_min_period_bytes = 47")
+                        && message.contains("48-byte floor")
+            ),
+            "the rejection names the value and the floor: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_a_repetition_floor_above_the_period_cap() {
+        let err =
+            DchConfig::from_toml_str("[runner]\nrepetition_min_period_bytes = 4097\n").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DchConfigError::Invalid(message)
+                    if message.contains("repetition_min_period_bytes = 4097")
+                        && message.contains("4096-byte period cap")
+            ),
+            "the rejection names the value and the cap: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_loads_the_repetition_floor_at_either_bound() {
+        // The library's own floor and cap are accepted values: a host
+        // asking for the library default on purpose gets it, and so does
+        // one asking for the widest window the guard ever scans.
+        let config =
+            DchConfig::from_toml_str("[runner]\nrepetition_min_period_bytes = 48\n").unwrap();
+        assert_eq!(
+            config.runner.repetition_min_period_bytes, 48,
+            "the library floor loads verbatim"
+        );
+        let config =
+            DchConfig::from_toml_str("[runner]\nrepetition_min_period_bytes = 4096\n").unwrap();
+        assert_eq!(
+            config.runner.repetition_min_period_bytes, 4096,
+            "the period cap loads verbatim"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_loads_zero_as_a_disarmed_guard() {
+        // Zero is the documented disarm value, not a below-floor mistake:
+        // the loader passes it through and the runner maps it to a
+        // disarmed guard.
+        let config =
+            DchConfig::from_toml_str("[runner]\nrepetition_min_period_bytes = 0\n").unwrap();
+        assert_eq!(
+            config.runner.repetition_min_period_bytes, 0,
+            "the disarm value loads verbatim"
         );
     }
 

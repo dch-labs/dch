@@ -2920,12 +2920,6 @@ impl TuiApp {
             }
             *previous_was_user = Some(is_user);
             let message_start = lines.len();
-            // One unit list per rendering block: the message itself for a
-            // user, system, error, or compaction message, one per content
-            // block and one for a trailing duration row for an assistant
-            // message. A pin's identity names a block and a paragraph within
-            // it, so a fold that takes paragraphs from one block leaves every
-            // block after it where it was.
             let mut block_units: Vec<Vec<usize>> = Vec::new();
             match message {
                 TuiMessage::User {

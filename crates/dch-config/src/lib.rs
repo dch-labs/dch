@@ -41,6 +41,7 @@ pub use self::config::permissions::{
 pub use self::config::project::{ProjectConfig, TechProfile};
 pub use self::config::runner::{
     CompactorSelection, Role, RoleOverride, RunnerConfig, TURN_TIMEOUT_FLOOR_SECS,
+    check_repetition_min_period_bytes,
 };
 pub use self::config::security::SecurityConfig;
 pub use self::config::telemetry::TelemetryConfig;

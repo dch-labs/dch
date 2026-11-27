@@ -314,7 +314,8 @@ impl DchConfig {
     /// # Errors
     ///
     /// Returns [`DchConfigError::Invalid`] when a runner value sits below
-    /// the floor its consumer enforces, when the read ceiling exceeds the
+    /// the floor its consumer enforces or outside the repetition guard's
+    /// scannable range, when the read ceiling exceeds the
     /// dispatch output cap, when `reasoning_effort` is not a rung of the
     /// ladder, when a model entry names no model or repeats a name
     /// ([`validate_models`](Self::validate_models)), or when a permission
@@ -337,6 +338,7 @@ impl DchConfig {
                 self.runner.rate_limit_delay_secs
             )));
         }
+        self::runner::check_repetition_min_period_bytes(self.runner.repetition_min_period_bytes)?;
         let cap = self.runner.max_tool_output_chars;
         if cap != 0 && self.runner.read_max_bytes > cap {
             return Err(DchConfigError::Invalid(format!(

@@ -31,6 +31,13 @@ impl TuiApp {
     /// renumbering mutation does; a running call's rows are
     /// rebuilt every frame and need no bump. Returns whether a
     /// tool row was hit at all.
+    ///
+    /// A baked block whose detail the detail cap retired still registers
+    /// its plain summary rows — the scroll's settle measures the block by
+    /// them — but nothing backs a toggle there, so a press on those rows
+    /// returns `false`. A running call is not subject to that rule: it
+    /// toggles before any detail is retained, so the retired-detail check
+    /// reads the baked rows alone.
     pub(crate) fn toggle_tool_at(&mut self, column: u16, row: u16) -> bool {
         let Some(view) = self.pointer.last_view else {
             return false;
@@ -53,11 +60,6 @@ impl TuiApp {
         if call_id.is_empty() {
             return false;
         }
-        // A baked block whose detail the cap retired still registers its
-        // plain summary rows — the settle measures the block by them — but
-        // no press resolves there: nothing backs a toggle. A running call
-        // toggles before any detail is retained, so the check is the baked
-        // rows' alone.
         if baked.is_some() && !self.tools.tool_details.contains_key(&call_id) {
             return false;
         }
