@@ -67,6 +67,7 @@ impl TuiApp {
         }
         if self.tools.tool_details.contains_key(&call_id) {
             if expanding {
+                self.keep_the_seen_layout();
                 self.scroll.stick = Stick::Hold;
             }
             self.note_call_reshape(&call_id);
@@ -140,6 +141,7 @@ impl TuiApp {
         let expanding = !self.expansion.expanded_thinking.remove(&key);
         if expanding {
             self.expansion.expanded_thinking.insert(key.clone());
+            self.keep_the_seen_layout();
             self.scroll.stick = Stick::Hold;
         }
         self.note_block_reshape(&key);
@@ -234,6 +236,7 @@ impl TuiApp {
         let expanding = !self.expansion.expanded_compactions.remove(&key);
         if expanding {
             self.expansion.expanded_compactions.insert(key.clone());
+            self.keep_the_seen_layout();
             self.scroll.stick = Stick::Hold;
         }
         self.note_block_reshape(&key);

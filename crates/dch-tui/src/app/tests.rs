@@ -6198,6 +6198,160 @@ fn a_notch_and_a_resize_in_one_frame_keep_the_requested_row_inside_its_unit() {
 }
 
 #[test]
+fn a_replaced_transcript_takes_the_scroll_s_layout_bound_state_with_it() {
+    // Detached, with a reshape note standing, an identity stored, and a kept
+    // layout: all three name rows and messages of the transcript that
+    // stands. A transcript replaced wholesale takes them with it, the way
+    // it takes the index-keyed expansions.
+    let (mut app, call_id) = app_with_a_plan_block_mid_conversation(true);
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("first draw");
+    let block_rows = block_rows_of(&app, &call_id);
+    let block_end = *block_rows.last().expect("the block baked rows");
+    // Inside the open block, the row under the pin still on screen.
+    seat_the_pin_at(&mut app, block_end - 2, &mut pane);
+    assert!(
+        app.scroll.pin_identity.is_some(),
+        "a detached settle stored an identity"
+    );
+    assert!(app.scroll.settled_layout.is_some(), "and kept its layout");
+    assert!(
+        click_baked_row(&mut app, block_end - 1),
+        "the click lands on the block"
+    );
+    assert!(
+        !app.scroll.reshaped_blocks.is_empty(),
+        "the click left a standing note"
+    );
+
+    app.replace_conversation_with(Vec::new());
+    assert!(
+        app.scroll.reshaped_blocks.is_empty(),
+        "a note names rows of the transcript that stood: {:?}",
+        app.scroll.reshaped_blocks
+    );
+    assert!(
+        app.scroll.pin_identity.is_none(),
+        "an identity names a message of the transcript that stood"
+    );
+    assert!(
+        app.scroll.settled_layout.is_none(),
+        "a kept layout indexes the transcript that stood"
+    );
+}
+
+#[test]
+fn a_click_that_opens_a_block_and_a_wider_frame_land_on_the_line_the_reader_saw() {
+    // The view follows the tail; the reader opens a block the frame shows,
+    // which detaches the view without moving the offset, and the frame
+    // draws wider. No identity stands yet — the following settles kept
+    // none — so the previous top row's place is read in the layout the
+    // click kept and mapped onto the rebaked rows.
+    let line = |app: &TuiApp| top_text(app).unwrap_or_default();
+    let mut app = app();
+    let paragraph = |i: usize| {
+        format!(
+            "older row {i:02} — a first part long enough that the wrap at eighty columns falls \
+             before the second naming; older row {i:02} — tail"
+        )
+    };
+    for i in 0..157 {
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text { text: paragraph(i) }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    let call_id = "call_near_tail".to_string();
+    app.retain_tool_detail(&call_id, "{\"x\":1}", "detail one\ndetail two");
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Read".to_string(),
+            call_id: call_id.clone(),
+            input_preview: "x".to_string(),
+            output_preview: "detail one".to_string(),
+            retained_input: String::new(),
+            success: true,
+            elapsed_secs: 0.1,
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    for i in 157..160 {
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text { text: paragraph(i) }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame))
+        .expect("the following draw");
+    // The top row is a paragraph's wrapped continuation — its second naming
+    // — so the round trip below has a row inside a unit to restore; a blank
+    // or first row at the top is moved past by one more row under the
+    // document.
+    for _ in 0..3 {
+        if line(&app).contains("— tail") && !line(&app).trim_start().starts_with("older row") {
+            break;
+        }
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "a tail pad row".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        pane.draw(|frame| app.render(frame))
+            .expect("the padding draw");
+    }
+    assert!(
+        app.scroll.stick.follows() && app.scroll_offset() == 0,
+        "the view follows the tail"
+    );
+    let expected_no = older_row_no(&line(&app)).expect("the top row names its paragraph");
+    let expected_line = line(&app);
+    let summary_row = block_rows_of(&app, &call_id)[0];
+    assert!(
+        summary_row >= top_row(&app),
+        "the block is on screen for the click (summary {summary_row}, top {})",
+        top_row(&app)
+    );
+
+    // One batch: the click opens the block, and the frame draws wider.
+    assert!(
+        click_baked_row(&mut app, summary_row),
+        "the click lands on the summary"
+    );
+    assert!(
+        !app.scroll.stick.follows(),
+        "opening a block detaches the view"
+    );
+    let mut wider =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 22)).expect("terminal");
+    wider
+        .draw(|frame| app.render(frame))
+        .expect("the rewrapping draw");
+    assert_eq!(
+        older_row_no(&line(&app)),
+        Some(expected_no),
+        "the view's top names the paragraph it showed before the click, across the rewrap: {:?}",
+        line(&app)
+    );
+
+    // The pane's own width: the continuation row is the view's top again.
+    pane.draw(|frame| app.render(frame))
+        .expect("the restoring draw");
+    assert_eq!(
+        line(&app),
+        expected_line,
+        "the requested row inside its unit, not the first row the mapping rounded to"
+    );
+}
+
+#[test]
 fn an_occurrence_the_last_frame_did_not_paint_takes_no_note() {
     let mut app = app();
     push_plain_rows(&mut app, "row above", 15);

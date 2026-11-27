@@ -827,10 +827,13 @@ impl TuiApp {
     /// them — a thinking section or compaction expanded by position in
     /// the old conversation is nothing the new one ever opened, and a
     /// driverless host has no adoption reply to drop them later — and
-    /// the selection goes with the rows it spanned. The todo deltas
-    /// keyed by the old transcript's call ids die with it too: the
-    /// seeding walk records the resumed transcript's own deltas afresh
-    /// over the emptied map, and a cleared session carries none.
+    /// the selection goes with the rows it spanned, and so does the
+    /// scroll's layout-bound state — the standing reshape notes, the
+    /// pin's identity, and the kept layout, all of which name rows and
+    /// messages of the transcript that stood. The todo deltas keyed by
+    /// the old transcript's call ids die with it too: the seeding walk
+    /// records the resumed transcript's own deltas afresh over the
+    /// emptied map, and a cleared session carries none.
     fn replace_conversation_with(&mut self, transcript: Vec<TuiMessage>) {
         self.conversation.clear();
         self.plan.todo_changes.clear();
@@ -841,6 +844,9 @@ impl TuiApp {
         self.expansion.expanded_thinking.clear();
         self.expansion.expanded_compactions.clear();
         self.pointer.selection = None;
+        self.scroll.reshaped_blocks.clear();
+        self.scroll.pin_identity = None;
+        self.scroll.settled_layout = None;
     }
 
     /// How long a theme switch waits for the event reader to
@@ -2313,7 +2319,25 @@ impl TuiApp {
             } else {
                 match self.scroll.pin_identity {
                     Some(identity) => self.pin_row_after_rewrap(identity).unwrap_or(pin),
-                    None => pin,
+                    None => {
+                        match self
+                            .scroll
+                            .settled_layout
+                            .as_deref()
+                            .and_then(|layout| {
+                                Self::pin_identity_in(requested, &layout.ranges, &layout.units)
+                            })
+                            .and_then(|identity| {
+                                self.pin_row_after_rewrap(identity)
+                                    .map(|row| (identity, row))
+                            }) {
+                            Some((identity, row)) => {
+                                retained = Some(identity);
+                                row
+                            }
+                            None => pin,
+                        }
+                    }
                 }
             };
             self.scroll.scroll_offset = total_lines.saturating_sub(viewport).saturating_sub(pin);
