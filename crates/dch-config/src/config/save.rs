@@ -44,10 +44,12 @@ impl DchConfig {
     /// resolved before anything is staged: the rename replaces the
     /// file the link names, never the link itself, so the managed copy
     /// the user keeps is the one that changes. A link whose target is
-    /// missing is refused before anything is staged — the error names
-    /// the link, and the link stands — because writing at the link's
-    /// own path would replace it with a plain file and leave the
-    /// managed copy missing. A staged write that
+    /// missing — the config file, or the config directory itself — is
+    /// refused before anything is staged: the error names the link, and
+    /// the link stands — and so is a link the filesystem will not
+    /// resolve for any other reason, a permission denial, a stale mount,
+    /// a loop, since the rename would replace that link just the same. A
+    /// staged write that
     /// fails removes itself — a stray can carry a credential, and its
     /// pid-and-sequence name could collide with a pid-reusing
     /// successor (a container's dch is often pid 1 against a
@@ -57,10 +59,11 @@ impl DchConfig {
     /// # Errors
     ///
     /// Returns an error when validation refuses the document, when
-    /// serialization fails, when the directory cannot be created, when
-    /// the target is a symbolic link that resolves to nothing, or when
-    /// the staged write or rename does — the target file itself is
-    /// never touched until the rename succeeds.
+    /// serialization fails, when the directory or the target is a
+    /// symbolic link that resolves to nothing or cannot be resolved,
+    /// when the directory cannot be created, or when the staged write or
+    /// rename does — the target file itself is never touched until the
+    /// rename succeeds.
     pub fn save_to_dir(&self, dir: &Path) -> Result<(), DchConfigError> {
         static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         self.validate()?;
@@ -70,27 +73,23 @@ impl DchConfig {
         } else {
             dir.join("config.toml")
         };
+        if is_dangling_symlink(dir) {
+            return Err(dangling_link(dir));
+        }
         std::fs::create_dir_all(dir)?;
         let target = match std::fs::canonicalize(&chosen) {
             Ok(resolved) => resolved,
-            Err(_) if is_dangling_symlink(&chosen) => {
-                return Err(DchConfigError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "{} is a symbolic link whose target is missing; the link was left in place",
-                        chosen.display()
-                    ),
-                )));
+            Err(_) if is_dangling_symlink(&chosen) => return Err(dangling_link(&chosen)),
+            Err(err) if is_symlink(&chosen) => {
+                return Err(DchConfigError::UnresolvedLink {
+                    path: chosen,
+                    source: err,
+                });
             }
             Err(_) => chosen,
         };
-        let staging = target.with_file_name(format!(
-            ".{}.{}.{}.{}.tmp",
-            target
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or("config.toml"),
-            std::process::id(),
+        let staging = target.with_file_name(Self::staging_name(
+            &target,
             SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             Self::staging_nonce(),
         ));
@@ -100,6 +99,27 @@ impl DchConfig {
             return Err(err.into());
         }
         Ok(())
+    }
+
+    /// The staging file's name beside `target`: the target's own name,
+    /// the pid, the per-process `sequence`, and a time `nonce`.
+    ///
+    /// The pid and the sequence alone collide with a stray left by an
+    /// earlier process whose pid a container reuses — every fresh
+    /// container is pid 1 against the same persistent home — so the name
+    /// carries the nonce as well, and no stray can stand at a successor's
+    /// name whatever sequence the successor draws.
+    fn staging_name(target: &Path, sequence: u64, nonce: u64) -> String {
+        format!(
+            ".{}.{}.{}.{}.tmp",
+            target
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("config.toml"),
+            std::process::id(),
+            sequence,
+            nonce,
+        )
     }
 
     /// A time-based nonce for the staging name.
@@ -203,14 +223,39 @@ impl DchConfig {
     }
 }
 
-/// Whether `path` is a symbolic link that resolves to nothing.
+/// Whether `path` is a symbolic link whose target does not exist.
 ///
-/// The one shape of path that exists yet defeats `canonicalize`: the
-/// link stands, the file it names does not. A save at the link's own
-/// path would replace it with a plain file and leave the managed copy
-/// missing, which is why [`DchConfig::save_to_dir`] refuses instead.
+/// Both halves are needed: the path itself is a link, and following it
+/// reports nothing at the far end. A link whose target stands is the
+/// managed layout a dotfile manager leaves — a whole directory folded
+/// into one link — and the save lands through it; only a link naming
+/// nothing is refused, because a save at its own path would replace it
+/// with a plain file and leave the managed copy missing for good
+/// ([`DchConfig::save_to_dir`]). The config directory and the config
+/// file are judged by the same rule.
 fn is_dangling_symlink(path: &Path) -> bool {
+    is_symlink(path)
+        && matches!(
+            std::fs::metadata(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        )
+}
+
+/// Whether `path` is a symbolic link, whatever it names.
+///
+/// Read off the link's own metadata, never the target's: the link
+/// stands as a link whether its target resolves or not, which is what
+/// the save needs to know before it would rename over it.
+fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// The refusal at a dangling link: the error names `path`, the link the
+/// save would have replaced.
+fn dangling_link(path: &Path) -> DchConfigError {
+    DchConfigError::DanglingLink {
+        path: path.to_path_buf(),
+    }
 }
 
 #[cfg(test)]
@@ -286,9 +331,13 @@ mod save_roundtrip {
         let err = DchConfig::default()
             .save_to_dir(dir.path())
             .expect_err("a save through a dangling link is refused");
-        assert!(
-            err.to_string().contains("symbolic link"),
-            "the refusal names the link: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} is a symbolic link whose target is missing; the link was left in place",
+                link.display()
+            ),
+            "the refusal is the link's own, named in full — never a read failure"
         );
         let meta = std::fs::symlink_metadata(&link).expect("the link stands");
         assert!(
@@ -308,6 +357,167 @@ mod save_roundtrip {
             left,
             vec!["config.toml".to_string()],
             "the refused save staged nothing and left nothing behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_under_a_dangling_symlinked_directory_is_refused_and_the_link_stands() {
+        // The config directory itself is a managed symlink whose checkout
+        // is absent. Creating the directory at the link's path would
+        // fail on a plain "exists" at best, or replace the link at
+        // worst; the refusal comes first and names the directory.
+        let managed = tempfile::tempdir().expect("managed parent tempdir");
+        let missing_dir = managed.path().join("dch");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let dir = home.path().join(".dch");
+        std::os::unix::fs::symlink(&missing_dir, &dir).expect("a dangling directory symlink");
+
+        let err = DchConfig::default()
+            .save_to_dir(&dir)
+            .expect_err("a save under a dangling directory link is refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} is a symbolic link whose target is missing; the link was left in place",
+                dir.display()
+            ),
+            "the refusal names the directory, in full"
+        );
+        let meta = std::fs::symlink_metadata(&dir).expect("the link stands");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the save left the directory link a link"
+        );
+        assert!(
+            !missing_dir.exists(),
+            "nothing was created at the missing destination"
+        );
+        let left: Vec<String> = std::fs::read_dir(home.path())
+            .expect("the home reads")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec![".dch".to_string()],
+            "the refused save staged nothing and left nothing behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_under_a_symlinked_directory_whose_target_stands_lands_in_the_managed_directory() {
+        // A dotfile manager folds the whole config directory into one
+        // link whose target stands: the link is the user's path, so the
+        // save goes through it, a first save and an update alike, and
+        // leaves the link a link.
+        let managed = tempfile::tempdir().expect("managed tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let dir = home.path().join(".dch");
+        std::os::unix::fs::symlink(managed.path(), &dir).expect("a directory symlink in home");
+
+        let mut config = DchConfig::default();
+        config.api.model = "folded".to_string();
+        config
+            .save_to_dir(&dir)
+            .expect("a first save lands through the directory link");
+        config.api.model = "refolded".to_string();
+        config
+            .save_to_dir(&dir)
+            .expect("an update lands through the directory link");
+
+        let saved =
+            std::fs::read_to_string(managed.path().join("config.toml")).expect("the managed file");
+        assert!(
+            saved.contains("\"refolded\""),
+            "the managed directory carries the latest document: {saved}"
+        );
+        let landed: Vec<String> = std::fs::read_dir(managed.path())
+            .expect("the managed directory reads")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            landed,
+            vec!["config.toml".to_string()],
+            "the managed directory holds the document alone — no staging file"
+        );
+        let link = std::fs::symlink_metadata(&dir).expect("the link stands");
+        assert!(
+            link.file_type().is_symlink(),
+            "the saves left the directory link a link"
+        );
+        let left: Vec<String> = std::fs::read_dir(home.path())
+            .expect("the home reads")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec![".dch".to_string()],
+            "nothing lands beside the link — both documents went through it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_symlink_loop_is_refused_and_the_links_stand() {
+        // A managed config whose link cannot be resolved for a reason
+        // other than absence — here a loop — must not be replaced by a
+        // plain file at the link's own path: the save refuses, names the
+        // link, and leaves the directory as it found it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("config.toml");
+        let other = dir.path().join("loop.toml");
+        std::os::unix::fs::symlink(&other, &link).expect("config.toml -> loop.toml");
+        std::os::unix::fs::symlink(&link, &other).expect("loop.toml -> config.toml");
+
+        let err = DchConfig::default()
+            .save_to_dir(dir.path())
+            .expect_err("a save through an unresolvable link is refused");
+        assert!(
+            err.to_string().contains(&format!(
+                "{} is a symbolic link the save could not resolve",
+                link.display()
+            )),
+            "the refusal names the link and the failure: {err}"
+        );
+        let meta = std::fs::symlink_metadata(&link).expect("the link stands");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the save left the link a link"
+        );
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("the dir reads")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["config.toml".to_string(), "loop.toml".to_string()],
+            "nothing was staged and nothing replaced: {left:?}"
+        );
+    }
+
+    #[test]
+    fn a_staging_name_carries_a_nonce_no_stray_can_be_planted_without() {
+        // A stray left by a crashed, pid-reusing predecessor sits at the
+        // pid-and-sequence name with no nonce; whatever sequence this
+        // process draws, the nonce keeps the fresh save's name its own.
+        let target = Path::new("/home/reader/.dch/config.toml");
+        for sequence in 0..64_u64 {
+            let stray = format!(".config.toml.{}.{}.tmp", std::process::id(), sequence);
+            assert_ne!(
+                DchConfig::staging_name(target, sequence, 1_728_000_000_000_000_000_u64),
+                stray,
+                "sequence {sequence}: the fresh name is not the stray's"
+            );
+        }
+        assert!(
+            DchConfig::staging_name(target, 7, 9).starts_with(".config.toml."),
+            "the name stays a hidden sibling of the target"
         );
     }
 

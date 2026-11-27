@@ -108,7 +108,10 @@ async fn probe_within(
 /// pinned context, the running models' served context, the model
 /// listing, and last the model's ceiling bounding the window `config`
 /// would otherwise assume — [`FALLBACK_CONTEXT_WINDOW`] when it states
-/// none. Returns `None` when no question has an answer.
+/// none — bounds that window from above when it sits below it; a ceiling
+/// at or above it is no answer, since it narrows nothing and a discovery
+/// would claim a number the caller supplied itself. Returns `None` when
+/// no question has an answer.
 async fn ask_in_order(config: &ApiConfig, base_url: &str, model: &str) -> Option<u64> {
     if !matches!(
         config.api_type,
@@ -132,7 +135,23 @@ async fn ask_in_order(config: &ApiConfig, base_url: &str, model: &str) -> Option
         return Some(window);
     }
     let ceiling = shown.as_ref().and_then(ollama_model_ceiling)?;
-    Some(ceiling.min(config.context_window.unwrap_or(FALLBACK_CONTEXT_WINDOW)))
+    let assumed = config.context_window.unwrap_or(FALLBACK_CONTEXT_WINDOW);
+    (ceiling < assumed).then_some(ceiling)
+}
+
+/// The probe's HTTP client: bounded by [`PROBE_TIMEOUT`] and following no
+/// redirect.
+///
+/// The loopback gate admits the local server's own address; a redirect
+/// from it names another host, which the gate never admitted, so the
+/// client takes the first answer as it stands and lets the caller read
+/// a 3xx as no document.
+fn probe_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
 }
 
 /// Read the llama.cpp family's `/props` document for the per-request
@@ -147,10 +166,7 @@ async fn props_window(root: &str) -> Option<u64> {
         tracing::debug!(root, "endpoint is not loopback; skipping the /props probe");
         return None;
     }
-    let client = reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .ok()?;
+    let client = probe_client()?;
     let response = client.get(format!("{root}/props")).send().await.ok()?;
     if !response.status().is_success() {
         tracing::debug!(status = %response.status(), "no capability document; keeping the configured window");
@@ -209,10 +225,7 @@ async fn listing_window(base: &str, model: &str) -> Option<u64> {
         );
         return None;
     }
-    let client = reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .ok()?;
+    let client = probe_client()?;
     let response = client.get(&listing).send().await.ok()?;
     if !response.status().is_success() {
         tracing::debug!(status = %response.status(), "no model listing; keeping the configured window");
@@ -256,10 +269,7 @@ async fn ollama_model_document(root: &str, model: &str) -> Option<serde_json::Va
         );
         return None;
     }
-    let client = reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .ok()?;
+    let client = probe_client()?;
     let response = client
         .post(format!("{root}/api/show"))
         .json(&serde_json::json!({ "model": model }))
@@ -297,7 +307,11 @@ fn ollama_pinned_window(document: &serde_json::Value) -> Option<u64> {
 /// The largest context the model's `/api/show` document claims.
 ///
 /// The training context is keyed by architecture (`qwen35.context_length`),
-/// so the value is matched by the key's last segment. The ceiling is read
+/// so the value is matched by the key's last segment, and the largest
+/// such value is taken: a vision model's document keys a projector's
+/// context beside the language model's (`clip.context_length`), and the
+/// model's ceiling is the greater, whichever key sorts first. The
+/// ceiling is read
 /// only when the document states no `num_ctx` and no listing named a
 /// served window, so it is the model's one stated number — a training
 /// limit rather than a served one — and it only ever bounds the window
@@ -307,7 +321,8 @@ fn ollama_model_ceiling(document: &serde_json::Value) -> Option<u64> {
     info.iter()
         .filter(|(key, _)| key.rsplit('.').next() == Some("context_length"))
         .filter_map(|(_, entry)| entry.as_u64())
-        .find(|length| *length > 0)
+        .filter(|length| *length > 0)
+        .max()
 }
 
 /// Read Ollama's running-models listing for the context `model` is served with.
@@ -328,10 +343,7 @@ async fn ollama_loaded_window(root: &str, model: &str) -> Option<u64> {
         );
         return None;
     }
-    let client = reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .ok()?;
+    let client = probe_client()?;
     let response = client.get(format!("{root}/api/ps")).send().await.ok()?;
     if !response.status().is_success() {
         tracing::debug!(
@@ -696,6 +708,14 @@ mod tests {
             "the unauthenticated probe still reads the document"
         );
         let request = captured.lock().expect("capture lock").clone();
+        assert!(
+            request.contains("GET /props"),
+            "the capture holds the request line, so the negatives below read a whole request: {request}"
+        );
+        assert!(
+            request.to_ascii_lowercase().contains("host:"),
+            "the capture holds the headers the negatives below are about: {request}"
+        );
         assert!(
             !request.to_ascii_lowercase().contains("authorization"),
             "the probe request carries no credential: {request}"
@@ -1108,17 +1128,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_loopback_redirect_to_another_port_is_not_followed() {
+        // The gate holds for every hop: a loopback server answering
+        // `/props` with a 302 to another port must not have that port
+        // asked on the probe's behalf. The second listener watches for
+        // any connection until the probe has answered and a grace period
+        // has passed — never for a span the probe could outlast.
+        let second = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+        let second_port = second
+            .local_addr()
+            .expect("bound socket has an address")
+            .port();
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&reached);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            second.set_nonblocking(true).expect("nonblocking");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                if second.accept().is_ok() {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+        let port = listener
+            .local_addr()
+            .expect("bound socket has an address")
+            .port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 1024];
+                drop(std::io::Read::read(&mut stream, &mut buffer));
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{second_port}/props\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                drop(stream.write_all(head.as_bytes()));
+            }
+        });
+        assert_eq!(
+            props_window(&format!("http://127.0.0.1:{port}")).await,
+            None,
+            "a redirect is no capability document"
+        );
+        // A grace period for a redirect that was followed to connect,
+        // then the watcher may stop.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "the redirected-to port was never asked"
+        );
+    }
+
+    #[test]
+    fn the_model_ceiling_is_the_largest_context_the_document_claims() {
+        // A vision model's document keys a projector's context beside the
+        // language model's; the ceiling is the greater, whichever key sorts
+        // first. A zero claims nothing.
+        for document in [
+            r#"{"model_info":{"clip.context_length":4096,"qwen35.context_length":262144}}"#,
+            r#"{"model_info":{"qwen35.context_length":262144,"clip.context_length":4096}}"#,
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(document).expect("document");
+            assert_eq!(ollama_model_ceiling(&parsed), Some(262_144), "{document}");
+        }
+        let lone: serde_json::Value =
+            serde_json::from_str(r#"{"model_info":{"clip.context_length":4096}}"#)
+                .expect("document");
+        assert_eq!(
+            ollama_model_ceiling(&lone),
+            Some(4_096),
+            "a lone projector context is still the document's one claim"
+        );
+        let zero: serde_json::Value =
+            serde_json::from_str(r#"{"model_info":{"qwen35.context_length":0}}"#)
+                .expect("document");
+        assert_eq!(
+            ollama_model_ceiling(&zero),
+            None,
+            "a zero claims no ceiling"
+        );
+    }
+
+    #[tokio::test]
     async fn the_model_ceiling_bounds_the_window_the_caller_would_assume() {
         // No pin, no loaded entry, no listing figure: the `/api/show`
         // document's training ceiling is all the server states. A
-        // ceiling below the caller's assumption narrows it; one above
-        // leaves the assumption standing — never more than the model
-        // holds, and never a guess at what a default-sized server
-        // serves.
+        // ceiling below the caller's assumption narrows it; one at or
+        // above it is no answer — the caller's own window stands, and
+        // no discovery is logged for a number the probe did not find.
         for (ceiling, stated, expected) in [
-            (8_192_u64, None, 8_192_u64),
-            (262_144, None, FALLBACK_CONTEXT_WINDOW),
-            (262_144, Some(50_000), 50_000),
+            (8_192_u64, None, Some(8_192_u64)),
+            (262_144, None, None),
+            (262_144, Some(50_000), None),
         ] {
             let shown = format!(
                 r#"{{"parameters":"repeat_penalty 1","model_info":{{"qwen35.context_length":{ceiling}}}}}"#
@@ -1138,33 +1248,34 @@ mod tests {
                     "test-model"
                 )
                 .await,
-                Some(expected),
-                "the ceiling bounds the assumed window from above: ceiling {ceiling}, stated {stated:?}"
+                expected,
+                "the ceiling bounds the assumed window from above, or is no answer: ceiling {ceiling}, stated {stated:?}"
             );
         }
     }
 
     #[tokio::test]
     async fn a_pinned_context_that_is_not_a_positive_whole_number_pins_nothing() {
-        // `num_ctx abc` is no context; with no loaded entry and no
-        // listing figure left to ask, the server has no answer.
-        let (port, _) = serve_bodies(vec![
-            miss(),
-            r#"{"parameters":"num_predict 5\nnum_ctx abc\n"}"#.to_string(),
-            miss(),
-            miss(),
-        ]);
-        let config = probe_config(ApiType::Ollama);
-        assert_eq!(
-            probe_context_window(
-                &config,
-                &format!("http://127.0.0.1:{port}/v1"),
-                "test-model"
-            )
-            .await,
-            None,
-            "an unreadable pin is no pin; the questions after it decide"
-        );
+        // `num_ctx abc` is no context, and neither is `num_ctx 0`; with
+        // no loaded entry and no listing figure left to ask, the server
+        // has no answer.
+        for parameters in [
+            r#"{"parameters":"num_predict 5\nnum_ctx abc\n"}"#,
+            r#"{"parameters":"num_ctx 0\n"}"#,
+        ] {
+            let (port, _) = serve_bodies(vec![miss(), parameters.to_string(), miss(), miss()]);
+            let config = probe_config(ApiType::Ollama);
+            assert_eq!(
+                probe_context_window(
+                    &config,
+                    &format!("http://127.0.0.1:{port}/v1"),
+                    "test-model"
+                )
+                .await,
+                None,
+                "an unreadable pin is no pin; the questions after it decide: {parameters}"
+            );
+        }
     }
     /// Bind an ephemeral port and never accept a connection on it: the
     /// dead-tunnel shape, where every question connects and then waits.

@@ -1469,6 +1469,7 @@ impl TuiApp {
             );
             return;
         };
+        self.keep_the_seen_layout();
         self.scroll.scroll_offset = self
             .pacing
             .last_layout_lines
@@ -2233,6 +2234,25 @@ impl TuiApp {
         ]
     }
 
+    /// Keep the layout the reader's first move off the tail is queued
+    /// against.
+    ///
+    /// While the view follows the tail the settle keeps no layout — nothing
+    /// is pinned to map across a rewrap. A move that detaches asks for a
+    /// row of the frame just shown, so that frame's layout is kept here,
+    /// once, for the settle to read the requested row's place in should
+    /// the detaching frame also change width; a frame still following
+    /// clears it again, and the detached settle replaces it.
+    fn keep_the_seen_layout(&mut self) {
+        if !self.scroll.stick.follows() {
+            return;
+        }
+        self.scroll.settled_layout = Some(Box::new(BakeLayout {
+            ranges: self.bake.message_ranges.clone(),
+            units: self.bake.message_units.clone(),
+        }));
+    }
+
     /// Settle the scroll offset for this frame's layout.
     ///
     /// A pinned view sits at the newest line: the offset resets to
@@ -2244,7 +2264,12 @@ impl TuiApp {
     /// moves *above* the pin move the pin itself,
     /// [`rows_moved_above_anchor`](Self::rows_moved_above_anchor)), and a
     /// viewport that changes under the view — a pane tmux resized while
-    /// it was hidden. The saturation can only deny the pin for a frame,
+    /// it was hidden. Rows reshaped where no keyed block stands to note
+    /// them — a retry line rewritten in place, a verbosity or theme
+    /// switch re-rendering every block, a transcript replaced wholesale —
+    /// are the accepted windows: the first two move the pinned view with
+    /// the document, and the last resets the offset outright. The
+    /// saturation can only deny the pin for a frame,
     /// never lose it: the pin is remembered while the offset cannot reach
     /// it, and the offset restores it when the geometry allows again. A
     /// pane that changes *width* rewraps every message, so the pin is also
@@ -2506,9 +2531,15 @@ impl TuiApp {
         .filter(|(_, id)| id.as_str() == key)
         .map(|(row, _)| *row)
         .filter(|row| {
-            message
-                .and_then(|message| self.bake.message_ranges.get(message))
-                .is_none_or(|range| range.contains(row))
+            // No message named: every row the key holds. One named: only
+            // the rows inside it, and none at all when the bake holds no
+            // such message — an occurrence the last frame did not paint.
+            message.is_none_or(|message| {
+                self.bake
+                    .message_ranges
+                    .get(message)
+                    .is_some_and(|range| range.contains(row))
+            })
         })
         .collect();
         rows.sort_unstable();
@@ -2539,27 +2570,31 @@ impl TuiApp {
     /// pin moves it by its own change and the one below by nothing; rows
     /// pooled under the shared id would span the pin from both sides and
     /// read as one block neither wholly above it nor wholly below.
+    ///
+    /// Only occurrences the previous bake painted take a note. One that
+    /// graduated after the last frame has no rows to measure — a
+    /// message-scoped read of it would fall back to the painted
+    /// occurrence's rows and count that fold twice — and its fold is no
+    /// change in the painted transcript.
     fn note_call_reshape(&mut self, call_id: &str) {
-        let occurrences: Vec<usize> = self
+        let painted: Vec<usize> = self
             .conversation
             .iter()
             .enumerate()
-            .filter(|(_, message)| {
-                matches!(
-                    message,
-                    TuiMessage::Assistant { blocks, .. }
-                        if blocks.iter().any(|block| matches!(
-                            block,
-                            ContentBlock::Tool { call_id: id, .. } if id == call_id
-                        ))
-                )
+            .filter(|(index, message)| {
+                self.bake.message_ranges.get(*index).is_some()
+                    && matches!(
+                        message,
+                        TuiMessage::Assistant { blocks, .. }
+                            if blocks.iter().any(|block| matches!(
+                                block,
+                                ContentBlock::Tool { call_id: id, .. } if id == call_id
+                            ))
+                    )
             })
             .map(|(index, _)| index)
             .collect();
-        if occurrences.is_empty() {
-            self.note_block_reshape_in(call_id, None);
-        }
-        for message in occurrences {
+        for message in painted {
             self.note_block_reshape_in(call_id, Some(message));
         }
     }
@@ -2607,30 +2642,37 @@ impl TuiApp {
     /// so a fold and a scroll handled in one batch agree wherever the
     /// reader has since moved the view. A block wholly below the noted pin
     /// — its first row at or after it — moved nothing above the pin and
-    /// moves the pin by nothing: its rows are read from the post-change map
-    /// the other notes have already shifted, and counting them against the
-    /// pre-change pin would take a block an earlier fold lifted past the
-    /// pinned content for one that landed above it.
+    /// moves the pin by nothing. The length rules come first and the
+    /// inside count last: its rows are read from the post-change map,
+    /// which the blocks above the pin have already shifted, so the count
+    /// runs against the noted pin moved by their net — against the pin's
+    /// old index it would take a block an earlier fold lifted past the
+    /// pinned content for one that landed above it. A block with no rows
+    /// when noted takes the inside count, which places whatever rows it
+    /// gained on whichever side of the pin they fall.
     fn rows_moved_above_anchor(&mut self) -> (usize, usize) {
         let notes = std::mem::take(&mut self.scroll.reshaped_blocks);
         let mut landed_above = 0usize;
         let mut left_above = 0usize;
+        let mut inside = Vec::new();
         for note in notes {
             let (len, _) = self.block_shape(&note.key, note.message);
             let first_row = note.last_row.saturating_sub(note.len.saturating_sub(1));
-            let (landed, left) = if note.last_row < note.pin {
-                (len.saturating_sub(note.len), note.len.saturating_sub(len))
-            } else if note.len > 0 && first_row > note.pin {
-                (0, 0)
-            } else {
-                let after = self.rows_above_pin(&note.key, note.message, note.pin);
-                (
-                    after.saturating_sub(note.rows_above),
-                    note.rows_above.saturating_sub(after),
-                )
-            };
-            landed_above = landed_above.saturating_add(landed);
-            left_above = left_above.saturating_add(left);
+            if note.len > 0 && note.last_row < note.pin {
+                landed_above = landed_above.saturating_add(len.saturating_sub(note.len));
+                left_above = left_above.saturating_add(note.len.saturating_sub(len));
+            } else if note.len == 0 || first_row <= note.pin {
+                inside.push(note);
+            }
+        }
+        for note in inside {
+            let pin = note
+                .pin
+                .saturating_add(landed_above)
+                .saturating_sub(left_above);
+            let after = self.rows_above_pin(&note.key, note.message, pin);
+            landed_above = landed_above.saturating_add(after.saturating_sub(note.rows_above));
+            left_above = left_above.saturating_add(note.rows_above.saturating_sub(after));
         }
         (landed_above, left_above)
     }

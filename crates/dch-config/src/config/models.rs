@@ -323,9 +323,8 @@ impl DchConfig {
                 .any(|seen: &String| seen.eq_ignore_ascii_case(named))
             {
                 return Err(DchConfigError::Invalid(format!(
-                    "duplicate [[models]] entry for model {:?}: --model could not choose \
-                     between them",
-                    entry.model
+                    "duplicate [[models]] entry for model {named:?}: --model could not choose \
+                     between them"
                 )));
             }
             if let Some(effort) = &entry.reasoning_effort
@@ -760,6 +759,39 @@ context_window = 210_000
         assert!(
             err.to_string().to_lowercase().contains("glm"),
             "the error names the doubled model: {err}"
+        );
+    }
+
+    #[test]
+    fn two_entries_sharing_a_name_under_padding_fail_a_save_of_a_config_assembled_in_code() {
+        // The one production route where names reach `validate` without a
+        // parse in front of it: a config assembled in code and saved. The
+        // duplicate check trims on its own, and names the name it found.
+        let config = DchConfig {
+            models: vec![
+                ModelProfile {
+                    model: "glm".to_string(),
+                    ..ModelProfile::default()
+                },
+                ModelProfile {
+                    model: "glm ".to_string(),
+                    ..ModelProfile::default()
+                },
+            ],
+            ..DchConfig::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = config
+            .save_to_dir(dir.path())
+            .expect_err("the padded duplicate is refused at the save");
+        assert!(
+            err.to_string()
+                .contains("duplicate [[models]] entry for model \"glm\":"),
+            "the refusal names the trimmed name: {err}"
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "a refused save touches no target"
         );
     }
 

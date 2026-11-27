@@ -40,6 +40,7 @@ impl TuiApp {
     /// section's wheel keeps its own one-entry step.
     pub(crate) fn scroll_the_wheel(&mut self, up: bool) -> bool {
         if up {
+            self.keep_the_seen_layout();
             self.scroll.scroll_offset =
                 self.scroll.scroll_offset.saturating_add(WHEEL_SCROLL_LINES);
             self.scroll.stick = Stick::Hold;
@@ -89,6 +90,7 @@ impl TuiApp {
             };
             let scrolled = view.skip > 0;
             if scrolled {
+                self.keep_the_seen_layout();
                 self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_add(1);
                 self.scroll.stick = Stick::Hold;
             }
@@ -288,6 +290,7 @@ impl TuiApp {
             return;
         }
         if line < view.skip {
+            self.keep_the_seen_layout();
             self.scroll.scroll_offset = self
                 .scroll
                 .scroll_offset

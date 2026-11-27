@@ -169,6 +169,7 @@ impl TuiApp {
                 true
             }
             (KeyCode::PageUp, _) => {
+                self.keep_the_seen_layout();
                 self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_add(10);
                 self.scroll.stick = Stick::Hold;
                 true
@@ -189,6 +190,7 @@ impl TuiApp {
             (KeyCode::Up, KeyModifiers::NONE)
                 if self.composer.input.is_empty() && !self.composer.input.has_history() =>
             {
+                self.keep_the_seen_layout();
                 self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_add(1);
                 self.scroll.stick = Stick::Hold;
                 true

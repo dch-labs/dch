@@ -30,19 +30,62 @@ use self::runner::{RunnerConfig, TURN_TIMEOUT_FLOOR_SECS};
 use self::security::SecurityConfig;
 use self::telemetry::TelemetryConfig;
 
-/// Errors arising while loading configuration.
+/// Errors arising while loading or saving configuration.
 ///
-/// Returned by [`DchConfig::load`] and [`DchConfig::load_from_dir`]. A missing
-/// config file is not an error — defaults are used — so both variants only arise
-/// when a file is present but cannot be read or parsed.
+/// Returned by [`DchConfig::load`] and [`DchConfig::load_from_dir`] — a
+/// missing config file is not an error, defaults are used, so a load
+/// fails only when a present file cannot be read or parsed — and by
+/// [`DchConfig::save_to_dir`] and [`DchConfig::save`], which add the
+/// validation, serialization, and write failures.
 #[derive(Debug, thiserror::Error)]
 pub enum DchConfigError {
-    /// I/O failure reading a present config file.
+    /// I/O failure reading a present config file or persisting one.
     ///
-    /// Wraps the underlying [`std::io::Error`] from a filesystem read, such as a
-    /// permission denial or a broken symlink.
-    #[error("failed to read config: {0}")]
+    /// Wraps the underlying [`std::io::Error`] from a filesystem read on
+    /// the load path, or from a create, write, sync, or rename on the
+    /// save path, such as a permission denial.
+    #[error("config I/O failed: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A save refused at a symbolic link whose target is missing.
+    ///
+    /// The link stands and nothing is staged: writing at the link's own
+    /// path would replace it with a plain file and leave the managed
+    /// copy missing for good.
+    #[error("{path} is a symbolic link whose target is missing; the link was left in place")]
+    DanglingLink {
+        /// The link the save refused at.
+        ///
+        /// The config file, or the config directory itself, as the user
+        /// named it — the path behind which the managed copy has to be
+        /// restored before a save can land.
+        path: std::path::PathBuf,
+    },
+
+    /// A save refused at a symbolic link it could not resolve.
+    ///
+    /// The link stands and nothing is staged. The target exists but the
+    /// filesystem would not resolve the link to it — a permission
+    /// denial, a stale mount, a loop — and a save at the link's own
+    /// path would replace the link with a plain file just as it would
+    /// for a dangling one.
+    #[error(
+        "{path} is a symbolic link the save could not resolve ({source}); the link was left in place"
+    )]
+    UnresolvedLink {
+        /// The link the save could not resolve.
+        ///
+        /// The config file as the user named it, behind which the
+        /// managed copy sits.
+        path: std::path::PathBuf,
+
+        /// The filesystem's reason the link did not resolve.
+        ///
+        /// Kept as the error's source, so a caller that reports chains
+        /// shows the cause beside the link.
+        #[source]
+        source: std::io::Error,
+    },
 
     /// Malformed TOML or schema mismatch in a present file.
     ///
@@ -231,7 +274,10 @@ impl DchConfig {
     /// and validation are a single operation, so no loader can deserialize
     /// a file and then forget to check it. Every route to a config — the
     /// default directory search, an explicit `--config` file — arrives
-    /// here. The defaults and every accepted value pass through untouched.
+    /// here. The defaults and every accepted value pass through untouched,
+    /// model names alone excepted: they arrive trimmed — the loader trims
+    /// `api.model` and every `[[models]]` entry's name — the one rewrite
+    /// it makes.
     ///
     /// # Errors
     ///
@@ -267,9 +313,13 @@ impl DchConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`DchConfigError::Invalid`] when a field sits below the floor
-    /// its consumer enforces, or when a read ceiling is set above the
-    /// dispatch output cap.
+    /// Returns [`DchConfigError::Invalid`] when a runner value sits below
+    /// the floor its consumer enforces, when the read ceiling exceeds the
+    /// dispatch output cap, when `reasoning_effort` is not a rung of the
+    /// ladder, when a model entry names no model or repeats a name
+    /// ([`validate_models`](Self::validate_models)), or when a permission
+    /// rule is malformed
+    /// ([`validate_permissions`](Self::validate_permissions)).
     fn validate(&self) -> Result<(), DchConfigError> {
         if self.runner.turn_timeout_secs < TURN_TIMEOUT_FLOOR_SECS {
             return Err(DchConfigError::Invalid(format!(

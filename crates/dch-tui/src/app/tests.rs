@@ -727,22 +727,17 @@ fn a_detached_pin_holds_its_anchor_over_a_drain_and_a_graduation_below() {
     );
 }
 
-/// The tmux repro pinned as an invariant. The reader is scrolled up,
-/// holding a row — not at the tail. The agent's run is still going: the
-/// plan block a `TodoWrite` result armed for folding sits *above* the
-/// reader's row, and the moment the next tool starts it folds on the
-/// next frame (`settle_todo_expansion` inside `render_layout`) — in the
-/// same frame the new tool's rows land at the tail. The old settle
-/// compensated the document's net change as if every removed row landed
-/// at or below the anchor, so the rows the fold took from *above* the
-/// anchor dragged the view toward the tail by their count and the reader
-/// was yanked off their line.
+/// The tmux repro as a fixture: the reader scrolled up and holding a row
+/// while the agent's run goes on, the plan block a `TodoWrite` result
+/// armed for folding sitting above that row. The fold comes on the next
+/// frame with a running tool (`settle_todo_expansion` inside
+/// `render_layout`), in the same frame the new tool's rows land at the
+/// tail. The invariant the tests pin is measured, not hardcoded: the
+/// foldable block sits entirely above the anchored row, and the line the
+/// reader was reading — the view's top row before the fold — is still
+/// the view's top row after it; the offset itself may move by exactly
+/// what the tail gained, and the fold must cost it nothing.
 ///
-/// The pinned invariant is measured, not hardcoded: the foldable block
-/// sits entirely above the anchored row, and the line the reader was
-/// reading — the view's top row before the fold — is still the view's
-/// top row after it. The offset itself may move, by exactly what the
-/// tail gained; the fold must cost it nothing.
 /// An app whose last `TodoWrite` block stands expanded and armed: the
 /// detail sits in the tool store, the block is in the conversation, and
 /// the expand flag and the auto-fold flag both wait — the next frame
@@ -1034,6 +1029,14 @@ fn top_text(app: &TuiApp) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The `older row NN` a row's text names, if any — every digit of the
+/// number, so paragraphs 110 and 119 name different lines.
+fn older_row_no(text: &str) -> Option<u32> {
+    let rest = text.split("older row ").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Scroll up until the view's top row is `row`, assuming the row is
 /// reachable from the tail by whole notches, and settle there.
 fn seat_the_pin_at(
@@ -1076,20 +1079,6 @@ fn click_baked_row(app: &mut TuiApp, row: usize) -> bool {
 
 #[test]
 fn a_fold_and_a_scroll_in_one_batch_land_where_separate_frames_land() {
-    fn top_row(app: &TuiApp) -> usize {
-        app.pacing
-            .last_layout_lines
-            .saturating_sub(app.pacing.last_layout_viewport)
-            .saturating_sub(app.scroll_offset())
-    }
-
-    fn top_text(app: &TuiApp) -> Option<String> {
-        app.bake
-            .conversation_cache
-            .get(top_row(app))
-            .map(ToString::to_string)
-    }
-
     /// Draw once, then scroll until the view's top row is the block's
     /// third row from its end — inside the block, block rows above it —
     /// and settle there. Returns the pin row and the block's first row.
@@ -5224,18 +5213,6 @@ fn a_boundary_mode_update_moves_the_display_without_the_file() {
 
 #[test]
 fn a_detached_pin_survives_the_pane_being_resized_while_hidden() {
-    fn top_text(app: &TuiApp) -> Option<String> {
-        let top = app
-            .pacing
-            .last_layout_lines
-            .saturating_sub(app.pacing.last_layout_viewport)
-            .saturating_sub(app.scroll_offset());
-        app.bake
-            .conversation_cache
-            .get(top)
-            .map(ToString::to_string)
-    }
-
     let mut app = app();
     let tall = {
         let mut t = String::new();
@@ -5323,18 +5300,6 @@ fn a_detached_pin_survives_the_pane_being_resized_while_hidden() {
 
 #[test]
 fn a_wheel_notch_while_the_pin_is_denied_moves_the_view_on_the_first_notch() {
-    fn top_text(app: &TuiApp) -> Option<String> {
-        let top = app
-            .pacing
-            .last_layout_lines
-            .saturating_sub(app.pacing.last_layout_viewport)
-            .saturating_sub(app.scroll_offset());
-        app.bake
-            .conversation_cache
-            .get(top)
-            .map(ToString::to_string)
-    }
-
     let mut app = app();
     let tall = {
         let mut t = String::new();
@@ -5945,6 +5910,456 @@ fn each_occurrence_of_a_retried_call_is_measured_on_its_own() {
 }
 
 #[test]
+fn a_summary_attached_to_a_compaction_notice_above_the_pin_leaves_the_pinned_line_in_place() {
+    let mut app = app();
+    push_plain_rows(&mut app, "row above", 10);
+    let notice = app.conversation.len();
+    app.push_message(TuiMessage::Compacted {
+        tokens_before: 10,
+        tokens_after: 5,
+        reason: "manual".to_string(),
+        evicted: 3,
+        duration_ms: 100,
+        compactor: Some("structured".to_string()),
+        compression_ratio: Some(2.0),
+        summary: None,
+        timestamp: chrono::Utc::now(),
+    });
+    push_plain_rows(&mut app, "row below", 30);
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("first draw");
+    let key = format!("m{notice}");
+    let notice_rows = |app: &TuiApp| -> Vec<usize> {
+        let mut rows: Vec<usize> = app
+            .bake
+            .compaction_summary_lines
+            .iter()
+            .filter(|(_, id)| id.as_str() == key)
+            .map(|(row, _)| *row)
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+    let rows = notice_rows(&app);
+    assert_eq!(rows.len(), 1, "a summary-less notice renders one row");
+    let seat = rows[0] + 3;
+    seat_the_pin_at(&mut app, seat, &mut pane);
+    let pinned_line = top_text(&app).expect("the pinned row is baked");
+
+    // The published summary lands on the notice after the frame that
+    // first rendered it.
+    app.attach_compaction_summary(
+        notice,
+        "Compacted at the manual pass: the key facts and the decisions were kept in the head, \
+         and the rest of the transcript was evicted."
+            .to_string(),
+    );
+    pane.draw(|frame| app.render(frame))
+        .expect("the attaching draw");
+    assert_eq!(
+        notice_rows(&app).len(),
+        2,
+        "the attached summary adds the notice's preview row"
+    );
+    assert_eq!(
+        top_text(&app).as_deref(),
+        Some(pinned_line.as_str()),
+        "the pinned line stays the view's top row"
+    );
+    assert_eq!(
+        top_row(&app),
+        seat + 1,
+        "lifted by the one row the notice gained above it"
+    );
+}
+
+#[test]
+fn a_thinking_section_folding_above_the_pin_leaves_the_pinned_line_in_place() {
+    // A thinking section's key names no message: the note's rows are read
+    // across the whole bake, the way a compaction notice's are.
+    let mut app = app();
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![
+            ContentBlock::Thinking {
+                text: "first thought\n\nsecond thought".to_string(),
+                redacted: false,
+                duration_ms: 1_200,
+            },
+            ContentBlock::Text {
+                text: "the answer".to_string(),
+            },
+        ],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    push_plain_rows(&mut app, "row below", 30);
+    app.expansion.expanded_thinking.insert("m0b0".to_string());
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("first draw");
+    let open: Vec<usize> = {
+        let mut rows: Vec<usize> = app
+            .bake
+            .thinking_summary_lines
+            .iter()
+            .filter(|(_, id)| id.as_str() == "m0b0")
+            .map(|(row, _)| *row)
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+    assert!(open.len() > 1, "the thinking stands open");
+    let seat = open[open.len() - 1] + 3;
+    seat_the_pin_at(&mut app, seat, &mut pane);
+    let pinned_line = top_text(&app).expect("the pinned row is baked");
+
+    // The section folds the way its toggle folds it, before the next frame.
+    app.expansion.expanded_thinking.remove("m0b0");
+    app.note_block_reshape("m0b0");
+    app.bake.conversation_generation = app.bake.conversation_generation.saturating_add(1);
+    app.bake.rebake_whole();
+    pane.draw(|frame| app.render(frame))
+        .expect("the folding draw");
+    assert_eq!(
+        top_text(&app).as_deref(),
+        Some(pinned_line.as_str()),
+        "the pinned line stays the view's top row"
+    );
+    assert_eq!(
+        top_row(&app),
+        seat - (open.len() - 1),
+        "lifted by the open rows that left above it"
+    );
+}
+
+#[test]
+fn an_occurrence_the_last_frame_did_not_paint_takes_no_note() {
+    let mut app = app();
+    push_plain_rows(&mut app, "row above", 15);
+    let retried = "retried".to_string();
+    app.retain_tool_detail(
+        &retried,
+        "{\"x\":1}",
+        "detail one\ndetail two\ndetail three\ndetail four\ndetail five",
+    );
+    let attempt = |call_id: &str| TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Read".to_string(),
+            call_id: call_id.to_string(),
+            input_preview: "x".to_string(),
+            output_preview: "detail one".to_string(),
+            retained_input: String::new(),
+            success: true,
+            elapsed_secs: 0.1,
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    };
+    app.expansion.expanded_tools.insert(retried.clone());
+    app.push_message(attempt(&retried));
+    push_plain_rows(&mut app, "row below", 30);
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("first draw");
+    let open = block_rows_of(&app, &retried);
+    assert!(open.len() > 1, "the attempt stands open");
+    let open_rows = open.len();
+    let seat = open.last().copied().unwrap_or_default() + 3;
+    seat_the_pin_at(&mut app, seat, &mut pane);
+    let pinned_line = top_text(&app).expect("the pinned row is baked");
+
+    // The second attempt graduates after the frame: in the conversation,
+    // not in the bake the next note would be read against.
+    app.push_message(attempt(&retried));
+    assert!(
+        app.bake.message_ranges.len() < app.conversation.len(),
+        "the new message is not in the last frame's bake"
+    );
+    // The call folds before the next frame, both attempts under the one
+    // toggle, the way a retirement folds it.
+    app.expansion.expanded_tools.remove(&retried);
+    app.note_call_reshape(&retried);
+    app.bake.conversation_generation = app.bake.conversation_generation.saturating_add(1);
+    app.bake.rebake_whole();
+    pane.draw(|frame| app.render(frame))
+        .expect("the folding draw");
+    assert_eq!(
+        top_text(&app).as_deref(),
+        Some(pinned_line.as_str()),
+        "the pinned line stays the view's top row: the painted fold moved the pin once"
+    );
+    assert_eq!(
+        top_row(&app),
+        seat - (open_rows - 1),
+        "lifted by the painted occurrence's open rows alone"
+    );
+}
+
+#[test]
+fn a_first_notch_off_the_tail_survives_a_frame_that_rewraps() {
+    let mut app = app();
+    // Paragraphs that wrap at eighty columns and fit one row at a
+    // hundred and sixty, each naming its line on both wrapped rows.
+    let tall = (0..160)
+        .map(|i| {
+            format!(
+                "older row {i:02} — a first part long enough that the wrap at eighty columns \
+                 falls before the second naming; older row {i:02} — tail"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text { text: tall }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame))
+        .expect("the following draw");
+    assert!(
+        app.scroll.stick.follows() && app.scroll_offset() == 0,
+        "the view follows the tail"
+    );
+    // Well up from the tail — the wider pane gives the conversation fewer
+    // rows — and onto a paragraph's first row, where both widths name it.
+    let tail_top = top_row(&app);
+    let asked_for = (tail_top.saturating_sub(40)..tail_top.saturating_sub(10))
+        .rev()
+        .find(|row| {
+            app.bake
+                .conversation_cache
+                .get(*row)
+                .is_some_and(|line| line.to_string().trim_start().starts_with("older row"))
+        })
+        .expect("a paragraph's first row lies well up from the tail");
+    let expected_no = older_row_no(
+        &app.bake
+            .conversation_cache
+            .get(asked_for)
+            .map_or_else(Default::default, ToString::to_string),
+    )
+    .expect("the requested row names its paragraph");
+
+    // One batch: the detaching notches, then a wider frame. While the
+    // view follows the tail the settle keeps no layout, so the detaching
+    // notch itself keeps the frame's layout for the settle to read.
+    for _ in 0..(tail_top - asked_for) {
+        app.scroll_the_wheel(true);
+    }
+    let mut wider =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 22)).expect("terminal");
+    wider
+        .draw(|frame| app.render(frame))
+        .expect("the rewrapping draw");
+    assert!(!app.scroll.stick.follows(), "the notch detached the view");
+    assert_ne!(
+        app.scroll.settled_width, 80,
+        "the wider pane rewrapped the bake"
+    );
+    assert_eq!(
+        older_row_no(top_text(&app).as_deref().unwrap_or_default()),
+        Some(expected_no),
+        "the first notches off the tail land on the paragraph they asked for, across the \
+         rewrap: {:?}",
+        top_text(&app)
+    );
+}
+
+#[test]
+fn a_first_key_up_off_the_tail_survives_a_frame_that_rewraps() {
+    let mut app = app();
+    let tall = (0..160)
+        .map(|i| {
+            format!(
+                "older row {i:02} — a first part long enough that the wrap at eighty columns \
+                 falls before the second naming; older row {i:02} — tail"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text { text: tall }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame))
+        .expect("the following draw");
+    assert!(
+        app.scroll.stick.follows() && app.scroll_offset() == 0,
+        "the view follows the tail"
+    );
+    let tail_top = top_row(&app);
+    let asked_for = (tail_top.saturating_sub(40)..tail_top.saturating_sub(10))
+        .rev()
+        .find(|row| {
+            app.bake
+                .conversation_cache
+                .get(*row)
+                .is_some_and(|line| line.to_string().trim_start().starts_with("older row"))
+        })
+        .expect("a paragraph's first row lies well up from the tail");
+    let expected_no = older_row_no(
+        &app.bake
+            .conversation_cache
+            .get(asked_for)
+            .map_or_else(Default::default, ToString::to_string),
+    )
+    .expect("the requested row names its paragraph");
+
+    // One batch: the detaching key presses, then a wider frame.
+    for _ in 0..(tail_top - asked_for) {
+        assert!(
+            app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            "the key scrolls"
+        );
+    }
+    let mut wider =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 22)).expect("terminal");
+    wider
+        .draw(|frame| app.render(frame))
+        .expect("the rewrapping draw");
+    assert!(!app.scroll.stick.follows(), "the keys detached the view");
+    assert_eq!(
+        older_row_no(top_text(&app).as_deref().unwrap_or_default()),
+        Some(expected_no),
+        "the key presses land on the paragraph they asked for, across the rewrap: {:?}",
+        top_text(&app)
+    );
+}
+
+#[test]
+fn an_inside_fold_and_a_growth_above_in_one_batch_land_where_separate_frames_land() {
+    fn seated() -> (
+        TuiApp,
+        ratatui::Terminal<ratatui::backend::TestBackend>,
+        usize,
+        String,
+        String,
+    ) {
+        let mut app = app();
+        push_plain_rows(&mut app, "row above", 12);
+        let retried = "retried".to_string();
+        app.retain_tool_detail(
+            &retried,
+            "{\"x\":1}",
+            "detail one\ndetail two\ndetail three\ndetail four\ndetail five",
+        );
+        let attempt = |call_id: &str| TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "Read".to_string(),
+                call_id: call_id.to_string(),
+                input_preview: "x".to_string(),
+                output_preview: "detail one".to_string(),
+                retained_input: String::new(),
+                success: true,
+                elapsed_secs: 0.1,
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        };
+        app.push_message(attempt(&retried));
+        push_plain_rows(&mut app, "row between", 4);
+        let receipt = [
+            "# Task List",
+            "",
+            "● [t1] read the settle math",
+            "◐ [t2] write the pin test",
+            "○ [t3] document the fix",
+        ]
+        .join("\n");
+        let call_id = "call_todo_inside".to_string();
+        app.retain_tool_detail(&call_id, "{\"todos\":[]}", &receipt);
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "TodoWrite".to_string(),
+                call_id: call_id.clone(),
+                input_preview: String::new(),
+                output_preview: receipt,
+                retained_input: String::new(),
+                success: true,
+                elapsed_secs: 0.1,
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        push_plain_rows(&mut app, "row after the plan", 4);
+        app.push_message(attempt(&retried));
+        push_plain_rows(&mut app, "row below", 30);
+        arm_the_plan_block(&mut app, &call_id);
+        let mut pane =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+        pane.draw(|frame| app.render(frame)).expect("first draw");
+        let plan = block_rows_of(&app, &call_id);
+        assert!(plan.len() > 2, "the plan block stands open");
+        let pin = plan[plan.len() - 3];
+        seat_the_pin_at(&mut app, pin, &mut pane);
+        let lower = *block_rows_of(&app, &retried)
+            .last()
+            .expect("the lower occurrence");
+        assert!(
+            lower - pin < app.pacing.last_layout_viewport,
+            "the lower occurrence is on screen to open"
+        );
+        (app, pane, pin, call_id, retried)
+    }
+    fn fold_the_plan(app: &mut TuiApp) {
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "after the fold".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+
+    // The reference: the fold settles in its own frame, then the growth.
+    let (mut reference, mut pane, _pin, call_id, retried) = seated();
+    fold_the_plan(&mut reference);
+    pane.draw(|frame| reference.render(frame))
+        .expect("the folding draw");
+    let lower_now = *block_rows_of(&reference, &retried)
+        .last()
+        .expect("the lower occurrence after the fold");
+    assert!(
+        click_baked_row(&mut reference, lower_now),
+        "the click lands on the lower occurrence"
+    );
+    pane.draw(|frame| reference.render(frame))
+        .expect("the opening draw");
+    let reference_top = top_row(&reference);
+    let reference_text = top_text(&reference);
+    assert!(
+        !reference.expansion.expanded_tools.contains(&call_id)
+            && reference.expansion.expanded_tools.contains(&retried),
+        "the reference folded the plan and opened the retried call"
+    );
+
+    // The batch: the same fold and the same opening, one settle.
+    let (mut batch, mut pane, _pin, _call_id, retried) = seated();
+    let lower = *block_rows_of(&batch, &retried)
+        .last()
+        .expect("the lower occurrence");
+    fold_the_plan(&mut batch);
+    assert!(
+        click_baked_row(&mut batch, lower),
+        "the click lands on the lower occurrence"
+    );
+    pane.draw(|frame| batch.render(frame))
+        .expect("the one batching draw");
+    assert_eq!(
+        top_row(&batch),
+        reference_top,
+        "an inside fold and a growth above in one batch land where separate frames land on"
+    );
+    assert_eq!(top_text(&batch), reference_text, "and on the same line");
+}
+
+#[test]
 fn a_queued_notch_survives_a_frame_that_rewraps_the_transcript() {
     let (mut app, call_id) = app_with_a_plan_block_mid_conversation(true);
     let mut terminal =
@@ -6053,28 +6468,29 @@ fn a_queued_notch_survives_a_frame_that_folds_a_block_and_rewraps() {
 
 #[test]
 fn a_detached_pin_follows_its_line_across_a_zoom() {
-    fn top_text(app: &TuiApp) -> String {
-        let top = app
-            .pacing
-            .last_layout_lines
-            .saturating_sub(app.pacing.last_layout_viewport)
-            .saturating_sub(app.scroll_offset());
-        app.bake
-            .conversation_cache
-            .get(top)
-            .map_or_else(Default::default, ToString::to_string)
-    }
-    /// The `older row NN` a row's text names, if any — every digit of
-    /// the number, so paragraphs 110 and 119 name different lines.
-    fn older_row_no(text: &str) -> Option<u32> {
-        let rest = text.split("older row ").nth(1)?;
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        digits.parse().ok()
-    }
-    assert_eq!(older_row_no("older row 07 — tail"), Some(7));
-    assert_eq!(older_row_no("older row 110 — tail"), Some(110));
-    assert_eq!(older_row_no("older row 119 — tail"), Some(119));
-    assert_eq!(older_row_no("no paragraph here"), None);
+    // The oracle reads a paragraph's number off the row's own text, so
+    // the reader's line is identified by what it says, never by its row.
+    let top_line = |app: &TuiApp| top_text(app).as_deref().and_then(older_row_no);
+    assert_eq!(
+        older_row_no("older row 07 — tail"),
+        Some(7),
+        "a two-digit number parses whole"
+    );
+    assert_eq!(
+        older_row_no("older row 110 — tail"),
+        Some(110),
+        "every digit is taken: 110 does not read as 11"
+    );
+    assert_eq!(
+        older_row_no("older row 119 — tail"),
+        Some(119),
+        "and 119 does not read as 11 either"
+    );
+    assert_eq!(
+        older_row_no("no paragraph here"),
+        None,
+        "a row naming no paragraph is no line"
+    );
 
     let mut app = app();
     // Paragraphs, so each wraps on its own — two rows at eighty columns,
@@ -6117,13 +6533,13 @@ fn a_detached_pin_follows_its_line_across_a_zoom() {
     }
     pane.draw(|frame| app.render(frame)).expect("draw");
     for _ in 0..4 {
-        if older_row_no(&top_text(&app)).is_some() {
+        if top_line(&app).is_some() {
             break;
         }
         app.scroll_the_wheel(true);
         pane.draw(|frame| app.render(frame)).expect("draw");
     }
-    let pinned_no = older_row_no(&top_text(&app)).expect("the pinned row names its line");
+    let pinned_no = top_line(&app).expect("the pinned row names its line");
     let offset0 = app.scroll_offset();
     assert!(
         offset0 >= 20,
@@ -6135,7 +6551,7 @@ fn a_detached_pin_follows_its_line_across_a_zoom() {
     zoomed.draw(|frame| app.render(frame)).expect("draw");
     let zoomed_top = top_text(&app);
     assert_eq!(
-        older_row_no(&zoomed_top),
+        top_line(&app),
         Some(pinned_no),
         "zooming must keep the reader's line at the top: {zoomed_top:?}"
     );
@@ -6147,7 +6563,7 @@ fn a_detached_pin_follows_its_line_across_a_zoom() {
         "the pane's own size restores the offset after the zoom"
     );
     assert_eq!(
-        older_row_no(&top_text(&app)),
+        top_line(&app),
         Some(pinned_no),
         "the line under the reader is still the view's top row after the zoom"
     );
@@ -6161,13 +6577,13 @@ fn a_detached_pin_follows_its_line_across_a_zoom() {
     }
     zoomed.draw(|frame| app.render(frame)).expect("draw");
     for _ in 0..4 {
-        if older_row_no(&top_text(&app)).is_some_and(|no| no < pinned_no) {
+        if top_line(&app).is_some_and(|no| no < pinned_no) {
             break;
         }
         app.scroll_the_wheel(true);
         zoomed.draw(|frame| app.render(frame)).expect("draw");
     }
-    let scrolled_no = older_row_no(&top_text(&app)).expect("the scrolled-to row names its line");
+    let scrolled_no = top_line(&app).expect("the scrolled-to row names its line");
     assert!(
         scrolled_no < pinned_no,
         "the reader scrolled up while zoomed ({scrolled_no} from {pinned_no})"
@@ -6175,7 +6591,7 @@ fn a_detached_pin_follows_its_line_across_a_zoom() {
     pane.draw(|frame| app.render(frame)).expect("draw");
     let back_top = top_text(&app);
     assert_eq!(
-        older_row_no(&back_top),
+        top_line(&app),
         Some(scrolled_no),
         "un-zooming after a zoomed scroll must land on the line the reader scrolled to: {back_top:?}"
     );

@@ -458,8 +458,11 @@ impl TuiApp {
     /// notice landed takes the published history's head text. The
     /// attach mutates a row the bake may already hold rendered, so it
     /// bumps the conversation's generation and rebakes whole — the
-    /// same discipline any mutation of a baked row keeps. A row that
-    /// no longer sits where the drain named it takes nothing.
+    /// same discipline any mutation of a baked row keeps — and, since
+    /// the notice grows by the summary's rows, it notes the notice's
+    /// block first the way any expansion site does, so a detached
+    /// reader below it is spared the growth. A row that no longer sits
+    /// where the drain named it takes nothing.
     pub(crate) fn attach_compaction_summary(&mut self, index: usize, summary: String) {
         let attached = match self.conversation.get_mut(index) {
             Some(TuiMessage::Compacted {
@@ -472,6 +475,7 @@ impl TuiApp {
             _ => false,
         };
         if attached {
+            self.note_block_reshape(&format!("m{index}"));
             self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
             self.bake.rebake_whole();
         }
