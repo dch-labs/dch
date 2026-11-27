@@ -6352,6 +6352,142 @@ fn a_click_that_opens_a_block_and_a_wider_frame_land_on_the_line_the_reader_saw(
 }
 
 #[test]
+fn a_click_after_a_detached_frame_and_a_following_one_maps_through_the_following_width() {
+    // Detached at a wide pane, following again at the narrow one, a block
+    // opened and the frame drawn wide before the click settles. The width
+    // the last detached frame settled at is not the width the click kept
+    // its layout at: the settle must compare against the following frame's
+    // width, or a narrow row number lands in the wide layout. A click and
+    // a draw at one width takes the plain path and keeps the top row.
+    let line = |app: &TuiApp| top_text(app).unwrap_or_default();
+    let mut app = app();
+    let paragraph = |i: usize| {
+        format!(
+            "older row {i:02} — a first part long enough that the wrap at eighty columns falls \
+             before the second naming; older row {i:02} — tail"
+        )
+    };
+    for i in 0..157 {
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text { text: paragraph(i) }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    let call_id = "call_near_tail".to_string();
+    app.retain_tool_detail(&call_id, "{\"x\":1}", "detail one\ndetail two");
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Read".to_string(),
+            call_id: call_id.clone(),
+            input_preview: "x".to_string(),
+            output_preview: "detail one".to_string(),
+            retained_input: String::new(),
+            success: true,
+            elapsed_secs: 0.1,
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    for i in 157..160 {
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text { text: paragraph(i) }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    let mut pane =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 22)).expect("terminal");
+    pane.draw(|frame| app.render(frame)).expect("first draw");
+    let narrow_width = usize::from(app.bake.conversation_cache_width);
+
+    // Detached at the wide pane: a settle there records the wide width.
+    let mut wide =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 22)).expect("terminal");
+    wide.draw(|frame| app.render(frame)).expect("the wide draw");
+    app.scroll_the_wheel(true);
+    wide.draw(|frame| app.render(frame))
+        .expect("the wide detached draw");
+    let wide_settled = app.scroll.settled_width;
+    assert!(
+        !app.scroll.stick.follows() && wide_settled != narrow_width,
+        "detached at the wide pane (settled_width {wide_settled}, narrow {narrow_width})"
+    );
+
+    // Following at the narrow pane with the top row a continuation row: a
+    // blank or first row at the top is moved past by one more row under
+    // the document.
+    let follow_on_a_continuation =
+        |app: &mut TuiApp, pane: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+            app.scroll.scroll_to_bottom();
+            pane.draw(|frame| app.render(frame))
+                .expect("the following draw");
+            assert!(app.scroll.stick.follows(), "following");
+            for _ in 0..3 {
+                if line(app).contains("— tail") && !line(app).trim_start().starts_with("older row")
+                {
+                    break;
+                }
+                app.push_message(TuiMessage::Assistant {
+                    blocks: vec![ContentBlock::Text {
+                        text: "a tail pad row".to_string(),
+                    }],
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: None,
+                });
+                pane.draw(|frame| app.render(frame))
+                    .expect("the padding draw");
+            }
+        };
+    follow_on_a_continuation(&mut app, &mut pane);
+    let expected_no = older_row_no(&line(&app)).expect("the top row names its paragraph");
+    let summary_row = block_rows_of(&app, &call_id)[0];
+    assert!(
+        summary_row >= top_row(&app),
+        "the block is on screen for the click (summary {summary_row}, top {})",
+        top_row(&app)
+    );
+
+    // One batch: the click, then the wide frame.
+    assert!(
+        click_baked_row(&mut app, summary_row),
+        "the click lands on the summary"
+    );
+    wide.draw(|frame| app.render(frame))
+        .expect("the wide rewrapping draw");
+    assert_eq!(
+        older_row_no(&line(&app)),
+        Some(expected_no),
+        "the view's top names the paragraph the following frame showed, not a narrow row in the \
+         wide layout: {:?}",
+        line(&app)
+    );
+
+    // A click and a draw at one width: the plain path, the top row kept.
+    app.expansion.expanded_tools.remove(&call_id);
+    app.bake.rebake_whole();
+    follow_on_a_continuation(&mut app, &mut pane);
+    let expected_line = line(&app);
+    let summary_row = block_rows_of(&app, &call_id)[0];
+    assert!(
+        click_baked_row(&mut app, summary_row),
+        "the click lands on the summary"
+    );
+    assert_eq!(
+        app.scroll.settled_width,
+        usize::from(app.bake.conversation_cache_width),
+        "a following settle records its width, so the click's frame takes the plain path"
+    );
+    pane.draw(|frame| app.render(frame))
+        .expect("the same-width draw");
+    assert_eq!(
+        line(&app),
+        expected_line,
+        "a click followed by a draw at the same width keeps the top row"
+    );
+}
+
+#[test]
 fn an_occurrence_the_last_frame_did_not_paint_takes_no_note() {
     let mut app = app();
     push_plain_rows(&mut app, "row above", 15);

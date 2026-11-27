@@ -555,7 +555,10 @@ pub(crate) struct ScrollPosture {
     /// survives the rewrap instead of being replaced by the old pin.
     pub(crate) settled_layout: Option<Box<BakeLayout>>,
 
-    /// The bake width the last settle saw.
+    /// The bake width the last settle saw, the following ones too: a
+    /// click that detaches keeps the layout of the frame it was made in,
+    /// and the next settle compares against that frame's width, never the
+    /// last detached one's.
     ///
     /// A different width this frame means the bake rewrapped and moved
     /// every row, so the settle maps the pin's identity onto the rebaked

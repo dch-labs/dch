@@ -2283,6 +2283,7 @@ impl TuiApp {
     /// ([`PinIdentity`]) — and mapped onto the rebaked rows, where its row
     /// index alone would name a different line.
     fn settle_scroll_offset(&mut self, total_lines: usize, viewport: usize) {
+        let width = usize::from(self.bake.conversation_cache_width);
         if self.scroll.stick.follows() {
             self.scroll.scroll_offset = 0;
             self.scroll.anchored_row = None;
@@ -2290,6 +2291,7 @@ impl TuiApp {
             self.scroll.pin_identity = None;
             self.scroll.reshaped_blocks.clear();
             self.scroll.settled_layout = None;
+            self.scroll.settled_width = width;
         } else {
             let reader_moved = self.scroll.scroll_offset != self.scroll.settled_offset;
             let base = self.pin_base();
@@ -2298,7 +2300,6 @@ impl TuiApp {
             let pin = requested
                 .saturating_add(landed_above)
                 .saturating_sub(left_above);
-            let width = usize::from(self.bake.conversation_cache_width);
             let mut retained = None;
             let pin = if width == self.scroll.settled_width {
                 pin
