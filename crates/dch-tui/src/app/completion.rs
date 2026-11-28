@@ -292,9 +292,8 @@ impl TuiApp {
             .is_some_and(|(prefix, _)| prefix.starts_with("/theme "));
         if !browse_stands {
             self.browse.theme_before_browse = None;
-            self.theme = theme;
+            self.swap_theme(theme);
             self.browse.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
-            self.invalidate_conversation_renders();
         }
     }
 
@@ -313,10 +312,9 @@ impl TuiApp {
             self.completion.completion_dismissed = Some(self.composer.input.stamp());
             self.completion.completion = None;
             if let Some(theme) = self.browse.theme_before_browse.take() {
-                self.theme = theme;
+                self.swap_theme(theme);
                 self.browse.pending_theme_osc =
                     Some((self.theme.ui.background, self.theme.ui.primary));
-                self.invalidate_conversation_renders();
             }
             return true;
         }

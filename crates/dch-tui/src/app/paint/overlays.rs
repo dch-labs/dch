@@ -51,7 +51,7 @@ impl TuiApp {
             return;
         };
         let wrap_at = usize::from(area.width.saturating_sub(4));
-        let sheet_area = self.question_sheet_area(area);
+        let sheet_area = self.display.question_sheet_area(area);
         let budget = usize::from(sheet_area.height.saturating_sub(2));
         let sheet = self.question_sheet(entry, wrap_at, more, budget);
         let lines = sheet.lines;

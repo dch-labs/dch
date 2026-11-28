@@ -614,12 +614,14 @@ fn folded_hint(rows: &[TodoRow], colors: &TodoColors) -> Line<'static> {
 /// that one row, it stands there instead — no ellipsis at all, the
 /// whole list on screen for the price of the count that hid it.
 /// The caller's height arithmetic counts what this returns, so the
-/// layout always pays for exactly what is painted. `ways` carries the
-/// two gestures the section may name: the chord's next act for the
-/// badge, and the way to the cut rows for the ellipsis — the caller's,
-/// because it knows the posture: the chord while the cap holds the
-/// window, the wheel once the window is open, where the chord would
-/// fold the section.
+/// layout always pays for exactly what is painted. `ways` is asked
+/// once the window has settled and the cap has said what it cut —
+/// the chord's next act depends on that — and carries back the two
+/// gestures the section may name: the chord's next act for the
+/// badge, and the way to the cut rows for the ellipsis. Both are
+/// the caller's, because it knows the posture: the chord while the
+/// cap holds the window, the wheel once the window is open, where
+/// the chord would fold the section.
 pub(crate) fn section_lines(
     rows: &[TodoRow],
     changes: &HashMap<String, TodoStatus>,
@@ -627,8 +629,33 @@ pub(crate) fn section_lines(
     width: u16,
     body_cap: usize,
     skip: usize,
-    ways: (Option<&'static str>, &'static str),
+    ways: impl FnOnce(bool) -> (Option<&'static str>, &'static str),
 ) -> Vec<Line<'static>> {
+    let groups: Vec<Vec<Line<'static>>> = rows
+        .iter()
+        .skip(skip)
+        .map(|row| render_rows(std::slice::from_ref(row), changes, colors, width))
+        .collect();
+    let mut body = Vec::new();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for (index, group) in groups.into_iter().enumerate() {
+        if used.saturating_add(group.len()) > body_cap {
+            let rides_the_ellipsis = index.saturating_add(1).saturating_add(skip) == rows.len()
+                && used.saturating_add(group.len()) <= body_cap.saturating_add(1);
+            if !rides_the_ellipsis {
+                if used == 0 && body_cap > 0 && !group.is_empty() {
+                    body.extend(group.into_iter().take(body_cap));
+                }
+                break;
+            }
+        }
+        used = used.saturating_add(group.len());
+        shown = shown.saturating_add(1);
+        body.extend(group);
+    }
+    let more = rows.len().saturating_sub(skip).saturating_sub(shown);
+    let (chord_hint, cut_way) = ways(more > 0);
     let mut badge_spans = vec![
         Span::styled(
             format!(" {TODO_TITLE} "),
@@ -642,7 +669,6 @@ pub(crate) fn section_lines(
             Style::default().fg(colors.dim),
         ),
     ];
-    let (chord_hint, cut_way) = ways;
     if let Some(chord) = chord_hint {
         badge_spans.push(Span::raw(" · "));
         badge_spans.push(Span::styled(
@@ -651,29 +677,7 @@ pub(crate) fn section_lines(
         ));
     }
     let mut lines = vec![Line::from(Vec::new()), Line::from(badge_spans)];
-    let groups: Vec<Vec<Line<'static>>> = rows
-        .iter()
-        .skip(skip)
-        .map(|row| render_rows(std::slice::from_ref(row), changes, colors, width))
-        .collect();
-    let mut used = 0usize;
-    let mut shown = 0usize;
-    for (index, group) in groups.into_iter().enumerate() {
-        if used.saturating_add(group.len()) > body_cap {
-            let rides_the_ellipsis = index.saturating_add(1).saturating_add(skip) == rows.len()
-                && used.saturating_add(group.len()) <= body_cap.saturating_add(1);
-            if !rides_the_ellipsis {
-                if used == 0 && body_cap > 0 && !group.is_empty() {
-                    lines.extend(group.into_iter().take(body_cap));
-                }
-                break;
-            }
-        }
-        used = used.saturating_add(group.len());
-        shown = shown.saturating_add(1);
-        lines.extend(group);
-    }
-    let more = rows.len().saturating_sub(skip).saturating_sub(shown);
+    lines.extend(body);
     if more > 0 {
         lines.push(Line::styled(
             format!("… +{more} more ({cut_way})"),
@@ -776,6 +780,81 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
     }
 
     #[test]
+    fn the_badge_hint_is_asked_with_the_cut_the_section_renders() {
+        // The chord's next act depends on whether the cap cut an entry,
+        // and the cap answers only once the window has settled — so the
+        // hint is asked with that answer, inside the render that draws
+        // it. A hint read off an earlier frame's cut names the opposite
+        // of the next press for as long as the two disagree. A final
+        // entry that rides the ellipsis row is no cut: the list stands
+        // whole, and the badge says so.
+        let rows = parse_submission(
+            r#"{"todos":[
+                {"id":"1","subject":"task one"},
+                {"id":"2","subject":"task two"},
+                {"id":"3","subject":"task three"},
+                {"id":"4","subject":"task four"}
+            ]}"#,
+        )
+        .expect("the submission parses");
+        let colors = TodoColors {
+            plain: ratatui::style::Color::Reset,
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        };
+        let asked = std::cell::Cell::new(None);
+        let render = |rows: &[TodoRow], asked: &std::cell::Cell<Option<bool>>| {
+            let lines = section_lines(rows, &HashMap::new(), &colors, 60, 2, 0, |cut| {
+                asked.set(Some(cut));
+                (Some(if cut { "open" } else { "fold" }), "way")
+            });
+            lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<String>>()
+        };
+
+        let text = render(&rows, &asked);
+        assert_eq!(
+            asked.get(),
+            Some(true),
+            "four entries under a two-row cap cut"
+        );
+        assert!(
+            text[1].contains("open"),
+            "the badge names the opening: {text:?}"
+        );
+        assert!(
+            text.last()
+                .is_some_and(|line| line.contains("… +2 more (way)")),
+            "the ellipsis names the two cut entries: {text:?}"
+        );
+
+        let text = render(&rows[..3], &asked);
+        assert_eq!(
+            asked.get(),
+            Some(false),
+            "the final entry rides the ellipsis row, so nothing is cut"
+        );
+        assert!(
+            text[1].contains("fold"),
+            "the badge names the fold: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("… +")),
+            "no ellipsis stands for a whole list: {text:?}"
+        );
+    }
+
+    #[test]
     fn a_result_without_a_task_list_parses_to_none() {
         // The cleared list and any error answer None, so the caller
         // falls back to reading the request — never to inventing rows.
@@ -807,15 +886,9 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(
-            &rows,
-            &HashMap::new(),
-            &colors,
-            60,
-            4,
-            2,
-            (None, "ctrl+t to open"),
-        );
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 2, |_| {
+            (None, "ctrl+t to open")
+        });
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -970,15 +1043,9 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(
-            &rows,
-            &HashMap::new(),
-            &colors,
-            60,
-            0,
-            0,
-            (None, "ctrl+t to open"),
-        );
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, 0, |_| {
+            (None, "ctrl+t to open")
+        });
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1076,15 +1143,9 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(
-            &rows,
-            &HashMap::new(),
-            &colors,
-            60,
-            0,
-            0,
-            (None, "ctrl+t to open"),
-        );
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, 0, |_| {
+            (None, "ctrl+t to open")
+        });
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1127,15 +1188,9 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(
-            &rows,
-            &HashMap::new(),
-            &colors,
-            60,
-            4,
-            0,
-            (None, "ctrl+t to open"),
-        );
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 0, |_| {
+            (None, "ctrl+t to open")
+        });
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1168,15 +1223,9 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
                 status: TodoStatus::Pending,
             })
             .collect();
-        let lines = section_lines(
-            &rows,
-            &HashMap::new(),
-            &colors,
-            60,
-            4,
-            0,
-            (None, "ctrl+t to open"),
-        );
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 0, |_| {
+            (None, "ctrl+t to open")
+        });
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1255,15 +1304,9 @@ mod long_subject_wrap {
 
         // And the section's arithmetic pays for the wrap: the open
         // posture's line count includes every continuation row.
-        let section = section_lines(
-            &rows,
-            &HashMap::new(),
-            &colors,
-            30,
-            usize::MAX,
-            0,
-            (None, "ctrl+t to open"),
-        );
+        let section = section_lines(&rows, &HashMap::new(), &colors, 30, usize::MAX, 0, |_| {
+            (None, "ctrl+t to open")
+        });
         assert_eq!(
             section.len(),
             lines.len() + 2,
@@ -1312,23 +1355,17 @@ mod review_2026_11_01_round {
         // One entry whose wording wraps past the whole budget keeps its
         // head — the budget pays for even one row — and what did not
         // fit stands behind the ellipsis: the entry is cut, not
-        // complete, so the plan-cut flag reads true and Ctrl+T opens
-        // the whole list.
+        // complete, so the section counts the list as cut and Ctrl+T
+        // opens the whole list.
         let subject = "word ".repeat(24);
         let rows = vec![TodoRow {
             id: "solo".to_string(),
             subject,
             status: TodoStatus::Pending,
         }];
-        let lines = section_lines(
-            &rows,
-            &HashMap::new(),
-            &plain_colors(),
-            20,
-            4,
-            0,
-            (None, "ctrl+t to open"),
-        );
+        let lines = section_lines(&rows, &HashMap::new(), &plain_colors(), 20, 4, 0, |_| {
+            (None, "ctrl+t to open")
+        });
         let text: Vec<String> = lines
             .iter()
             .map(|line| {

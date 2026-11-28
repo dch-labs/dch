@@ -35,7 +35,7 @@ impl TuiApp {
                 }
                 self.composer.caret_blink.resolidify();
                 if !self.questions.pending_questions.is_empty() {
-                    return self.paste_into_the_question(text);
+                    return self.questions.paste_into_the_question(text);
                 }
                 if self.queue.queue_mode == QueueMode::Focused {
                     return true;

@@ -86,7 +86,7 @@ impl TuiApp {
                 } => {
                     if let Some(prompt) = maybe_question {
                         match question_rx.as_mut() {
-                            Some(rx) => self.land_question_requests(prompt, rx),
+                            Some(rx) => self.questions.land_question_requests(prompt, rx),
                             None => {
                                 self.questions.pending_questions
                                     .push_back(PendingQuestion::new(prompt));
@@ -115,7 +115,7 @@ impl TuiApp {
                 } => {
                     if let Some(request) = maybe_request {
                         match permission_rx.as_mut() {
-                            Some(rx) => self.land_permission_requests(request, rx),
+                            Some(rx) => self.permission.land_permission_requests(request, rx),
                             None => self.permission.pending_permissions.push_back(request),
                         }
                         true
@@ -407,6 +407,42 @@ pub(crate) struct FramePacing {
     pub(crate) full_repaint_due: Option<Instant>,
 }
 
+impl FramePacing {
+    /// Spend the parked redraw request, stamping the frame time.
+    ///
+    /// `false`, and nothing moved, while no request is parked;
+    /// otherwise the request is spent, `last_frame` takes `now` so the
+    /// interval restarts from the frame it pays for, and the answer is
+    /// `true` without a look at the interval — the tick that asks is
+    /// owed the frame whenever it lands. The reasoning behind that
+    /// reading is on the public claim, `TuiApp::take_pending_redraw`.
+    pub(super) fn take_pending_redraw(&mut self, now: Instant) -> bool {
+        if !self.render_pending {
+            return false;
+        }
+        self.render_pending = false;
+        self.last_frame = Some(now);
+        true
+    }
+
+    /// The instant the strip animates against: a pin's clock when one
+    /// stands, the real clock otherwise.
+    ///
+    /// The glow's phase is a pure function of the time since the
+    /// run's anchor, so a pin that fixes both ends asserts an exact
+    /// brightness instead of racing the milliseconds between setting
+    /// the anchor and drawing the frame.
+    pub(super) fn pulse_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(pinned) = self.pulse_clock.get() {
+            return pinned;
+        }
+        #[cfg(not(test))]
+        let _ = self;
+        Instant::now()
+    }
+}
+
 /// The periodic beat the run loop wakes on.
 ///
 /// The loop's coarse chores ride this beat: claiming a redraw a
@@ -439,6 +475,44 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use loopctl::middleware::PermissionResolution;
     use std::sync::Arc;
+
+    #[test]
+    fn a_public_redraw_claim_is_owed_its_frame_and_restarts_the_interval() {
+        // The public claim carries the pacing state's whole contract:
+        // nothing parked draws nothing and stamps nothing, a parked
+        // request is spent on the first claim whatever the interval
+        // says — the frame is owed, not re-checked — and the claim
+        // stamps the frame time the interval restarts from.
+        let mut app = app();
+        let now = std::time::Instant::now();
+        assert!(
+            !app.take_pending_redraw(now),
+            "nothing parked: nothing owed"
+        );
+        assert_eq!(
+            app.pacing.last_frame, None,
+            "an unclaimed tick stamps no frame time"
+        );
+        app.pacing.render_pending = true;
+        // Inside the interval: a frame was stamped a millisecond ago.
+        app.pacing.last_frame = Some(
+            now.checked_sub(std::time::Duration::from_millis(1))
+                .expect("a millisecond fits before now"),
+        );
+        assert!(
+            app.take_pending_redraw(now),
+            "a parked request is owed its frame inside the interval"
+        );
+        assert_eq!(
+            app.pacing.last_frame,
+            Some(now),
+            "the claim stamps the frame time"
+        );
+        assert!(
+            !app.take_pending_redraw(now),
+            "one request pays for one frame"
+        );
+    }
 
     #[test]
     fn drain_shared_state_moves_retry_lines_into_the_conversation() {

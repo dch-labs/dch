@@ -79,9 +79,7 @@ use self::composer::INPUT_SIDE_INSET;
 use self::exit::QuitState;
 use self::notices::{NOTICE_HOLD, error_block_lines, format_duration, plain_wrapped_lines};
 use self::paint::welcome::{WelcomeShape, WelcomeState};
-use self::queue::QueueMode;
 use self::run::FRAME_INTERVAL;
-use self::todos::PlanView;
 use crate::markdown;
 use crate::todo_view;
 
@@ -185,13 +183,28 @@ pub(crate) struct HostLanes {
     pub(crate) git_branch: Option<String>,
 }
 
+impl HostLanes {
+    /// Hand `id` to the driver, reporting whether the channel took it.
+    ///
+    /// The send is a [`Submission::Run`]: the driver resolves the id
+    /// against the shared queue when the turn comes, so this never has to
+    /// take anything back.
+    fn send_queued_id(&self, id: u64) -> bool {
+        self.submit_tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(Submission::Run { id }).is_ok())
+    }
+}
+
 /// The display settings the session carries live: the verbosity, the
 /// strip's placement, and its animation style.
 ///
 /// The three `[display]` values a runtime command can move without a
 /// restart, read every frame. The rest of the display section lives
 /// on the config; these ride the app because they change mid-session
-/// and every painter reads them per frame.
+/// and every painter reads them per frame. The seat the host states
+/// rides beside them — not a setting, but read like one by the canvas
+/// decision.
 pub(crate) struct DisplayState {
     /// The display verbosity shaping tool lines.
     ///
@@ -222,6 +235,36 @@ pub(crate) struct DisplayState {
     /// otherwise. A test states it to pin either seat regardless of
     /// the shell the suite runs in.
     pub(crate) terminal_seat: Option<bool>,
+}
+
+impl DisplayState {
+    /// The rows a question sheet may take over the frame.
+    ///
+    /// The status bar's two content rows stay its own — the session
+    /// line reads while an ask waits — while the footer's air is
+    /// margin no pane paints, which the sheet may stand on: a deeper
+    /// composer margin costs the sheet no rows it did not already
+    /// spend. So does the strip's row when the strip is configured to
+    /// the top of the terminal: the sheet cannot occupy a row the
+    /// layout has already promised elsewhere, and a reservation that
+    /// counted it too asked the solver for one row more than the frame
+    /// had, leaving it to squeeze an unspecified pane to pay. The
+    /// origin moves down with the strip row, so the sheet's bottom
+    /// edge — anchored above the status bar — stays where it is in
+    /// every strip position. Both the
+    /// reservation and the box derive their height from here, so they
+    /// cannot disagree about how much room there is.
+    fn question_sheet_area(&self, area: Rect) -> Rect {
+        let strip_rows = u16::from(matches!(self.strip_position, StripPosition::Top));
+        Rect {
+            y: area.y.saturating_add(strip_rows),
+            height: area
+                .height
+                .saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR)
+                .saturating_sub(strip_rows),
+            ..area
+        }
+    }
 }
 
 impl Stick {
@@ -327,8 +370,10 @@ pub struct TuiApp {
     /// The active palette and element styles.
     ///
     /// Resolved from `config.display.theme` at construction; an
-    /// unknown name warns and falls back to the default theme.
-    pub theme: Theme,
+    /// unknown name warns and falls back to the default theme. Swapped
+    /// only through [`swap_theme`](Self::swap_theme), which drops every
+    /// rendering cached under the palette it replaces.
+    theme: Theme,
 
     /// The conversation so far, oldest first.
     ///
@@ -633,6 +678,44 @@ impl TuiApp {
         &self.conversation
     }
 
+    /// The active palette and element styles.
+    ///
+    /// A borrowed view for the embedding host: every painter reads the
+    /// same value each frame, so a caller measuring against it sees
+    /// what the next frame draws.
+    #[must_use]
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Swap the live theme and drop every rendering cached under the
+    /// one it replaces.
+    ///
+    /// The host's entry point — the startup deferral that hands a
+    /// terminal's own scheme back to its palette — and the public face
+    /// of the replacement every swap in the crate funnels through. The
+    /// bake, the merged cache, and the live lane's styled rows all
+    /// re-render under the new palette on the next frame. Nothing is
+    /// written to the terminal: a palette that keeps a canvas of its
+    /// own owes the cursor tint and the canvas write, which stay the
+    /// caller's to land, while the deferral owes neither.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.swap_theme(theme);
+    }
+
+    /// Replace the live theme, invalidating every cached rendering, and
+    /// hand back the palette it displaced.
+    ///
+    /// The one place the field is assigned. The displaced palette comes
+    /// back for the caller that means to restore it — a browse remembers
+    /// what the session wore before the preview began. The cursor tint
+    /// and the terminal's canvas are the caller's to land: they follow
+    /// the palette by different routes and at different moments.
+    pub(crate) fn swap_theme(&mut self, theme: Theme) -> Theme {
+        self.invalidate_conversation_renders();
+        std::mem::replace(&mut self.theme, theme)
+    }
+
     /// Append a message to the conversation.
     ///
     /// The observer and the session-resume path use this to populate
@@ -641,16 +724,19 @@ impl TuiApp {
     /// rows it baked while the flag stood: a mid-conversation block is
     /// past the tail the incremental bake re-renders, so the fold
     /// invalidates the whole bake rather than leave an expanded shape
-    /// standing on a flag it just cleared.
+    /// standing on a flag it just cleared. Either way the generation
+    /// moves once for the one message: the fold's rebake advances it,
+    /// and a push that folded nothing advances it alone.
     pub fn push_message(&mut self, message: TuiMessage) {
         if let Some(id) = self.expansion.auto_expanded_todo.take()
             && self.expansion.expanded_tools.remove(&id)
         {
             self.note_call_reshape(&id);
             self.bake.rebake_whole();
+        } else {
+            self.bake.bump_generation();
         }
         self.conversation.push(message);
-        self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
     }
 
     /// Name the session the status bar shows.
@@ -840,7 +926,6 @@ impl TuiApp {
         self.plan.todo_section_changes.clear();
         self.seed_messages(transcript);
         self.bake.rebake_whole();
-        self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
         self.expansion.expanded_thinking.clear();
         self.expansion.expanded_compactions.clear();
         self.pointer.selection = None;
@@ -961,9 +1046,8 @@ impl TuiApp {
             crate::terminal::restore_captured_canvas();
             return false;
         };
-        self.theme = theme;
+        self.swap_theme(theme);
         crate::terminal::set_cursor_color(self.theme.ui.primary);
-        self.invalidate_conversation_renders();
         true
     }
 
@@ -1515,19 +1599,15 @@ impl TuiApp {
     ///
     /// Returns whether a capped background request was waiting;
     /// claiming stamps the frame time so the interval restarts. The
-    /// claim does not itself re-check the interval — a parked
-    /// request is owed its frame whenever the tick lands, which can
-    /// sit inside the interval after a notify-initiated frame; the
-    /// tick stays several frame intervals wide, so the reading is
-    /// deliberate. Ticks with nothing pending and no tools in
-    /// flight still draw nothing.
+    /// claim does not itself re-check the interval — a parked request
+    /// is owed its frame whenever the tick lands, which can sit inside
+    /// the interval after a notify-initiated frame; the tick stays
+    /// several frame intervals wide, so the reading is deliberate.
+    /// Ticks with nothing pending and no tools in flight still draw
+    /// nothing. The run loop asks the pacing state directly; the
+    /// integration suites ask through here.
     pub fn take_pending_redraw(&mut self, now: Instant) -> bool {
-        if !self.pacing.render_pending {
-            return false;
-        }
-        self.pacing.render_pending = false;
-        self.pacing.last_frame = Some(now);
-        true
+        self.pacing.take_pending_redraw(now)
     }
 
     /// Handle a wake from the shared notify.
@@ -1556,7 +1636,7 @@ impl TuiApp {
     /// own beat. An idle tick between flips and away from all of the
     /// above draws nothing.
     pub fn tick_wake(&mut self, now: Instant) -> bool {
-        let claimed = self.take_pending_redraw(now);
+        let claimed = self.pacing.take_pending_redraw(now);
         let dragged = if self.permission.pending_permissions.front().is_some() {
             self.pointer.drag_position = None;
             false
@@ -1660,8 +1740,11 @@ impl TuiApp {
         let place_shown = sections.stands(SECTION_PLACE);
         let ruled = self.theme.ui.composer_border.is_some();
         let question_reserved = if let Some(page) = question_page {
-            let sheet =
-                self.question_sheet_height(area.width, self.question_sheet_area(area).height, page);
+            let sheet = self.question_sheet_height(
+                area.width,
+                self.display.question_sheet_area(area).height,
+                page,
+            );
             sheet
                 .saturating_sub(composer_height)
                 .saturating_sub(2)
@@ -2091,22 +2174,6 @@ impl TuiApp {
         }
     }
 
-    /// The plan badge's chord hint, naming what the next press does.
-    ///
-    /// The cycle spends its press differently per posture — and the
-    /// capped posture's press depends on whether the cap actually cut
-    /// an entry — so the badge tells the truth for the state it stands
-    /// in: a cut cap names the open, a whole cap and the open list
-    /// name the fold. `None` for the hidden posture, whose one row
-    /// carries its own hint.
-    fn plan_chord_hint(&self) -> Option<&'static str> {
-        match self.plan.plan_view {
-            PlanView::Hidden => None,
-            PlanView::Capped if self.plan.plan_cut.get() => Some("ctrl+t to open"),
-            PlanView::Full | PlanView::Capped => Some("ctrl+t to hide"),
-        }
-    }
-
     /// Bake the conversation cache incrementally.
     ///
     /// Messages are immutable once a newer one follows — only the
@@ -2295,7 +2362,7 @@ impl TuiApp {
         } else {
             let reader_moved = self.scroll.scroll_offset != self.scroll.settled_offset;
             let base = self.pin_base();
-            let requested = self.pin_after_reader_move(base);
+            let requested = self.scroll.pin_after_reader_move(base);
             let (landed_above, left_above) = self.rows_moved_above_anchor();
             let pin = requested
                 .saturating_add(landed_above)
@@ -2308,7 +2375,7 @@ impl TuiApp {
                 match layout.and_then(|layout| {
                     Self::pin_identity_in(requested, &layout.ranges, &layout.units)
                 }) {
-                    Some(identity) => match self.pin_row_after_rewrap(identity) {
+                    Some(identity) => match self.bake.pin_row_after_rewrap(identity) {
                         Some(row) => {
                             retained = Some(identity);
                             row
@@ -2319,7 +2386,7 @@ impl TuiApp {
                 }
             } else {
                 match self.scroll.pin_identity {
-                    Some(identity) => self.pin_row_after_rewrap(identity).unwrap_or(pin),
+                    Some(identity) => self.bake.pin_row_after_rewrap(identity).unwrap_or(pin),
                     None => {
                         match self
                             .scroll
@@ -2329,7 +2396,8 @@ impl TuiApp {
                                 Self::pin_identity_in(requested, &layout.ranges, &layout.units)
                             })
                             .and_then(|identity| {
-                                self.pin_row_after_rewrap(identity)
+                                self.bake
+                                    .pin_row_after_rewrap(identity)
                                     .map(|row| (identity, row))
                             }) {
                             Some((identity, row)) => {
@@ -2398,22 +2466,7 @@ impl TuiApp {
     /// so the settle re-measures against the same pin whatever the reader
     /// has done since.
     fn pinned_row(&self) -> usize {
-        self.pin_after_reader_move(self.pin_base())
-    }
-
-    /// `base` moved by whatever the reader has done to the offset since
-    /// the last settle: a notch up takes it a row higher, a notch down a
-    /// row lower.
-    fn pin_after_reader_move(&self, base: usize) -> usize {
-        let up = self
-            .scroll
-            .scroll_offset
-            .saturating_sub(self.scroll.settled_offset);
-        let down = self
-            .scroll
-            .settled_offset
-            .saturating_sub(self.scroll.scroll_offset);
-        base.saturating_add(down).saturating_sub(up)
+        self.scroll.pin_after_reader_move(self.pin_base())
     }
 
     /// The pin as the last settle left it, before whatever the reader has
@@ -2494,35 +2547,6 @@ impl TuiApp {
         })
     }
 
-    /// The row the pin's identity names under the current bake, after a
-    /// rewrap moved every unit's rows: the unit opens at its new start,
-    /// and the offset scales by the unit's new row count over the old —
-    /// under uniform wrapping the same source line, give or take a row.
-    fn pin_row_after_rewrap(&self, identity: PinIdentity) -> Option<usize> {
-        let range = self.bake.message_ranges.get(identity.message)?;
-        let blocks = self.bake.message_units.get(identity.message)?;
-        let units = blocks.get(identity.block)?;
-        let start = *units.get(identity.unit)?;
-        let end = units
-            .get(identity.unit.saturating_add(1))
-            .copied()
-            .or_else(|| {
-                blocks
-                    .get(identity.block.saturating_add(1))
-                    .and_then(|units| units.first())
-                    .copied()
-            })
-            .unwrap_or(range.end);
-        let rows = end.saturating_sub(start);
-        let offset = identity
-            .offset
-            .saturating_mul(rows)
-            .checked_div(identity.unit_rows)
-            .unwrap_or_default()
-            .min(rows.saturating_sub(1));
-        Some(start.saturating_add(offset))
-    }
-
     /// The rows the block registered under `key` holds above `pin`.
     ///
     /// Tool, thinking, and compaction blocks alike — a key names one
@@ -2530,7 +2554,8 @@ impl TuiApp {
     /// inside this way, before and after a change, and moves the pin by
     /// the difference.
     fn rows_above_pin(&self, key: &str, message: Option<usize>, pin: usize) -> usize {
-        self.block_rows(key, message)
+        self.bake
+            .block_rows(key, message)
             .into_iter()
             .filter(|row| *row < pin)
             .count()
@@ -2542,42 +2567,9 @@ impl TuiApp {
     /// wholly above the pin — its last row before the pin — from one the
     /// pin sat inside, and apply the right rule to each.
     fn block_shape(&self, key: &str, message: Option<usize>) -> (usize, usize) {
-        let rows = self.block_rows(key, message);
+        let rows = self.bake.block_rows(key, message);
         let last_row = rows.iter().copied().max().unwrap_or(0);
         (rows.len(), last_row)
-    }
-
-    /// The rows the block registered under `key` holds in the bake's row
-    /// maps, within `message` alone when a shared call id has to name one
-    /// of its occurrences.
-    ///
-    /// Tool, thinking, and compaction blocks alike: the three maps are
-    /// read together, since the caller knows the key and not which map
-    /// carries it.
-    fn block_rows(&self, key: &str, message: Option<usize>) -> Vec<usize> {
-        let mut rows: Vec<usize> = [
-            &self.bake.tool_summary_lines,
-            &self.bake.thinking_summary_lines,
-            &self.bake.compaction_summary_lines,
-        ]
-        .into_iter()
-        .flat_map(|map| map.iter())
-        .filter(|(_, id)| id.as_str() == key)
-        .map(|(row, _)| *row)
-        .filter(|row| {
-            // No message named: every row the key holds. One named: only
-            // the rows inside it, and none at all when the bake holds no
-            // such message — an occurrence the last frame did not paint.
-            message.is_none_or(|message| {
-                self.bake
-                    .message_ranges
-                    .get(message)
-                    .is_some_and(|range| range.contains(row))
-            })
-        })
-        .collect();
-        rows.sort_unstable();
-        rows
     }
 
     /// Note, ahead of its `rebake_whole()`, that the block registered
@@ -2731,10 +2723,10 @@ impl TuiApp {
             if let Some(index) = self.tools.retry_row_index.get(&line.episode).copied() {
                 if let Some(TuiMessage::System { text, .. }) = self.conversation.get_mut(index) {
                     *text = line.text;
-                    self.bake.conversation_generation =
-                        self.bake.conversation_generation.saturating_add(1);
                     if index < self.bake.conversation_baked_through {
                         self.bake.rebake_whole();
+                    } else {
+                        self.bake.bump_generation();
                     }
                 }
             } else {
@@ -2795,8 +2787,7 @@ impl TuiApp {
                     }) = self.conversation.last_mut()
                     {
                         *reply_duration = Some(duration_ms);
-                        self.bake.conversation_generation =
-                            self.bake.conversation_generation.saturating_add(1);
+                        self.bake.bump_generation();
                     }
                 }
                 Graduation::Tool(result) => {
@@ -3066,20 +3057,6 @@ impl TuiApp {
             return None;
         }
         Some("ctrl+s to guide".to_string())
-    }
-
-    /// Whether the waiting section holds the keyboard, the composer
-    /// reduced to reading matter.
-    ///
-    /// True while the section is focused or holding an ask — the two
-    /// states where a keypress lands on the queue, not the draft — and
-    /// false the moment the keys come back: an edit lifts a prompt into
-    /// the composer, and there the composer is the active editor again.
-    fn section_holds_keys(&self) -> bool {
-        matches!(
-            self.queue.queue_mode,
-            QueueMode::Focused | QueueMode::Confirming { .. }
-        )
     }
 }
 

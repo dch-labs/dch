@@ -333,14 +333,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::terminal::set_multiplexed_for_tests(Some(false));
         let mut deferred = app();
-        deferred.theme = deferred.theme.deferred_to_terminal();
+        deferred.set_theme(deferred.theme().deferred_to_terminal());
         let mut deferred_terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
         deferred_terminal
             .draw(|frame| deferred.render(frame))
             .expect("deferred draw");
         let mut seated = app();
-        seated.theme = seated.theme.deferred_to_terminal();
+        seated.set_theme(seated.theme().deferred_to_terminal());
         seated.set_terminal_seat(true);
         let mut seated_terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");

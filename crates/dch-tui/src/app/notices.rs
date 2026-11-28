@@ -476,7 +476,6 @@ impl TuiApp {
         };
         if attached {
             self.note_block_reshape(&format!("m{index}"));
-            self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
             self.bake.rebake_whole();
         }
     }

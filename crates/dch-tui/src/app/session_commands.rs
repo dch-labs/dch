@@ -617,8 +617,7 @@ impl TuiApp {
         match key {
             "theme" => {
                 if let Some(theme) = Theme::by_name(&self.config.display.theme) {
-                    self.theme = theme;
-                    self.land_theme_change();
+                    self.land_theme_change(theme);
                 }
             }
             "verbosity" => {
@@ -938,16 +937,12 @@ impl TuiApp {
         } else {
             theme.deferred_to_terminal()
         };
-        if self.browse.theme_before_browse.is_none() {
-            self.browse.theme_before_browse = Some(std::mem::replace(&mut self.theme, theme));
-        } else {
-            self.theme = theme;
-        }
+        let displaced = self.swap_theme(theme);
+        self.browse.theme_before_browse.get_or_insert(displaced);
         self.browse.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
-        self.invalidate_conversation_renders();
     }
 
-    /// Land a theme change on every surface the session already painted.
+    /// Land `theme` on every surface the session already painted.
     ///
     /// The startup sequence, replayed on every switch. The background
     /// override lands in two tiers: a terminal the session has already
@@ -971,18 +966,19 @@ impl TuiApp {
     /// cache the frames serve, and the live lane's streaming rows —
     /// under the new palette rather than serving the old colors from
     /// cache.
-    fn land_theme_change(&mut self) {
-        let background = self.theme.ui.background;
-        let landed = if crate::terminal::write_only_warranted(background) {
+    fn land_theme_change(&mut self, theme: Theme) {
+        let landed = if crate::terminal::write_only_warranted(theme.ui.background) {
             true
         } else {
-            self.ask_background_once(background, false)
+            self.ask_background_once(theme.ui.background, false)
         };
-        if !landed {
-            self.theme = self.theme.deferred_to_terminal();
-        }
+        let theme = if landed {
+            theme
+        } else {
+            theme.deferred_to_terminal()
+        };
+        self.swap_theme(theme);
         self.browse.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
-        self.invalidate_conversation_renders();
     }
 
     /// Change the live theme by name, keeping the current one on a miss.
@@ -993,8 +989,7 @@ impl TuiApp {
     fn set_theme_command(&mut self, name: &str) {
         self.browse.theme_before_browse = None;
         if let Some(theme) = Theme::by_name(name) {
-            self.theme = theme;
-            self.land_theme_change();
+            self.land_theme_change(theme);
             let key = Theme::key_for_name(name).unwrap_or_default();
             self.config.display.theme = key.to_string();
             if let Some(file) = self.config_writes.config_file.as_mut() {
@@ -1035,8 +1030,7 @@ impl TuiApp {
             .get(next)
             .and_then(|candidate| Theme::by_name(candidate))
         {
-            self.theme = name;
-            self.land_theme_change();
+            self.land_theme_change(name);
         }
     }
 
@@ -1194,11 +1188,11 @@ impl TuiApp {
         }
         let handled = match (key.code, key.modifiers) {
             (KeyCode::Up, KeyModifiers::NONE) => {
-                self.step_session_picker(true);
+                self.pickers.step_session_picker(true);
                 true
             }
             (KeyCode::Down, KeyModifiers::NONE) => {
-                self.step_session_picker(false);
+                self.pickers.step_session_picker(false);
                 true
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
@@ -1237,11 +1231,11 @@ impl TuiApp {
         }
         let handled = match (key.code, key.modifiers) {
             (KeyCode::Up, KeyModifiers::NONE) => {
-                self.step_model_picker(true);
+                self.pickers.step_model_picker(true);
                 true
             }
             (KeyCode::Down, KeyModifiers::NONE) => {
-                self.step_model_picker(false);
+                self.pickers.step_model_picker(false);
                 true
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
@@ -1268,78 +1262,20 @@ impl TuiApp {
         Some(handled)
     }
 
-    /// Step the model picker's cursor one row, wrapping at the ends.
-    ///
-    /// The picker's arrow semantics: Up and Down move a single row and
-    /// wrap past either end onto the opposite row, so both directions
-    /// reach every entry without a second key. An empty sheet (no
-    /// declared models) never reaches here — the picker does not open —
-    /// and the guard keeps the step a no-op rather than a panic if one
-    /// ever stands.
-    fn step_model_picker(&mut self, up: bool) {
-        let Some(picker) = self.pickers.model_picker.as_mut() else {
-            return;
-        };
-        if picker.rows.is_empty() {
-            return;
-        }
-        let last = picker.rows.len().saturating_sub(1);
-        picker.cursor = if up {
-            if picker.cursor == 0 {
-                last
-            } else {
-                picker.cursor.saturating_sub(1)
-            }
-        } else if picker.cursor >= last {
-            0
-        } else {
-            picker.cursor.saturating_add(1)
-        };
-    }
-
-    /// Step the picker's cursor one row, wrapping at the ends.
-    ///
-    /// The same walk the completion popup's arrows take: a list short
-    /// enough to show whole never moves, and the ends wrap so both
-    /// directions always have somewhere to go. An empty sheet never
-    /// reaches here — the picker does not open — and the guard keeps
-    /// the step a no-op rather than a panic if one ever stands.
-    fn step_session_picker(&mut self, up: bool) {
-        let Some(picker) = self.pickers.session_picker.as_mut() else {
-            return;
-        };
-        if picker.rows.is_empty() {
-            return;
-        }
-        let last = picker.rows.len().saturating_sub(1);
-        picker.cursor = if up {
-            if picker.cursor == 0 {
-                last
-            } else {
-                picker.cursor.saturating_sub(1)
-            }
-        } else if picker.cursor >= last {
-            0
-        } else {
-            picker.cursor.saturating_add(1)
-        };
-    }
-
     /// Invalidate every cached rendering of the conversation: the
     /// baked prefix, the merged cache the frames serve, and the live
     /// lane's styled rows.
     ///
     /// The shapes that make this necessary differ — a verbosity switch
     /// re-shapes every tool body, a theme switch re-tints every styled
-    /// line — but the cache discipline is one: the generation bump
-    /// pierces the render guard (or the merged cache would keep serving
-    /// the old rendering until an unrelated event rebaked), the rebake
-    /// empties the bake, and the freeze resets whole — the frozen
-    /// prefix and the live segment both — or the cached half would
-    /// keep serving the old rendering until the stream's next delta
-    /// or its graduation.
+    /// line — but the cache discipline is one: the rebake empties the
+    /// bake and advances the generation, which pierces the render
+    /// guard (or the merged cache would keep serving the old rendering
+    /// until an unrelated event rebaked), and the freeze resets whole
+    /// — the frozen prefix and the live segment both — or the cached
+    /// half would keep serving the old rendering until the stream's
+    /// next delta or its graduation.
     pub(crate) fn invalidate_conversation_renders(&mut self) {
-        self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
         self.bake.rebake_whole();
         let _ = self.freeze.reset();
     }
@@ -1367,6 +1303,65 @@ pub(crate) struct Pickers {
     /// cursor, Enter switching through the `/model` lane. `None` when
     /// no picker stands.
     pub(crate) model_picker: Option<ModelPicker>,
+}
+
+impl Pickers {
+    /// Step the model picker's cursor one row, wrapping at the ends.
+    ///
+    /// The picker's arrow semantics: Up and Down move a single row and
+    /// wrap past either end onto the opposite row, so both directions
+    /// reach every entry without a second key. An empty sheet (no
+    /// declared models) never reaches here — the picker does not open —
+    /// and the guard keeps the step a no-op rather than a panic if one
+    /// ever stands.
+    fn step_model_picker(&mut self, up: bool) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        if picker.rows.is_empty() {
+            return;
+        }
+        let last = picker.rows.len().saturating_sub(1);
+        picker.cursor = if up {
+            if picker.cursor == 0 {
+                last
+            } else {
+                picker.cursor.saturating_sub(1)
+            }
+        } else if picker.cursor >= last {
+            0
+        } else {
+            picker.cursor.saturating_add(1)
+        };
+    }
+
+    /// Step the picker's cursor one row, wrapping at the ends.
+    ///
+    /// The same walk the completion popup's arrows take: a list short
+    /// enough to show whole never moves, and the ends wrap so both
+    /// directions always have somewhere to go. An empty sheet never
+    /// reaches here — the picker does not open — and the guard keeps
+    /// the step a no-op rather than a panic if one ever stands.
+    fn step_session_picker(&mut self, up: bool) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        if picker.rows.is_empty() {
+            return;
+        }
+        let last = picker.rows.len().saturating_sub(1);
+        picker.cursor = if up {
+            if picker.cursor == 0 {
+                last
+            } else {
+                picker.cursor.saturating_sub(1)
+            }
+        } else if picker.cursor >= last {
+            0
+        } else {
+            picker.cursor.saturating_add(1)
+        };
+    }
 }
 
 /// The theme browse's state: the palette the session stood on and

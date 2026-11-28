@@ -68,15 +68,7 @@ impl TuiApp {
             self.expansion.expanded_tools.insert(call_id.clone());
         }
         if self.tools.tool_details.contains_key(&call_id) {
-            if expanding {
-                self.keep_the_seen_layout();
-                self.scroll.stick = Stick::Hold;
-            }
-            self.note_call_reshape(&call_id);
-            self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
-            self.bake.rebake_whole();
-            self.pointer.selection = None;
-            self.pointer.drag_position = None;
+            self.block_display_toggled(expanding, |this| this.note_call_reshape(&call_id));
         }
         true
     }
@@ -143,26 +135,21 @@ impl TuiApp {
         let expanding = !self.expansion.expanded_thinking.remove(&key);
         if expanding {
             self.expansion.expanded_thinking.insert(key.clone());
-            self.keep_the_seen_layout();
-            self.scroll.stick = Stick::Hold;
         }
-        self.note_block_reshape(&key);
-        self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
-        self.bake.rebake_whole();
-        self.pointer.selection = None;
-        self.pointer.drag_position = None;
+        self.block_display_toggled(expanding, |this| this.note_block_reshape(&key));
         true
     }
 
     /// Walk the plan section's posture one step, measuring the
     /// capped window at the press.
     ///
-    /// The frame's cut flag records what the last layout drew, which
-    /// under rapid presses is the previous posture — a Full frame
-    /// leaves it false, and a burst through Hidden would fold the
-    /// list again instead of opening it. The press measures the
-    /// capped window itself against the section's recorded width, so
-    /// every transition reads the list as it stands.
+    /// The press reads the list as it stands, not a frame's record of
+    /// it: a frame that has not drawn since the posture moved would
+    /// describe the previous posture — a Full frame leaves no cut
+    /// standing, and a burst through Hidden would fold the list again
+    /// instead of opening it. So the press measures the capped window
+    /// itself against the section's recorded width, and every
+    /// transition reads the list as it is.
     pub(crate) fn cycle_plan_view(&mut self) {
         let capped_cuts = self.capped_plan_cuts();
         self.plan.cycle_plan_view(capped_cuts);
@@ -173,8 +160,8 @@ impl TuiApp {
     /// The same render the capped section draws — the same colors,
     /// inset, and body cap at the section's recorded width — read
     /// only for its last row's ellipsis, the mark the cap leaves
-    /// when the list outgrows it. Measured at the press so a stale
-    /// frame flag never decides the step.
+    /// when the list outgrows it. Measured at the press, from the
+    /// list as it stands then.
     fn capped_plan_cuts(&self) -> bool {
         if self.plan.latest_todos.is_empty() {
             return false;
@@ -202,7 +189,7 @@ impl TuiApp {
             inner,
             TODO_SECTION_BODY_ROWS,
             self.plan.clamped_todo_skip(),
-            (self.plan_chord_hint(), self.plan.plan_cut_way()),
+            |cut| self.plan.section_ways(cut),
         )
         .last()
         .is_some_and(|line| {
@@ -238,15 +225,32 @@ impl TuiApp {
         let expanding = !self.expansion.expanded_compactions.remove(&key);
         if expanding {
             self.expansion.expanded_compactions.insert(key.clone());
+        }
+        self.block_display_toggled(expanding, |this| this.note_block_reshape(&key));
+        true
+    }
+
+    /// Land an expansion toggle on the view, once the expansion set
+    /// has moved.
+    ///
+    /// An opening pushes the rows below it down, so the view keeps the
+    /// layout the reader was looking at and stops following the tail;
+    /// a fold only pulls rows up and takes neither. Both change the
+    /// block's shape where the scroll's settle measures it, so the
+    /// caller names the blocks it re-shaped — noted against the map
+    /// the rebake is about to redraw — and the rebake then empties the
+    /// bake, advancing the generation with it. The pointer's selection
+    /// and drag are retired last: the rows they were drawn against are
+    /// gone.
+    fn block_display_toggled(&mut self, expanding: bool, note: impl FnOnce(&mut Self)) {
+        if expanding {
             self.keep_the_seen_layout();
             self.scroll.stick = Stick::Hold;
         }
-        self.note_block_reshape(&key);
-        self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
+        note(self);
         self.bake.rebake_whole();
         self.pointer.selection = None;
         self.pointer.drag_position = None;
-        true
     }
 
     /// Fold the auto-expanded todo block when the next tool is
@@ -275,8 +279,6 @@ impl TuiApp {
             self.expansion.auto_expanded_todo = None;
             if folded {
                 self.note_call_reshape(&id);
-                self.bake.conversation_generation =
-                    self.bake.conversation_generation.saturating_add(1);
                 self.bake.rebake_whole();
             }
         }
@@ -311,8 +313,6 @@ impl TuiApp {
             _ => TODO_SECTION_BODY_ROWS,
         };
         self.full_body_cap.set(body_cap);
-        let chord_hint = self.plan_chord_hint();
-        let cut_way = self.plan.plan_cut_way();
         let lines = todo_view::section_lines(
             &self.plan.latest_todos,
             &self.plan.todo_section_changes,
@@ -320,12 +320,8 @@ impl TuiApp {
             inner,
             body_cap,
             self.plan.clamped_todo_skip(),
-            (chord_hint, cut_way),
+            |cut| self.plan.section_ways(cut),
         );
-        let cut = body_cap != usize::MAX
-            && matches!(lines.last(), Some(line)
-                if line.spans.first().is_some_and(|span| span.content.starts_with('\u{2026}')));
-        self.plan.plan_cut.set(cut);
         u16::try_from(lines.len()).unwrap_or(0)
     }
 
@@ -374,8 +370,6 @@ impl TuiApp {
             self.tools.tool_details.remove(&retired);
             if self.expansion.expanded_tools.remove(&retired) {
                 self.note_call_reshape(&retired);
-                self.bake.conversation_generation =
-                    self.bake.conversation_generation.saturating_add(1);
                 self.bake.rebake_whole();
             }
         }
@@ -426,9 +420,9 @@ impl TuiApp {
 /// Everything the plan panel keeps between frames, in one place —
 /// the accepted `TodoWrite` list with the per-update accent deltas,
 /// the interruption flag a failed run leaves, and the view's
-/// posture, cut marker, scroll window, and screen rect. The
-/// graduation that replaces the list stays on [`TuiApp`]; this is
-/// what it writes into.
+/// posture, scroll window, and screen rect. The graduation that
+/// replaces the list stays on [`TuiApp`]; this is what it writes
+/// into.
 pub(crate) struct PlanState {
     /// The session's standing todo list, for the plan section.
     ///
@@ -499,17 +493,6 @@ pub(crate) struct PlanState {
     /// spends itself on the fold.
     pub(crate) plan_view: PlanView,
 
-    /// Whether the capped posture's last render cut an entry.
-    ///
-    /// The layout computes the section's rows from the same render the
-    /// frame draws, so it is the one place that already knows whether
-    /// the cap ate anything; the cell carries that answer to the chord
-    /// hint the identity row names — whether to offer the grow chord —
-    /// while the posture cycle measures fresh at its own press. Fresh
-    /// until the first frame renders — `false` reads as "the cap cut
-    /// nothing" until one proves otherwise.
-    pub(crate) plan_cut: std::cell::Cell<bool>,
-
     /// The pinned section's scroll: how many entries the window skips.
     ///
     /// The wheel over the section steps this window one entry at a
@@ -538,7 +521,6 @@ impl Default for PlanState {
             todo_section_changes: HashMap::new(),
             plan_interrupted: false,
             plan_view: PlanView::Capped,
-            plan_cut: std::cell::Cell::new(false),
             todo_scroll: 0,
             todo_section_rect: Rect::default(),
         }
@@ -634,10 +616,10 @@ impl PlanState {
     /// Walk the plan section's posture one step.
     ///
     /// Capped opens to the whole list when the capped window is
-    /// actually cutting entries — the caller measures it at the
-    /// press, because the frame's own flag may describe a previous
-    /// posture — otherwise the next step folds the section away, and
-    /// a fold steps back to the capped posture. The chord and a
+    /// actually cutting entries — the caller measures the capped
+    /// window at the press — otherwise the next step folds the
+    /// section away, and a fold steps back to the capped posture.
+    /// The chord and a
     /// click on the section both spend one press on one step, and
     /// every step resets the section's scroll window.
     pub(crate) fn cycle_plan_view(&mut self, capped_cuts: bool) {
@@ -664,11 +646,26 @@ impl PlanState {
         }
     }
 
-    /// Step the section's window one entry under the wheel.
+    /// The two gestures the section names, for a window that cut
+    /// entries or one that shows the list whole.
     ///
-    /// Down moves deeper into the plan, up back toward its head; the
-    /// clamp keeps at least one entry on screen either way, so the
-    /// window never scrolls past the plan's end.
+    /// The chord's next act depends on the posture and the cut
+    /// together: a capped window that hid entries opens on the chord,
+    /// while a capped window showing every entry and an open list both
+    /// fold — the steps [`cycle_plan_view`](Self::cycle_plan_view)
+    /// walks — and the hidden posture's one row carries its own hint.
+    /// The cut is the one the section is rendering with, asked for as
+    /// the rows settle, so the badge never names an act for a window
+    /// an earlier frame drew.
+    pub(crate) fn section_ways(&self, cut: bool) -> (Option<&'static str>, &'static str) {
+        let chord_hint = match self.plan_view {
+            PlanView::Hidden => None,
+            PlanView::Capped if cut => Some("ctrl+t to open"),
+            PlanView::Full | PlanView::Capped => Some("ctrl+t to hide"),
+        };
+        (chord_hint, self.plan_cut_way())
+    }
+
     /// The gesture that reaches the cut rows, for the ellipsis.
     ///
     /// The posture decides it: while the cap holds the window the
@@ -677,13 +674,18 @@ impl PlanState {
     /// promise the opposite of the next press. Open follows the
     /// posture, never the window's size: a screen too short to widen
     /// the window still leaves the wheel as the way in.
-    pub(super) fn plan_cut_way(&self) -> &'static str {
+    fn plan_cut_way(&self) -> &'static str {
         match self.plan_view {
             PlanView::Full => "wheel to walk",
             PlanView::Capped | PlanView::Hidden => "ctrl+t to open",
         }
     }
 
+    /// Step the section's window one entry under the wheel.
+    ///
+    /// Down moves deeper into the plan, up back toward its head; the
+    /// clamp keeps at least one entry on screen either way, so the
+    /// window never scrolls past the plan's end.
     pub(crate) fn scroll_todo_section(&mut self, up: bool) {
         if self.latest_todos.is_empty() {
             return;

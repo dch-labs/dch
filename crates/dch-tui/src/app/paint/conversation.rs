@@ -178,7 +178,8 @@ impl TuiApp {
             compaction_rows.len(),
             tools.len(),
         );
-        self.settle_selectable_shape(streaming_changed, shape);
+        self.pointer
+            .settle_selectable_shape(streaming_changed, shape);
         self.thinking_live_rows = thinking_rows.1.map(|row| {
             let start = row
                 .saturating_add(self.bake.conversation_cache.len())
