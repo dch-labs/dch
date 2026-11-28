@@ -5,15 +5,12 @@
 use super::TuiApp;
 use super::composer::COMPOSE_PREFIX;
 use super::composer::paste_for_one_line;
-use super::context::{STATUS_BAR_AIR, STATUS_BAR_ROWS};
 use super::keys::key_survives_the_sheet;
 use super::notices::wrap_prompt_rows;
 use super::permissions::MAX_OVERLAY_ROWS;
 use crate::cells::{for_display, str_width};
 use crate::question::QuestionPrompt;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use dch_config::StripPosition;
-use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Line;
 
@@ -34,114 +31,31 @@ impl TuiApp {
     /// Land one delivered question and any others already waiting
     /// behind it.
     ///
-    /// The run loop's select arm hands the prompt its wakeup
-    /// delivered plus the receiver it owns: the prompt enters the
-    /// queue and the receiver drains, so a multi-question batch lands
-    /// together and the first frame's overlay reports the true
-    /// waiting count.
+    /// The prompt enters the queue and the receiver drains, so a
+    /// multi-question batch lands together and the first frame's
+    /// overlay reports the true waiting count. The integration suites
+    /// stage their batches through here; the run loop lands its own
+    /// the same way, through the question state and the receiver it
+    /// keeps in a local.
     pub fn land_question_requests(
         &mut self,
         first: QuestionPrompt,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>,
     ) {
-        self.questions
-            .pending_questions
-            .push_back(PendingQuestion::new(first));
-        while let Ok(prompt) = rx.try_recv() {
-            self.questions
-                .pending_questions
-                .push_back(PendingQuestion::new(prompt));
-        }
+        self.questions.land_question_requests(first, rx);
     }
 
-    /// Refresh the queue: land what arrived, drop what nobody asks.
+    /// Refresh the question queue without the run loop.
     ///
-    /// Landing and withdrawal are one pass because they are the same
-    /// question asked twice — is this prompt still live? — and the run
-    /// loop does both on its own beat. The test seam for staging
-    /// questions without the loop: production keeps its receiver in a
-    /// local and lands batches through
-    /// [`land_question_requests`](Self::land_question_requests) instead —
-    /// once `run` claims the channel, this slot is empty and only the
-    /// withdrawal half has anything left to say.
+    /// The test seam the integration suites drive to stage questions:
+    /// what arrived lands and what nobody asks any longer drops, both
+    /// in the question state's own pass
+    /// (`QuestionState::poll_question_requests`). The run loop lands
+    /// its batches through the question state instead, from the
+    /// receiver it keeps in a local — once `run` has claimed the
+    /// channel, only the withdrawal half has anything left to say.
     pub fn poll_question_requests(&mut self) {
-        while let Some(prompt) = self
-            .questions
-            .question_rx
-            .as_mut()
-            .and_then(|rx| rx.try_recv().ok())
-        {
-            self.questions
-                .pending_questions
-                .push_back(PendingQuestion::new(prompt));
-        }
-        self.questions.retire_withdrawn_questions();
-    }
-
-    /// What the shown question's marks and its draft add up to, as the
-    /// answer Enter sends.
-    ///
-    /// Marked option rows answer in the order the sheet shows them and a
-    /// draft answers last, from the row below every option. A single
-    /// select answers one thing: the marked row — or the draft, where the
-    /// draft is what the user chose to write — and with nothing marked at
-    /// all, the row the cursor stands on. A multi-select asks the same
-    /// question of its rows and, when none of them is marked, takes the
-    /// cursor's row for its own: an empty reply is exactly what a
-    /// dismissal sends, so Enter on a row the user walked onto cannot
-    /// answer with nothing. Whichever row the cursor stands on is the row
-    /// Enter confirms, the compose row included — there its words are its
-    /// content, and a draft kept out of compose answers from no other row
-    /// but that one.
-    ///
-    /// `draft_counts` is whether the typed text belongs to the answer on
-    /// its own rather than only where its row is marked: the draft's own
-    /// Enter says yes, because writing a reply *is* choosing it, while
-    /// Enter over the rows asks the mark. Both paths come here, so a
-    /// marked draft answers the same however it was reached and composing
-    /// never silently drops the rows marked beside it.
-    fn shown_answer(&self, draft_counts: bool) -> Vec<String> {
-        let Some(entry) = self.questions.shown_question() else {
-            return Vec::new();
-        };
-        let ui = &entry.ui;
-        let free_row = entry.prompt.options.len();
-        let draft = ui.draft.trim().to_string();
-        let draft_wanted = !draft.is_empty()
-            && (draft_counts || ui.toggled.contains(&free_row) || ui.cursor == free_row);
-        if entry.prompt.multi_select {
-            let mut answers = entry
-                .prompt
-                .options
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index < free_row && ui.toggled.contains(index))
-                .map(|(_, option)| option.label.clone())
-                .collect::<Vec<String>>();
-            if draft_wanted {
-                answers.push(draft);
-            }
-            if answers.is_empty() {
-                answers.extend(
-                    entry
-                        .prompt
-                        .options
-                        .get(ui.cursor)
-                        .map(|option| option.label.clone()),
-                );
-            }
-            answers
-        } else if draft_wanted {
-            vec![draft]
-        } else {
-            ui.toggled
-                .iter()
-                .copied()
-                .find(|index| *index < free_row)
-                .and_then(|index| entry.prompt.options.get(index))
-                .or_else(|| entry.prompt.options.get(ui.cursor))
-                .map_or_default(|option| vec![option.label.clone()])
-        }
+        self.questions.poll_question_requests();
     }
 
     /// Apply a key press to the question on screen.
@@ -229,61 +143,10 @@ impl TuiApp {
             }
         }
         if send {
-            let answers = self.shown_answer(true);
+            let answers = self.questions.shown_answer(true);
             self.questions.resolve_pending_question(answers);
         }
         true
-    }
-
-    /// Land a paste on the question on screen: into the open draft at its
-    /// caret, or into a draft opened for it.
-    ///
-    /// A paste is a burst of keystrokes, and the overlay answers
-    /// keystrokes — a letter typed at the rows opens the draft with that
-    /// letter in it, so a paste arrives the same way rather than vanishing
-    /// without a word. Dropping it would lose the likeliest thing a user
-    /// has to say that the options never offered: a path, a hash, the line
-    /// copied out of the conversation above the box.
-    ///
-    /// The text lands as one line whatever it held. A draft answers one
-    /// question in one row, so the breaks a multi-line paste carries
-    /// become the spaces between its parts; nothing is discarded.
-    pub(crate) fn paste_into_the_question(&mut self, text: &str) -> bool {
-        let Some(entry) = self.questions.shown_question_mut() else {
-            return true;
-        };
-        if !entry.ui.composing {
-            entry.ui.open_composing();
-        }
-        entry.ui.insert_str(&paste_for_one_line(text));
-        true
-    }
-
-    /// Whether Enter here means go and write a reply rather than answer.
-    ///
-    /// An empty compose row cannot be sent, so Enter opens the draft to
-    /// fill it — whenever the row is the answer the user is pointing at
-    /// (`on_compose_row`, where an unmarked compose row is exactly that
-    /// invitation) or when it is the only mark on the sheet. Marks on real
-    /// options beside it settle the matter the other way: the answer is
-    /// chosen, and the empty row contributes nothing to it.
-    fn needs_the_draft(&self, on_compose_row: bool) -> bool {
-        self.questions.shown_question().is_some_and(|entry| {
-            let free_row = entry.prompt.options.len();
-            let marks = entry.ui.toggled.len();
-            let options_marked = entry
-                .ui
-                .toggled
-                .iter()
-                .filter(|index| **index < free_row)
-                .count();
-            entry.ui.draft.trim().is_empty()
-                && if on_compose_row || entry.ui.toggled.contains(&free_row) {
-                    options_marked == 0 && (on_compose_row || marks == 1)
-                } else {
-                    false
-                }
-        })
     }
 
     /// The keys the option rows answer, on the question on screen.
@@ -337,13 +200,13 @@ impl TuiApp {
                 }
             }
             KeyCode::Enter if bare => {
-                if self.needs_the_draft(cursor == free_row) {
+                if self.questions.needs_the_draft(cursor == free_row) {
                     if let Some(entry) = self.questions.shown_question_mut() {
                         entry.ui.open_composing();
                     }
                     return true;
                 }
-                let answers = self.shown_answer(false);
+                let answers = self.questions.shown_answer(false);
                 self.questions.resolve_pending_question(answers);
             }
             KeyCode::Esc if bare => {
@@ -688,34 +551,6 @@ impl TuiApp {
             .saturating_add(2)
             .min(sheet_area_height)
     }
-
-    /// The rows a question sheet may take over the frame.
-    ///
-    /// The status bar's two content rows stay its own — the session
-    /// line reads while an ask waits — while the footer's air is
-    /// margin no pane paints, which the sheet may stand on: a deeper
-    /// composer margin costs the sheet no rows it did not already
-    /// spend. So does the strip's row when the strip is configured to
-    /// the top of the terminal: the sheet cannot occupy a row the
-    /// layout has already promised elsewhere, and a reservation that
-    /// counted it too asked the solver for one row more than the frame
-    /// had, leaving it to squeeze an unspecified pane to pay. The
-    /// origin moves down with the strip row, so the sheet's bottom
-    /// edge — anchored above the status bar — stays where it is in
-    /// every strip position. Both the
-    /// reservation and the box derive their height from here, so they
-    /// cannot disagree about how much room there is.
-    pub(crate) fn question_sheet_area(&self, area: Rect) -> Rect {
-        let strip_rows = u16::from(matches!(self.display.strip_position, StripPosition::Top));
-        Rect {
-            y: area.y.saturating_add(strip_rows),
-            height: area
-                .height
-                .saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR)
-                .saturating_sub(strip_rows),
-            ..area
-        }
-    }
 }
 
 /// The question sheet's state: the prompts waiting, the one on
@@ -894,6 +729,162 @@ impl QuestionState {
             tracing::trace!("question reply channel already closed");
         }
         self.clamp_question_view();
+    }
+
+    /// What the shown question's marks and its draft add up to, as the
+    /// answer Enter sends.
+    ///
+    /// Marked option rows answer in the order the sheet shows them and a
+    /// draft answers last, from the row below every option. A single
+    /// select answers one thing: the marked row — or the draft, where the
+    /// draft is what the user chose to write — and with nothing marked at
+    /// all, the row the cursor stands on. A multi-select asks the same
+    /// question of its rows and, when none of them is marked, takes the
+    /// cursor's row for its own: an empty reply is exactly what a
+    /// dismissal sends, so Enter on a row the user walked onto cannot
+    /// answer with nothing. Whichever row the cursor stands on is the row
+    /// Enter confirms, the compose row included — there its words are its
+    /// content, and a draft kept out of compose answers from no other row
+    /// but that one.
+    ///
+    /// `draft_counts` is whether the typed text belongs to the answer on
+    /// its own rather than only where its row is marked: the draft's own
+    /// Enter says yes, because writing a reply *is* choosing it, while
+    /// Enter over the rows asks the mark. Both paths come here, so a
+    /// marked draft answers the same however it was reached and composing
+    /// never silently drops the rows marked beside it.
+    fn shown_answer(&self, draft_counts: bool) -> Vec<String> {
+        let Some(entry) = self.shown_question() else {
+            return Vec::new();
+        };
+        let ui = &entry.ui;
+        let free_row = entry.prompt.options.len();
+        let draft = ui.draft.trim().to_string();
+        let draft_wanted = !draft.is_empty()
+            && (draft_counts || ui.toggled.contains(&free_row) || ui.cursor == free_row);
+        if entry.prompt.multi_select {
+            let mut answers = entry
+                .prompt
+                .options
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index < free_row && ui.toggled.contains(index))
+                .map(|(_, option)| option.label.clone())
+                .collect::<Vec<String>>();
+            if draft_wanted {
+                answers.push(draft);
+            }
+            if answers.is_empty() {
+                answers.extend(
+                    entry
+                        .prompt
+                        .options
+                        .get(ui.cursor)
+                        .map(|option| option.label.clone()),
+                );
+            }
+            answers
+        } else if draft_wanted {
+            vec![draft]
+        } else {
+            ui.toggled
+                .iter()
+                .copied()
+                .find(|index| *index < free_row)
+                .and_then(|index| entry.prompt.options.get(index))
+                .or_else(|| entry.prompt.options.get(ui.cursor))
+                .map_or_default(|option| vec![option.label.clone()])
+        }
+    }
+
+    /// Whether Enter here means go and write a reply rather than answer.
+    ///
+    /// An empty compose row cannot be sent, so Enter opens the draft to
+    /// fill it — whenever the row is the answer the user is pointing at
+    /// (`on_compose_row`, where an unmarked compose row is exactly that
+    /// invitation) or when it is the only mark on the sheet. Marks on real
+    /// options beside it settle the matter the other way: the answer is
+    /// chosen, and the empty row contributes nothing to it.
+    fn needs_the_draft(&self, on_compose_row: bool) -> bool {
+        self.shown_question().is_some_and(|entry| {
+            let free_row = entry.prompt.options.len();
+            let marks = entry.ui.toggled.len();
+            let options_marked = entry
+                .ui
+                .toggled
+                .iter()
+                .filter(|index| **index < free_row)
+                .count();
+            entry.ui.draft.trim().is_empty()
+                && if on_compose_row || entry.ui.toggled.contains(&free_row) {
+                    options_marked == 0 && (on_compose_row || marks == 1)
+                } else {
+                    false
+                }
+        })
+    }
+
+    /// Land a paste on the question on screen: into the open draft at its
+    /// caret, or into a draft opened for it.
+    ///
+    /// A paste is a burst of keystrokes, and the overlay answers
+    /// keystrokes — a letter typed at the rows opens the draft with that
+    /// letter in it, so a paste arrives the same way rather than vanishing
+    /// without a word. Dropping it would lose the likeliest thing a user
+    /// has to say that the options never offered: a path, a hash, the line
+    /// copied out of the conversation above the box.
+    ///
+    /// The text lands as one line whatever it held. A draft answers one
+    /// question in one row, so the breaks a multi-line paste carries
+    /// become the spaces between its parts; nothing is discarded.
+    pub(crate) fn paste_into_the_question(&mut self, text: &str) -> bool {
+        let Some(entry) = self.shown_question_mut() else {
+            return true;
+        };
+        if !entry.ui.composing {
+            entry.ui.open_composing();
+        }
+        entry.ui.insert_str(&paste_for_one_line(text));
+        true
+    }
+
+    /// Refresh the queue: land what arrived, drop what nobody asks.
+    ///
+    /// Landing and withdrawal are one pass because they are the same
+    /// question asked twice — is this prompt still live? — and the run
+    /// loop does both on its own beat. The test seam for staging
+    /// questions without the loop: production keeps its receiver in a
+    /// local and lands batches through
+    /// [`land_question_requests`](Self::land_question_requests) instead —
+    /// once `run` claims the channel, this slot is empty and only the
+    /// withdrawal half has anything left to say.
+    pub(crate) fn poll_question_requests(&mut self) {
+        while let Some(prompt) = self.question_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
+            self.pending_questions
+                .push_back(PendingQuestion::new(prompt));
+        }
+        self.retire_withdrawn_questions();
+    }
+
+    /// Land one delivered question and any others already waiting
+    /// behind it.
+    ///
+    /// The run loop's select arm hands the prompt its wakeup
+    /// delivered plus the receiver it owns: the prompt enters the
+    /// queue and the receiver drains, so a multi-question batch lands
+    /// together and the first frame's overlay reports the true
+    /// waiting count.
+    pub(crate) fn land_question_requests(
+        &mut self,
+        first: QuestionPrompt,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>,
+    ) {
+        self.pending_questions
+            .push_back(PendingQuestion::new(first));
+        while let Ok(prompt) = rx.try_recv() {
+            self.pending_questions
+                .push_back(PendingQuestion::new(prompt));
+        }
     }
 }
 

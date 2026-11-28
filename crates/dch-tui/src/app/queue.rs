@@ -6,7 +6,6 @@ use super::TuiApp;
 use super::keys::key_survives_the_sheet;
 use super::notices::{plain_wrapped_lines, wrap_prompt_rows};
 use crate::cells::{for_display, str_width};
-use crate::queue::Submission;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -38,18 +37,6 @@ impl TuiApp {
         }
         self.queue.toggle_queue_posture();
         true
-    }
-
-    /// Hand `id` to the driver, reporting whether the channel took it.
-    ///
-    /// The send is a [`Submission::Run`]: the driver resolves the id
-    /// against the shared queue when the turn comes, so this never has to
-    /// take anything back.
-    pub(crate) fn send_queued_id(&self, id: u64) -> bool {
-        self.host
-            .submit_tx
-            .as_ref()
-            .is_some_and(|tx| tx.send(Submission::Run { id }).is_ok())
     }
 
     /// Add `text` to the shared queue and name it.
@@ -603,29 +590,6 @@ impl TuiApp {
         u16::try_from(body.saturating_add(3)).unwrap_or(QUEUE_ROWS)
     }
 
-    /// The chords the queue section names beside its badge.
-    ///
-    /// They are the mode's, not the section's: while the composer holds the
-    /// keys the section cannot act on a letter typed into it, so the badge
-    /// offers the way in rather than keys that would be swallowed a moment
-    /// later. Once the section has them, it says what it does with them,
-    /// including the way back out — the mode that swallows everything else
-    /// owes the user the key that ends it.
-    pub(crate) fn queue_hint(&self) -> &'static str {
-        if matches!(self.queue.queue_mode, QueueMode::Editing { .. }) {
-            "enter save  esc discard"
-        } else if let QueueMode::Confirming { act, .. } = self.queue.queue_mode {
-            match act {
-                QueueAct::Steer => "guide the running turn? y/n",
-                QueueAct::Drop => "drop this prompt? y/n",
-            }
-        } else if self.queue.queue_mode == QueueMode::Focused {
-            "\u{2190}/\u{2192} walk  ctrl+w next  e edit  s guide  d drop  esc back"
-        } else {
-            "ctrl+w walk  ctrl+q hide"
-        }
-    }
-
     /// Send the composer straight to the model, mid-turn: `Ctrl+S`.
     ///
     /// Enter is patient and Ctrl+S is not. With a run in flight and the
@@ -796,7 +760,7 @@ impl TuiApp {
                 && !self.state.agent_running.load(Ordering::SeqCst);
             self.queue.handed = None;
             let id = self.push_queued(text.clone());
-            if self.send_queued_id(id) {
+            if self.host.send_queued_id(id) {
                 if was_empty && idle {
                     self.queue.handed = Some(id);
                 }
@@ -874,7 +838,7 @@ impl TuiApp {
         self.queue.handed = None;
         for text in taken {
             let id = self.push_queued(text);
-            if self.send_queued_id(id) {
+            if self.host.send_queued_id(id) {
                 promised = promised.saturating_add(1);
             }
         }
@@ -1015,6 +979,43 @@ impl QueueState {
             QueuePosture::Standing => QueuePosture::Folded,
             QueuePosture::Folded => QueuePosture::Standing,
         };
+    }
+
+    /// The chords the queue section names beside its badge.
+    ///
+    /// They are the mode's, not the section's: while the composer holds the
+    /// keys the section cannot act on a letter typed into it, so the badge
+    /// offers the way in rather than keys that would be swallowed a moment
+    /// later. Once the section has them, it says what it does with them,
+    /// including the way back out — the mode that swallows everything else
+    /// owes the user the key that ends it.
+    pub(crate) fn queue_hint(&self) -> &'static str {
+        if matches!(self.queue_mode, QueueMode::Editing { .. }) {
+            "enter save  esc discard"
+        } else if let QueueMode::Confirming { act, .. } = self.queue_mode {
+            match act {
+                QueueAct::Steer => "guide the running turn? y/n",
+                QueueAct::Drop => "drop this prompt? y/n",
+            }
+        } else if self.queue_mode == QueueMode::Focused {
+            "\u{2190}/\u{2192} walk  ctrl+w next  e edit  s guide  d drop  esc back"
+        } else {
+            "ctrl+w walk  ctrl+q hide"
+        }
+    }
+
+    /// Whether the waiting section holds the keyboard, the composer
+    /// reduced to reading matter.
+    ///
+    /// True while the section is focused or holding an ask — the two
+    /// states where a keypress lands on the queue, not the draft — and
+    /// false the moment the keys come back: an edit lifts a prompt into
+    /// the composer, and there the composer is the active editor again.
+    pub(super) fn section_holds_keys(&self) -> bool {
+        matches!(
+            self.queue_mode,
+            QueueMode::Focused | QueueMode::Confirming { .. }
+        )
     }
 }
 /// The most rows the waiting-prompt section can hold when drawn.

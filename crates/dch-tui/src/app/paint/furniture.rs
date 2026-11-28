@@ -20,7 +20,6 @@ use super::super::{Color, Line, Paragraph, Span, StripStyle, Style, str_width};
 use super::conversation::for_display_lines;
 use crate::cells::{display_width, for_display};
 use crate::todo_view;
-use std::time::Instant;
 
 impl TuiApp {
     /// Render the pinned pulse strip into its row.
@@ -56,7 +55,7 @@ impl TuiApp {
             Self::strip_stood_down(frame, area);
             return false;
         }
-        let now = self.pulse_now();
+        let now = self.pacing.pulse_now();
         let base = self
             .theme
             .ui
@@ -92,23 +91,6 @@ impl TuiApp {
     /// palette's canvas.
     fn strip_stood_down(frame: &mut Frame, area: Rect) {
         frame.render_widget(ratatui::widgets::Clear, area);
-    }
-
-    /// The instant the strip animates against: a pin's clock when one
-    /// stands, the real clock otherwise.
-    ///
-    /// The glow's phase is a pure function of the time since the
-    /// run's anchor, so a pin that fixes both ends asserts an exact
-    /// brightness instead of racing the milliseconds between setting
-    /// the anchor and drawing the frame.
-    fn pulse_now(&self) -> Instant {
-        #[cfg(test)]
-        if let Some(pinned) = self.pacing.pulse_clock.get() {
-            return pinned;
-        }
-        #[cfg(not(test))]
-        let _ = self;
-        Instant::now()
     }
 
     /// Render the pinned plan section: the run's current tasks,
@@ -159,7 +141,6 @@ impl TuiApp {
             PlanView::Full => self.full_body_cap.get(),
             _ => TODO_SECTION_BODY_ROWS,
         };
-        let chord_hint = self.plan_chord_hint();
         let mut lines = todo_view::section_lines(
             &self.plan.latest_todos,
             &self.plan.todo_section_changes,
@@ -169,7 +150,7 @@ impl TuiApp {
                 .max(1),
             body_cap,
             self.plan.clamped_todo_skip(),
-            (chord_hint, self.plan.plan_cut_way()),
+            |cut| self.plan.section_ways(cut),
         );
         for_display_lines(&mut lines);
         frame.render_widget(
@@ -308,7 +289,7 @@ impl TuiApp {
             ),
             Span::raw(" "),
             Span::styled(
-                self.queue_hint().to_string(),
+                self.queue.queue_hint().to_string(),
                 Style::default().fg(self.theme.ui.dim),
             ),
         ]));
@@ -396,10 +377,11 @@ impl TuiApp {
         rows: &[String],
         caret: (u16, u16),
     ) {
-        let muted = self.section_holds_keys();
+        let muted = self.queue.section_holds_keys();
         let text_style = self.paint_composer_surface(frame, area, muted);
         self.paint_composer_identity(frame, area, rows, caret);
-        let (interior, start) = self.paint_composer_text(frame, area, rows, text_style, caret.0);
+        let (interior, start, view) = paint_composer_text(frame, area, rows, text_style, caret.0);
+        self.composer.input_view = Some(view);
         self.paint_composer_caret(frame, area, interior, start, caret);
     }
 
@@ -506,59 +488,6 @@ impl TuiApp {
                 );
             }
         }
-    }
-
-    /// Paint the field's visible rows and say where they sit.
-    ///
-    /// The window slides with the caret's row: the field's own height
-    /// net of its padding decides how many rows stand, the window
-    /// starts at the caret's row less all but the last of them, and
-    /// the geometry is published to the pointer's hand beside it — the
-    /// same `InputView` a click converts through, so what was painted
-    /// and what is aimed at never disagree. Returns the window's own
-    /// rectangle and its first row, which is where the caret's math
-    /// continues.
-    fn paint_composer_text(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        rows: &[String],
-        text_style: Style,
-        caret_row: u16,
-    ) -> (Rect, usize) {
-        let text_height = INPUT_TEXT_ROWS.min(
-            area.height
-                .saturating_sub(INPUT_VERTICAL_PADDING.saturating_mul(2))
-                .saturating_sub(1),
-        );
-        let interior = Rect {
-            x: area
-                .x
-                .saturating_add(INPUT_SIDE_INSET)
-                .min(area.right().saturating_sub(1)),
-            y: area.y.saturating_add(INPUT_VERTICAL_PADDING),
-            width: area
-                .width
-                .max(1)
-                .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
-            height: text_height,
-        };
-        let visible_rows = usize::from(text_height);
-        let start = usize::from(caret_row).saturating_sub(visible_rows.saturating_sub(1));
-        self.composer.input_view = Some(InputView {
-            pane: area,
-            origin: (interior.x, interior.y),
-            start,
-            visible: visible_rows,
-        });
-        let lines: Vec<Line<'_>> = rows
-            .iter()
-            .skip(start)
-            .take(visible_rows)
-            .map(|row| Line::styled(row.as_str(), text_style))
-            .collect();
-        frame.render_widget(Paragraph::new(lines), interior);
-        (interior, start)
     }
 
     /// Paint the caret cell itself, wherever the window left it.
@@ -768,4 +697,56 @@ impl TuiApp {
             );
         }
     }
+}
+
+/// Paint the field's visible rows and say where they sit.
+///
+/// The window slides with the caret's row: the field's own height
+/// net of its padding decides how many rows stand, the window
+/// starts at the caret's row less all but the last of them, and
+/// the geometry comes back as the view the caller publishes to the
+/// pointer's hand beside it — the same `InputView` a click converts
+/// through, so what was painted and what is aimed at never disagree.
+/// Returns the window's own rectangle, its first row, and that view,
+/// which is where the caret's math continues.
+fn paint_composer_text(
+    frame: &mut Frame,
+    area: Rect,
+    rows: &[String],
+    text_style: Style,
+    caret_row: u16,
+) -> (Rect, usize, InputView) {
+    let text_height = INPUT_TEXT_ROWS.min(
+        area.height
+            .saturating_sub(INPUT_VERTICAL_PADDING.saturating_mul(2))
+            .saturating_sub(1),
+    );
+    let interior = Rect {
+        x: area
+            .x
+            .saturating_add(INPUT_SIDE_INSET)
+            .min(area.right().saturating_sub(1)),
+        y: area.y.saturating_add(INPUT_VERTICAL_PADDING),
+        width: area
+            .width
+            .max(1)
+            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
+        height: text_height,
+    };
+    let visible_rows = usize::from(text_height);
+    let start = usize::from(caret_row).saturating_sub(visible_rows.saturating_sub(1));
+    let view = InputView {
+        pane: area,
+        origin: (interior.x, interior.y),
+        start,
+        visible: visible_rows,
+    };
+    let lines: Vec<Line<'_>> = rows
+        .iter()
+        .skip(start)
+        .take(visible_rows)
+        .map(|row| Line::styled(row.as_str(), text_style))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), interior);
+    (interior, start, view)
 }

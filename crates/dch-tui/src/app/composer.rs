@@ -72,7 +72,7 @@ impl TuiApp {
                 && !self.state.agent_running.load(Ordering::SeqCst);
             self.queue.handed = None;
             let id = self.push_queued(text.clone());
-            if self.send_queued_id(id) {
+            if self.host.send_queued_id(id) {
                 if was_empty && idle {
                     self.queue.handed = Some(id);
                 }
@@ -177,7 +177,7 @@ impl TuiApp {
             self.config.display.caret_display,
             dch_config::CaretDisplay::Static
         ) || self.composer.caret_blink.on)
-            && !self.section_holds_keys()
+            && !self.queue.section_holds_keys()
             && self.permission.pending_permissions.front().is_none()
             && self.questions.pending_questions.is_empty()
             && self.pickers.session_picker.is_none()

@@ -94,7 +94,7 @@ impl TuiApp {
                 self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_add(1);
                 self.scroll.stick = Stick::Hold;
             }
-            let extended = self.extend_selection_head(head);
+            let extended = self.pointer.extend_selection_head(head);
             scrolled || extended
         } else if usize::from(row).saturating_add(1) >= usize::from(view.area.bottom()) {
             let last = view
@@ -109,25 +109,10 @@ impl TuiApp {
             let scrolled = self.scroll.scroll_offset > 0;
             self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_sub(1);
             self.scroll.rearm_if_near_bottom();
-            let extended = self.extend_selection_head(head);
+            let extended = self.pointer.extend_selection_head(head);
             scrolled || extended
         } else {
             false
-        }
-    }
-
-    /// Point the selection head at `head`, reporting whether it moved.
-    ///
-    /// Exactly one selection is in play during a drag; with none —
-    /// the button already released, say — there is nothing to extend.
-    fn extend_selection_head(&mut self, head: CellPos) -> bool {
-        match self.pointer.selection.as_mut() {
-            Some(selection) => {
-                let moved = selection.head != head;
-                selection.head = head;
-                moved
-            }
-            None => false,
         }
     }
 
@@ -302,33 +287,6 @@ impl TuiApp {
                 .saturating_add(1);
             self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_sub(excess);
             self.scroll.rearm_if_near_bottom();
-        }
-    }
-
-    /// Record the frame's lane shape, dropping a selection it
-    /// stranded.
-    ///
-    /// The live lane rebuilds every frame, so its segment lengths
-    /// moving — or the streaming region rewriting itself — can leave
-    /// a selection naming lines that no longer sit where it was
-    /// drawn. Only a selection reaching past the stable conversation
-    /// prefix can be stranded: shallower ones keep their numbering,
-    /// and the drag ends with the selection it was steering.
-    pub(crate) fn settle_selectable_shape(
-        &mut self,
-        streaming_changed: bool,
-        shape: SelectableShape,
-    ) {
-        let shape_before = self.pointer.selectable_shape;
-        self.pointer.selectable_shape = shape;
-        let stranded =
-            (streaming_changed || shape != shape_before)
-                && self.pointer.selection.as_ref().is_some_and(|selection| {
-                    ordered(selection).1.line >= shape.0.min(shape_before.0)
-                });
-        if stranded {
-            self.pointer.selection = None;
-            self.pointer.drag_position = None;
         }
     }
 
@@ -602,6 +560,15 @@ impl ScrollPosture {
             self.stick = Stick::Follow;
         }
     }
+
+    /// `base` moved by whatever the reader has done to the offset since
+    /// the last settle: a notch up takes it a row higher, a notch down a
+    /// row lower.
+    pub(super) fn pin_after_reader_move(&self, base: usize) -> usize {
+        let up = self.scroll_offset.saturating_sub(self.settled_offset);
+        let down = self.settled_offset.saturating_sub(self.scroll_offset);
+        base.saturating_add(down).saturating_sub(up)
+    }
 }
 
 /// The pointer's state over the transcript: the selection it is
@@ -683,6 +650,48 @@ impl SelectionState {
             .min(last);
         let col = usize::from(column.saturating_sub(view.area.x));
         Some(CellPos { line, col })
+    }
+
+    /// Record the frame's lane shape, dropping a selection it
+    /// stranded.
+    ///
+    /// The live lane rebuilds every frame, so its segment lengths
+    /// moving — or the streaming region rewriting itself — can leave
+    /// a selection naming lines that no longer sit where it was
+    /// drawn. Only a selection reaching past the stable conversation
+    /// prefix can be stranded: shallower ones keep their numbering,
+    /// and the drag ends with the selection it was steering.
+    pub(crate) fn settle_selectable_shape(
+        &mut self,
+        streaming_changed: bool,
+        shape: SelectableShape,
+    ) {
+        let shape_before = self.selectable_shape;
+        self.selectable_shape = shape;
+        let stranded = (streaming_changed || shape != shape_before)
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| ordered(selection).1.line >= shape.0.min(shape_before.0));
+        if stranded {
+            self.selection = None;
+            self.drag_position = None;
+        }
+    }
+
+    /// Point the selection head at `head`, reporting whether it moved.
+    ///
+    /// Exactly one selection is in play during a drag; with none —
+    /// the button already released, say — there is nothing to extend.
+    fn extend_selection_head(&mut self, head: CellPos) -> bool {
+        match self.selection.as_mut() {
+            Some(selection) => {
+                let moved = selection.head != head;
+                selection.head = head;
+                moved
+            }
+            None => false,
+        }
     }
 }
 

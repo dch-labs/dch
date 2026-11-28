@@ -7,6 +7,8 @@ use ratatui::text::Line;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::selection::PinIdentity;
+
 /// The accumulators one conversation render pass fills.
 ///
 /// A render of a message range produces the styled rows themselves
@@ -438,18 +440,94 @@ impl Default for TranscriptBake {
 }
 
 impl TranscriptBake {
+    /// Advance the generation the render guard reads.
+    ///
+    /// Every settled-conversation mutation moves the count — a message
+    /// landing, a line rewritten — and the merged cache rebuilds exactly
+    /// when its stamp falls behind it. The whole-bake invalidation calls
+    /// this itself; a caller that changed content without emptying the
+    /// bake calls it alone.
+    pub(super) fn bump_generation(&mut self) {
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+    }
+
     /// Invalidate the bake whole, keeping the width.
     ///
     /// For the shapes that change how already-baked messages render —
     /// a verbosity switch re-shapes every tool body, an expansion
     /// click re-renders one block — the bake cannot stand: it froze
     /// the old shape. Rare by nature (a key press, a click), so the
-    /// full re-render they cost is the price they always paid.
+    /// full re-render they cost is the price they always paid. The
+    /// generation advances with it: the merged cache guards on that
+    /// count, and a bake emptied under an unchanged count would keep
+    /// serving the old rendering until an unrelated event moved it.
     pub(super) fn rebake_whole(&mut self) {
+        self.bump_generation();
         self.conversation_bake.clear();
         self.conversation_bake_meta = BakeMeta::default();
         self.conversation_baked_through = 0;
         self.conversation_baked_prev_user = None;
+    }
+
+    /// The rows the block registered under `key` holds in the bake's row
+    /// maps, within `message` alone when a shared call id has to name one
+    /// of its occurrences.
+    ///
+    /// Tool, thinking, and compaction blocks alike: the three maps are
+    /// read together, since the caller knows the key and not which map
+    /// carries it.
+    pub(super) fn block_rows(&self, key: &str, message: Option<usize>) -> Vec<usize> {
+        let mut rows: Vec<usize> = [
+            &self.tool_summary_lines,
+            &self.thinking_summary_lines,
+            &self.compaction_summary_lines,
+        ]
+        .into_iter()
+        .flat_map(|map| map.iter())
+        .filter(|(_, id)| id.as_str() == key)
+        .map(|(row, _)| *row)
+        .filter(|row| {
+            // No message named: every row the key holds. One named: only
+            // the rows inside it, and none at all when the bake holds no
+            // such message — an occurrence the last frame did not paint.
+            message.is_none_or(|message| {
+                self.message_ranges
+                    .get(message)
+                    .is_some_and(|range| range.contains(row))
+            })
+        })
+        .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// The row the pin's identity names under the current bake, after a
+    /// rewrap moved every unit's rows: the unit opens at its new start,
+    /// and the offset scales by the unit's new row count over the old —
+    /// under uniform wrapping the same source line, give or take a row.
+    pub(super) fn pin_row_after_rewrap(&self, identity: PinIdentity) -> Option<usize> {
+        let range = self.message_ranges.get(identity.message)?;
+        let blocks = self.message_units.get(identity.message)?;
+        let units = blocks.get(identity.block)?;
+        let start = *units.get(identity.unit)?;
+        let end = units
+            .get(identity.unit.saturating_add(1))
+            .copied()
+            .or_else(|| {
+                blocks
+                    .get(identity.block.saturating_add(1))
+                    .and_then(|units| units.first())
+                    .copied()
+            })
+            .unwrap_or(range.end);
+        let rows = end.saturating_sub(start);
+        let offset = identity
+            .offset
+            .saturating_mul(rows)
+            .checked_div(identity.unit_rows)
+            .unwrap_or_default()
+            .min(rows.saturating_sub(1));
+        Some(start.saturating_add(offset))
     }
 }
 
@@ -1192,6 +1270,154 @@ mod tests {
         assert!(
             subject.expansion.expanded_tools.contains("call_live"),
             "a live parsed edit diff expands its own row"
+        );
+    }
+
+    #[test]
+    fn a_whole_bake_invalidation_advances_the_generation_on_its_own() {
+        // The merged cache guards on the generation, so a bake emptied
+        // under an unchanged count would keep serving the old rendering
+        // until an unrelated event moved it. The invalidation carries
+        // its own advance, so no caller has to remember the pair — and
+        // it empties a bake that actually holds rows.
+        let mut bake = super::TranscriptBake::default();
+        bake.conversation_bake
+            .push(ratatui::text::Line::from("a baked row"));
+        bake.conversation_baked_through = 3;
+        bake.conversation_baked_prev_user = Some(true);
+        let generation = bake.conversation_generation;
+        bake.rebake_whole();
+        assert_eq!(
+            bake.conversation_generation,
+            generation.saturating_add(1),
+            "the invalidation moves the stamp the render guard reads"
+        );
+        assert!(
+            bake.conversation_bake.is_empty(),
+            "and empties the bake it guards"
+        );
+        assert_eq!(bake.conversation_baked_through, 0, "no message stays baked");
+        assert_eq!(
+            bake.conversation_baked_prev_user, None,
+            "the seam rule starts over"
+        );
+    }
+
+    #[test]
+    fn a_push_advances_the_generation_once_whether_or_not_it_folds_the_plan_block() {
+        // A fold rides the push that retired it: the rebake's own
+        // advance is the push's, so the count reads one mutation for one
+        // message on both paths — never two, never none. The bake tells
+        // the paths apart: a push that folds nothing leaves it standing,
+        // a push that folds the block empties it.
+        let message = || TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "working on it".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        };
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject
+            .bake
+            .conversation_bake
+            .push(ratatui::text::Line::from("a baked row"));
+        subject.bake.conversation_baked_through = 3;
+        let generation = subject.bake.conversation_generation;
+        subject.push_message(message());
+        assert_eq!(
+            subject.bake.conversation_generation,
+            generation.saturating_add(1),
+            "a push that folds nothing counts once"
+        );
+        assert_eq!(
+            subject.bake.conversation_baked_through, 3,
+            "and rebakes nothing: the bake stands as it was"
+        );
+
+        subject
+            .expansion
+            .expanded_tools
+            .insert("call_todo".to_string());
+        subject.expansion.auto_expanded_todo = Some("call_todo".to_string());
+        let generation = subject.bake.conversation_generation;
+        subject.push_message(message());
+        assert!(
+            !subject.expansion.expanded_tools.contains("call_todo"),
+            "the push folded the auto-expanded block"
+        );
+        assert_eq!(
+            subject.bake.conversation_generation,
+            generation.saturating_add(1),
+            "a push that folds the block counts once too"
+        );
+        assert!(
+            subject.bake.conversation_bake.is_empty(),
+            "and the fold emptied the bake"
+        );
+        assert_eq!(
+            subject.bake.conversation_baked_through, 0,
+            "no message stays baked"
+        );
+    }
+
+    #[test]
+    fn a_theme_swapped_by_the_host_drops_every_rendering_cached_under_the_old_one() {
+        // The palette is private to the crate: the host and the
+        // integration suites swap through the same entry point the
+        // in-crate paths funnel into, so a palette handed over at
+        // startup can no more leave the caches serving the old colors
+        // than a `/theme` can.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.bake.conversation_cache_generation = subject.bake.conversation_generation;
+        subject.freeze.live_stamp = 7;
+        subject.bake.conversation_baked_through = 3;
+        let generation = subject.bake.conversation_generation;
+        subject
+            .set_theme(crate::theme::Theme::by_name("nord").expect("the nord palette is shipped"));
+        assert_eq!(subject.theme().name, "Nord", "the swap landed");
+        assert!(
+            subject.bake.conversation_generation > generation,
+            "the swap pierces the render guard's generation"
+        );
+        assert_eq!(
+            subject.bake.conversation_baked_through, 0,
+            "the swap invalidates the conversation bake"
+        );
+        assert_eq!(
+            subject.freeze.live_stamp, 0,
+            "the swap forces the live lane to re-render"
+        );
+    }
+
+    #[test]
+    fn a_host_theme_swap_leaves_the_queued_terminal_writes_alone() {
+        // The host-facing swap re-renders every cached line and writes
+        // nothing to the terminal: the cursor tint and the canvas travel
+        // by the pair a committed switch queues for the render flush. A
+        // swap that touched the pair would land a canvas the caller
+        // never chose, or drop one it had queued.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        assert!(
+            subject.browse.pending_theme_osc.is_none(),
+            "a fresh session has no terminal write queued"
+        );
+        subject
+            .set_theme(crate::theme::Theme::by_name("nord").expect("the nord palette is shipped"));
+        assert!(
+            subject.browse.pending_theme_osc.is_none(),
+            "the swap queues no canvas or cursor write"
+        );
+        let queued = (
+            ratatui::style::Color::Rgb(1, 2, 3),
+            ratatui::style::Color::Rgb(4, 5, 6),
+        );
+        subject.browse.pending_theme_osc = Some(queued);
+        subject.set_theme(crate::theme::Theme::default());
+        assert_eq!(
+            subject.browse.pending_theme_osc,
+            Some(queued),
+            "nor does it disturb a write the caller had queued"
         );
     }
 

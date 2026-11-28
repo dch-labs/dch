@@ -10,11 +10,11 @@ use super::permissions::{
     popup_rect, popup_window,
 };
 use super::pulse::scaled_color;
-use super::queue::{QUEUE_ROWS, queue_prompt_prefix};
+use super::queue::{QUEUE_ROWS, QueueMode, queue_prompt_prefix};
 use super::run::FrameStats;
 use super::selection::reverse_selection;
 use super::session_commands::fit_picker_title;
-use super::todos::TOOL_DETAIL_CAP;
+use super::todos::{PlanView, TOOL_DETAIL_CAP};
 
 use super::clipboard::{CopyAnswer, CopyVerdict};
 use super::selection::CellPos;
@@ -1898,7 +1898,7 @@ fn the_startup_fallback_restores_without_opening_a_burst() {
     let mut app = TuiApp::new(dch_config::DchConfig::default());
     let mut literal = Theme::by_name("nord").expect("nord resolves");
     literal.name = "host literal";
-    app.theme = literal;
+    app.set_theme(literal);
     let before =
         crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
@@ -3762,7 +3762,7 @@ fn the_sheet_is_measured_against_the_rows_left_after_the_strip() {
     let mut app = app();
     let area = Rect::new(0, 0, 40, 12);
     assert_eq!(
-        app.question_sheet_area(area).height,
+        app.display.question_sheet_area(area).height,
         12u16
             .saturating_sub(STATUS_BAR_ROWS)
             .saturating_add(STATUS_BAR_AIR),
@@ -3771,7 +3771,7 @@ fn the_sheet_is_measured_against_the_rows_left_after_the_strip() {
 
     app.display.strip_position = dch_config::StripPosition::Top;
     assert_eq!(
-        app.question_sheet_area(area).height,
+        app.display.question_sheet_area(area).height,
         12u16
             .saturating_sub(STATUS_BAR_ROWS)
             .saturating_add(STATUS_BAR_AIR)
@@ -4199,7 +4199,7 @@ fn the_startup_retry_lands_the_registry_palette_over_the_deferral() {
     let canvas = app.theme.ui.background;
     let surface = app.theme.ui.surface;
     let foreground = app.theme.ui.foreground;
-    app.theme = app.theme.deferred_to_terminal();
+    app.set_theme(app.theme.deferred_to_terminal());
     assert_eq!(
         app.theme.ui.foreground,
         ratatui::style::Color::Reset,
@@ -4264,9 +4264,11 @@ fn a_stated_seat_grounds_a_deferred_palette_the_seat_doc_names_out_of_contract()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     crate::terminal::set_multiplexed_for_tests(Some(false));
     let mut subject = TuiApp::new(dch_config::DchConfig::default());
-    subject.theme = Theme::by_name("dracula")
-        .expect("dracula resolves")
-        .deferred_to_terminal();
+    subject.set_theme(
+        Theme::by_name("dracula")
+            .expect("dracula resolves")
+            .deferred_to_terminal(),
+    );
     let canvas = subject.theme.ui.background;
     assert!(
         matches!(canvas, ratatui::style::Color::Rgb(..)),
@@ -5138,7 +5140,7 @@ fn a_strip_that_stands_down_clears_its_row_before_the_composer() {
     // leak every light theme wears visibly. Pinned on a direct
     // terminal, where no canvas walk exists to refill the row.
     let mut subject = app();
-    subject.theme = Theme::by_name("github_light").unwrap();
+    subject.set_theme(Theme::by_name("github_light").unwrap());
     subject.push_message(TuiMessage::User {
         text: "hi".to_string(),
         timestamp: chrono::Utc::now(),

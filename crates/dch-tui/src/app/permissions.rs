@@ -456,42 +456,31 @@ impl TuiApp {
     /// Land one delivered request and any others already waiting
     /// behind it.
     ///
-    /// The run loop's select arm hands the request its wakeup
-    /// delivered plus the receiver it owns: the request enters the
-    /// queue and the receiver drains, so a burst of ready asks lands
-    /// together and the first frame's overlay reports the true
-    /// waiting count instead of admitting them one loop iteration at
-    /// a time.
+    /// The request enters the queue and the receiver drains, so a
+    /// burst of ready asks lands together and the first frame's
+    /// overlay reports the true waiting count instead of admitting
+    /// them one loop iteration at a time. The integration suites and
+    /// the in-crate tests stage their bursts through here; the run
+    /// loop lands its own the same way, through the permission state
+    /// and the receiver it keeps in a local.
     pub fn land_permission_requests(
         &mut self,
         first: PermissionRequest,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>,
     ) {
-        self.permission.spend_unrendered_front();
-        self.permission.pending_permissions.push_back(first);
-        while let Ok(request) = rx.try_recv() {
-            self.permission.spend_unrendered_front();
-            self.permission.pending_permissions.push_back(request);
-        }
+        self.permission.land_permission_requests(first, rx);
     }
 
-    /// Move any waiting permission requests into the queue.
+    /// Refresh the permission queue without the run loop.
     ///
-    /// The test seam for staging asks without the run loop:
-    /// production keeps its receiver in a local and lands bursts
-    /// through [`land_permission_requests`](Self::land_permission_requests)
-    /// instead — once `run` claims the channel, this slot is empty and
-    /// the method is a no-op.
+    /// The test seam the integration suites drive to stage asks; the
+    /// pass itself is the permission state's own
+    /// (`PermissionState::poll_permission_requests`). The run loop
+    /// lands its bursts through the permission state instead, from the
+    /// receiver it keeps in a local — once `run` has claimed the
+    /// channel, this is a no-op.
     pub fn poll_permission_requests(&mut self) {
-        while let Some(request) = self
-            .permission
-            .permission_rx
-            .as_mut()
-            .and_then(|rx| rx.try_recv().ok())
-        {
-            self.permission.spend_unrendered_front();
-            self.permission.pending_permissions.push_back(request);
-        }
+        self.permission.poll_permission_requests();
     }
 }
 
@@ -844,12 +833,13 @@ impl PermissionState {
         }
     }
 
-    /// The pending permission ask, as the overlay renders it: the ask's
-    /// prompt, the phrases naming what each press would actually record
-    /// — post-skip, the same filter the record arms apply — the command
-    /// the ask would run (read from the raw input, never from the
-    /// prompt), any reason line being typed, and how many more asks
-    /// wait behind it.
+    /// The pending permission ask, as the overlay renders it.
+    ///
+    /// The sheet carries the ask's prompt, the phrases naming what each
+    /// press would actually record — post-skip, the same filter the
+    /// record arms apply — the command the ask would run (read from the
+    /// raw input, never from the prompt), any reason line being typed,
+    /// and how many more asks wait behind it.
     pub(crate) fn shown_permission(&self) -> Option<PermissionSheet> {
         self.permission_spent.set(false);
         self.pending_permissions.front().map(|request| {
@@ -877,6 +867,46 @@ impl PermissionState {
                 more: self.pending_permissions.len().saturating_sub(1),
             }
         })
+    }
+
+    /// Move any waiting permission requests into the queue.
+    ///
+    /// The test seam for staging asks without the run loop:
+    /// production keeps its receiver in a local and lands bursts
+    /// through [`land_permission_requests`](Self::land_permission_requests)
+    /// instead — once `run` claims the channel, this slot is empty and
+    /// the method is a no-op.
+    pub(crate) fn poll_permission_requests(&mut self) {
+        while let Some(request) = self
+            .permission_rx
+            .as_mut()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.spend_unrendered_front();
+            self.pending_permissions.push_back(request);
+        }
+    }
+
+    /// Land one delivered request and any others already waiting
+    /// behind it.
+    ///
+    /// The run loop's select arm hands the request its wakeup
+    /// delivered plus the receiver it owns: the request enters the
+    /// queue and the receiver drains, so a burst of ready asks lands
+    /// together and the first frame's overlay reports the true
+    /// waiting count instead of admitting them one loop iteration at
+    /// a time.
+    pub(crate) fn land_permission_requests(
+        &mut self,
+        first: PermissionRequest,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>,
+    ) {
+        self.spend_unrendered_front();
+        self.pending_permissions.push_back(first);
+        while let Ok(request) = rx.try_recv() {
+            self.spend_unrendered_front();
+            self.pending_permissions.push_back(request);
+        }
     }
 }
 /// The popup's window over its candidates, following the highlight.

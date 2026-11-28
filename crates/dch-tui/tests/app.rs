@@ -182,7 +182,7 @@ fn new_constructs_with_empty_fresh_state() {
     assert!(!Arc::ptr_eq(app.active_tools(), other.active_tools()));
     assert!(!Arc::ptr_eq(app.tokens(), other.tokens()));
     assert!(!Arc::ptr_eq(app.render_notify(), other.render_notify()));
-    assert_eq!(app.theme.name, Theme::by_name("dracula").unwrap().name);
+    assert_eq!(app.theme().name, Theme::by_name("dracula").unwrap().name);
 }
 
 #[test]
@@ -229,13 +229,13 @@ fn seeded_messages_become_the_conversation_pinned_to_the_newest() {
 #[test]
 fn an_unknown_theme_falls_back_to_default() {
     let app = TuiApp::new(config_with_theme("no such theme"));
-    assert_eq!(app.theme.name, Theme::default().name);
+    assert_eq!(app.theme().name, Theme::default().name);
 }
 
 #[test]
 fn a_known_theme_name_resolves() {
     let app = TuiApp::new(config_with_theme("nord"));
-    assert_eq!(app.theme.name, "Nord");
+    assert_eq!(app.theme().name, "Nord");
 }
 
 #[test]
@@ -261,7 +261,7 @@ fn the_caret_follows_display_width_not_bytes() {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
     let terminal = render_to_buffer(&mut app, 80, 30);
-    let caret = painted_caret_col(&terminal, app.theme.ui.primary);
+    let caret = painted_caret_col(&terminal, app.theme().ui.primary);
     assert_eq!(
         caret,
         Some(5),
@@ -273,7 +273,7 @@ fn the_caret_follows_display_width_not_bytes() {
         wide_app.handle_event(&plain(KeyCode::Char(c)));
     }
     let wide_terminal = render_to_buffer(&mut wide_app, 80, 30);
-    let wide_caret = painted_caret_col(&wide_terminal, wide_app.theme.ui.primary);
+    let wide_caret = painted_caret_col(&wide_terminal, wide_app.theme().ui.primary);
     assert_eq!(
         wide_caret,
         Some(5),
@@ -1336,7 +1336,7 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
     );
     assert_eq!(
         buffer[(10, place_row + 1)].bg,
-        app.theme.ui.surface,
+        app.theme().ui.surface,
         "the caption closes tight against the box: the surface opens on the very next row"
     );
     let numbers_at = rows
@@ -1453,7 +1453,7 @@ fn layout_shows_three_panes() {
     );
     assert_eq!(
         buffer[(0, 23)].bg,
-        app.theme.ui.primary,
+        app.theme().ui.primary,
         "the corner cell opens the composer's primary edge column"
     );
     let first_text = field_row(24);
@@ -2519,7 +2519,8 @@ fn a_user_turn_opens_with_the_primary_chevron() {
         "the chevron rides the gutter beside the turn's first row"
     );
     assert_eq!(
-        chevron.fg, app.theme.ui.primary,
+        chevron.fg,
+        app.theme().ui.primary,
         "the chevron takes the theme's primary accent"
     );
     let marked_row = u16::try_from(marked).unwrap_or(0);
@@ -2530,7 +2531,7 @@ fn a_user_turn_opens_with_the_primary_chevron() {
     for (x, label) in [(5u16, "at the text"), (77, "at the box's right edge")] {
         assert_eq!(
             buffer[(x, marked_row)].bg,
-            app.theme.ui.surface,
+            app.theme().ui.surface,
             "the user turn paints the prompt box's surface {label}"
         );
     }
@@ -2597,7 +2598,7 @@ fn an_empty_session_centers_the_composer_under_the_splash() {
     // to the bottom, and the two positions are far apart.
     let mut fresh = app();
     let terminal = render_to_buffer(&mut fresh, 80, 100);
-    let primary = fresh.theme.ui.primary;
+    let primary = fresh.theme().ui.primary;
     let Some(centered_row) = primary_row_in(&terminal, 40..75, primary) else {
         panic!("the centered composer paints its caret lane mid-frame");
     };
@@ -2619,7 +2620,7 @@ fn an_empty_session_centers_the_composer_under_the_splash() {
         unsent: false,
     });
     let docked = render_to_buffer(&mut busy, 80, 100);
-    let Some(docked_row) = primary_row_in(&docked, 85..100, busy.theme.ui.primary) else {
+    let Some(docked_row) = primary_row_in(&docked, 85..100, busy.theme().ui.primary) else {
         panic!("the docked composer paints its caret lane at the bottom");
     };
     assert!(
@@ -2846,7 +2847,7 @@ fn the_transparent_theme_stands_its_captions_outside_the_rules() {
     let caption_row = u16::try_from(caption_row).unwrap_or(0);
     assert_eq!(
         buffer[(10, caption_row.saturating_add(1))].bg,
-        painted.theme.ui.surface,
+        painted.theme().ui.surface,
         "painted themes keep the caption tight against the composer's surface"
     );
 }
@@ -2862,13 +2863,13 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
     for y in 18..=21u16 {
         assert_eq!(
             buffer[(0, y)].bg,
-            plain.theme.ui.primary,
+            plain.theme().ui.primary,
             "every composer row opens with the primary edge"
         );
     }
     assert_eq!(
         buffer[(1, 18)].bg,
-        plain.theme.ui.surface,
+        plain.theme().ui.surface,
         "the composer body beside the edge keeps the surface color"
     );
 
@@ -2877,7 +2878,8 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
     // numbers row at the bottom sits on the bar's canvas, skipping the
     // bar's row between them, which carries the track's own fill.
     assert_ne!(
-        plain.theme.ui.background, plain.theme.ui.surface,
+        plain.theme().ui.background,
+        plain.theme().ui.surface,
         "the palettes keep the bar's canvas distinct from the raised surface"
     );
     assert_eq!(
@@ -2887,7 +2889,7 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
     );
     assert_eq!(
         buffer[(0, 24)].bg,
-        plain.theme.ui.background,
+        plain.theme().ui.background,
         "the numbers row sits on the bar's canvas at the frame's bottom"
     );
 
@@ -2921,7 +2923,7 @@ fn a_press_in_the_composer_places_the_caret_where_it_landed() {
     let mut app = docked_app();
     app.handle_event(&Event::Paste("hello world".to_string()));
     let composed = render_to_buffer(&mut app, 80, 24);
-    let (end, row) = painted_caret_pos(&composed, app.theme.ui.primary)
+    let (end, row) = painted_caret_pos(&composed, app.theme().ui.primary)
         .expect("the painted caret renders after typing");
 
     app.handle_event(&mouse_event(
@@ -2931,7 +2933,7 @@ fn a_press_in_the_composer_places_the_caret_where_it_landed() {
     ));
     let clicked = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
-        painted_caret_col(&clicked, app.theme.ui.primary),
+        painted_caret_col(&clicked, app.theme().ui.primary),
         Some(2 + 3),
         "a press on the text lands the caret where it pointed"
     );
@@ -2943,7 +2945,7 @@ fn a_press_in_the_composer_places_the_caret_where_it_landed() {
     ));
     let clamped = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
-        painted_caret_col(&clamped, app.theme.ui.primary),
+        painted_caret_col(&clamped, app.theme().ui.primary),
         Some(end),
         "a press past the text's end clamps the caret to the end"
     );
@@ -4660,7 +4662,7 @@ fn mouse_traffic_leaves_the_caret_blink_alone() {
     );
     let dark = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
-        painted_caret_col(&dark, app.theme.ui.primary),
+        painted_caret_col(&dark, app.theme().ui.primary),
         None,
         "the caret's dark phase paints no cell"
     );
@@ -4679,7 +4681,7 @@ fn mouse_traffic_leaves_the_caret_blink_alone() {
     ));
     let read = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
-        painted_caret_col(&read, app.theme.ui.primary),
+        painted_caret_col(&read, app.theme().ui.primary),
         None,
         "mouse traffic leaves the dark phase dark"
     );
@@ -4687,7 +4689,7 @@ fn mouse_traffic_leaves_the_caret_blink_alone() {
     app.handle_event(&plain(KeyCode::Char('x')));
     let typed = render_to_buffer(&mut app, 80, 24);
     assert!(
-        painted_caret_col(&typed, app.theme.ui.primary).is_some(),
+        painted_caret_col(&typed, app.theme().ui.primary).is_some(),
         "typing resolidifies the caret"
     );
 }
@@ -4712,7 +4714,7 @@ fn the_caret_blinks_on_the_tick_and_input_resolidifies_it() {
     );
     let dark = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
-        painted_caret_col(&dark, app.theme.ui.primary),
+        painted_caret_col(&dark, app.theme().ui.primary),
         None,
         "the caret paints no cell through the dark half of the beat"
     );
@@ -4726,7 +4728,7 @@ fn the_caret_blinks_on_the_tick_and_input_resolidifies_it() {
     app.handle_event(&plain(KeyCode::Char('x')));
     let typed = render_to_buffer(&mut app, 80, 24);
     assert!(
-        painted_caret_col(&typed, app.theme.ui.primary).is_some(),
+        painted_caret_col(&typed, app.theme().ui.primary).is_some(),
         "keyboard input resolidifies the caret from the dark phase"
     );
     assert!(
@@ -4860,7 +4862,7 @@ fn an_exactly_filled_line_stays_visible_with_its_caret_at_the_end() {
         .position(|row| row.contains(&text))
         .expect("the filled line renders");
     let start = cell_col(&rows[line], &text);
-    let (col, row) = painted_caret_pos(&typed, app.theme.ui.primary)
+    let (col, row) = painted_caret_pos(&typed, app.theme().ui.primary)
         .expect("the caret paints on an exactly filled line");
     assert_eq!(
         row,
@@ -4912,10 +4914,10 @@ fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
         app.handle_event(&plain(KeyCode::Char('x')));
         let typed = render_to_buffer(&mut app, 40, height);
         let buffer = typed.backend().buffer();
-        if let Some((_, row)) = painted_caret_pos(&typed, app.theme.ui.primary) {
+        if let Some((_, row)) = painted_caret_pos(&typed, app.theme().ui.primary) {
             assert_ne!(
                 buffer[(0, row)].bg,
-                app.theme.ui.status_bar_bg,
+                app.theme().ui.status_bar_bg,
                 "h={height}: the caret stays on the composer's own rows, never the bar's"
             );
         }
@@ -4926,7 +4928,7 @@ fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
     roomy.handle_event(&plain(KeyCode::Char('x')));
     let typed = render_to_buffer(&mut roomy, 40, 6);
     assert!(
-        painted_caret_pos(&typed, roomy.theme.ui.primary).is_some(),
+        painted_caret_pos(&typed, roomy.theme().ui.primary).is_some(),
         "at a height the composer breathes in, the caret paints"
     );
 }
@@ -4949,8 +4951,8 @@ fn the_status_bar_paints_only_its_own_rows_in_undersized_terminals() {
         let buffer = terminal.backend().buffer();
         let bar_rows: Vec<u16> = (0..height)
             .filter(|&y| {
-                buffer[(0, y)].fg == app.theme.ui.status_bar_fg
-                    && buffer[(0, y)].bg == app.theme.ui.status_bar_bg
+                buffer[(0, y)].fg == app.theme().ui.status_bar_fg
+                    && buffer[(0, y)].bg == app.theme().ui.status_bar_bg
             })
             .collect();
         let count = u16::try_from(bar_rows.len()).unwrap_or(0);
@@ -4983,12 +4985,12 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
     );
     assert_eq!(
         buffer[(1, composer.y)].bg,
-        app.theme.ui.surface,
+        app.theme().ui.surface,
         "the composer body beside its primary edge draws on the surface color"
     );
     assert_eq!(
         buffer[(0, 13)].bg,
-        app.theme.ui.status_bar_bg,
+        app.theme().ui.status_bar_bg,
         "the status bar paints its own row"
     );
 }
@@ -5012,18 +5014,18 @@ fn a_seated_pane_grounds_its_canvas_and_keeps_its_surfaces() {
     let composer = composer_chunk(40, 14, 4);
     assert_eq!(
         buffer[(5, composer.y.saturating_sub(2))].bg,
-        app.theme.ui.background,
+        app.theme().ui.background,
         "the conversation pane paints its canvas where the direct seat leaves the \
          terminal default — a client's own background cannot show through"
     );
     assert_eq!(
         buffer[(1, composer.y)].bg,
-        app.theme.ui.surface,
+        app.theme().ui.surface,
         "the composer body keeps its surface fill over the grounded canvas"
     );
     assert_eq!(
         buffer[(0, 13)].bg,
-        app.theme.ui.status_bar_bg,
+        app.theme().ui.status_bar_bg,
         "the status bar paints its own row over the grounded canvas"
     );
 }
@@ -6052,7 +6054,7 @@ fn a_pad_row_and_a_blank_line_breathe_between_user_turns_and_agent_material() {
     );
     assert_eq!(
         buffer[(10, u16::try_from(question + 1).unwrap_or(0))].bg,
-        app.theme.ui.surface,
+        app.theme().ui.surface,
         "the first boundary row is the box's own closing pad"
     );
     assert_eq!(
@@ -6182,7 +6184,7 @@ fn the_conversation_opens_one_row_below_the_pane_s_top_edge() {
     }
     assert_eq!(
         buffer[(10, 1)].bg,
-        app.theme.ui.surface,
+        app.theme().ui.surface,
         "the row above the text carries the box's tint"
     );
     assert_eq!(
@@ -6757,8 +6759,8 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
     // document scrollable; the pinned view sits at its bottom.
     let terminal = render_to_buffer(&mut app, 20, 15);
     let buffer = terminal.backend().buffer();
-    let thumb = app.theme.ui.scrollbar_thumb;
-    let track = app.theme.ui.scrollbar_track;
+    let thumb = app.theme().ui.scrollbar_thumb;
+    let track = app.theme().ui.scrollbar_track;
     // 20 rows: 6 conversation rows — 5 content rows for the
     // conversation below its padding row, above the notice, spacer,
     // composer, and footer. thumb = 5 * 5 / 60 clamps to 1 row,
@@ -7975,11 +7977,11 @@ fn the_arrows_belong_to_the_draft_while_it_is_open() {
     }
     let _ = app.handle_event(&plain(KeyCode::Home));
     let before = render_to_buffer(&mut app, 80, 24);
-    let caret_before = painted_caret_col(&before, app.theme.ui.primary);
+    let caret_before = painted_caret_col(&before, app.theme().ui.primary);
     let _ = app.handle_event(&plain(KeyCode::Right));
     let after = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
-        painted_caret_col(&after, app.theme.ui.primary),
+        painted_caret_col(&after, app.theme().ui.primary),
         caret_before.map(|col| col.saturating_add(1)),
         "Right moves the caret one cell right inside the draft"
     );
@@ -8918,7 +8920,7 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
     let composed = render_to_buffer(&mut app, 80, 25);
-    let before = painted_caret_col(&composed, app.theme.ui.primary);
+    let before = painted_caret_col(&composed, app.theme().ui.primary);
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
     let (reply, reply_rx) = tokio::sync::oneshot::channel();
     requests_tx
@@ -8951,7 +8953,7 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
     );
     let answered = render_to_buffer(&mut app, 80, 25);
     assert_eq!(
-        painted_caret_col(&answered, app.theme.ui.primary),
+        painted_caret_col(&answered, app.theme().ui.primary),
         before,
         "the click behind the overlay left the caret where it was — the \
          draft comes back unedited"
@@ -10120,7 +10122,7 @@ fn a_click_on_the_question_sheet_leaves_the_hidden_caret_alone() {
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
     let composed = render_to_buffer(&mut app, 80, 25);
-    let before = painted_caret_col(&composed, app.theme.ui.primary);
+    let before = painted_caret_col(&composed, app.theme().ui.primary);
     let _answer = staged_question(&mut app, "which one?", &[("one", None)], false);
 
     assert!(app.handle_event(&mouse_event(
@@ -10132,7 +10134,7 @@ fn a_click_on_the_question_sheet_leaves_the_hidden_caret_alone() {
     assert!(app.handle_event(&plain(KeyCode::Enter)));
     let answered = render_to_buffer(&mut app, 80, 25);
     assert_eq!(
-        painted_caret_col(&answered, app.theme.ui.primary),
+        painted_caret_col(&answered, app.theme().ui.primary),
         before,
         "the press on the sheet never moved the caret it hid"
     );
@@ -10340,7 +10342,7 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
     assert!(click_the_composer(&mut bare));
     let moved = render_to_buffer(&mut bare, 80, 25);
     assert_eq!(
-        painted_caret_col(&moved, bare.theme.ui.primary),
+        painted_caret_col(&moved, bare.theme().ui.primary),
         Some(6),
         "with nothing over it, the press moves the caret where it pointed"
     );
@@ -10350,13 +10352,13 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
     let composed = render_to_buffer(&mut app, 80, 25);
-    let before = painted_caret_col(&composed, app.theme.ui.primary);
+    let before = painted_caret_col(&composed, app.theme().ui.primary);
     stage(&mut app);
     assert!(click_the_composer(&mut app));
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     let after = render_to_buffer(&mut app, 80, 25);
     assert_eq!(
-        painted_caret_col(&after, app.theme.ui.primary),
+        painted_caret_col(&after, app.theme().ui.primary),
         before,
         "the painted caret the sheet hid never moved"
     );
@@ -10860,7 +10862,7 @@ fn a_todo_update_renders_as_checkbox_rows_in_the_conversation() {
         .position(|row| row.contains("\u{25d0}") && row.contains("dig the trench"))
         .expect("the moved trench's row");
     let accent_cells = (0..80u16)
-        .filter(|&x| buffer[(x, u16::try_from(trench_row).unwrap())].fg == app.theme.ui.primary)
+        .filter(|&x| buffer[(x, u16::try_from(trench_row).unwrap())].fg == app.theme().ui.primary)
         .count();
     assert!(accent_cells > 0, "the rung in progress wears the accent");
 
@@ -10886,10 +10888,10 @@ fn a_todo_update_renders_as_checkbox_rows_in_the_conversation() {
         .expect("the newborn's row");
     let newborn_row = u16::try_from(newborn_row).unwrap_or(0);
     let newborn_moved = (0..80u16)
-        .filter(|&x| buffer[(x, newborn_row)].fg == app.theme.ui.secondary)
+        .filter(|&x| buffer[(x, newborn_row)].fg == app.theme().ui.secondary)
         .count();
     let newborn_accent = (0..80u16)
-        .filter(|&x| buffer[(x, newborn_row)].fg == app.theme.ui.primary)
+        .filter(|&x| buffer[(x, newborn_row)].fg == app.theme().ui.primary)
         .count();
     assert!(
         newborn_moved > 0 && newborn_accent == 0,
@@ -11554,7 +11556,7 @@ fn an_unsent_row_renders_dimmed_without_a_marker() {
         steered: false,
         unsent: true,
     }]);
-    let dim = app.theme.ui.dim;
+    let dim = app.theme().ui.dim;
     let terminal = render_to_buffer(&mut app, 80, 24);
     let flat: String = row_texts(&terminal).join("\n");
     assert!(
@@ -11578,7 +11580,7 @@ fn an_unsent_row_renders_dimmed_without_a_marker() {
         steered: false,
         unsent: false,
     }]);
-    let user_fg = app.theme.ui.user_message_fg;
+    let user_fg = app.theme().ui.user_message_fg;
     let terminal = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
         fg_of_row_holding(&terminal, "queued when the kill came"),
@@ -11822,14 +11824,14 @@ fn the_plan_badge_names_the_section_in_the_queue_s_own_style() {
     for offset in 0..6u16 {
         assert_eq!(
             buffer[(column + offset, row)].bg,
-            app.theme.ui.primary,
+            app.theme().ui.primary,
             "the word rides the primary fill — the queue's pill, another name"
         );
     }
     for letters in 1..5u16 {
         assert_eq!(
             buffer[(column + letters, row)].fg,
-            app.theme.ui.background,
+            app.theme().ui.background,
             "the canvas color keeps the letters legible on the accent"
         );
     }
@@ -11863,7 +11865,7 @@ fn the_plan_badge_names_the_section_in_the_queue_s_own_style() {
     );
 
     // A deferring theme fills nothing: the badge becomes plain text.
-    app.theme = Theme::by_name("transparent").expect("the transparent theme is shipped");
+    app.set_theme(Theme::by_name("transparent").expect("the transparent theme is shipped"));
     let terminal = render_to_buffer(&mut app, 80, 30);
     let rows = row_texts(&terminal);
     let badge_row = rows
@@ -12292,7 +12294,7 @@ fn autumn_night_keeps_its_track_a_visible_step_off_the_bar() {
         steered: false,
         unsent: false,
     });
-    let (track, bar_bg) = (app.theme.ui.scrollbar_track, app.theme.ui.status_bar_bg);
+    let (track, bar_bg) = (app.theme().ui.scrollbar_track, app.theme().ui.status_bar_bg);
     let (track_rgb, bar_rgb) = (rgb_of(track), rgb_of(bar_bg));
     let delta = std::iter::zip(track_rgb, bar_rgb)
         .map(|(t, b)| t.abs_diff(b))
@@ -12444,8 +12446,8 @@ fn completed_rows_retire_uniformly_with_an_unstruck_box() {
     let terminal = render_to_buffer(&mut app, 80, 30);
     let rows = row_texts(&terminal);
     let buffer = terminal.backend().buffer();
-    let dim = app.theme.ui.dim;
-    let accent = app.theme.ui.primary;
+    let dim = app.theme().ui.dim;
+    let accent = app.theme().ui.primary;
     for subject in ["the earlier work", "the last stretch"] {
         let row = rows
             .iter()
@@ -13789,7 +13791,7 @@ fn a_tail_user_row_paints_its_own_chrome() {
     );
     assert_eq!(
         buffer[(5, tail_row)].bg,
-        app.theme.ui.surface,
+        app.theme().ui.surface,
         "the tail turn's row rides the prompt box the frame it lands"
     );
 }
@@ -13854,7 +13856,7 @@ fn a_layout_rebake_leaves_no_stale_chrome() {
     let second_row = u16::try_from(*expected.last().expect("the second turn's row")).unwrap_or(0);
     assert_eq!(
         buffer[(5, second_row)].bg,
-        app.theme.ui.surface,
+        app.theme().ui.surface,
         "the rebaked layout boxes each turn on its new rows"
     );
 }
@@ -14176,7 +14178,7 @@ fn a_theme_command_sets_the_palette_and_persists_it() {
     app.run_command(Command::Theme {
         name: Some("nord".to_string()),
     });
-    assert_eq!(app.theme.name, "Nord", "the palette changed live");
+    assert_eq!(app.theme().name, "Nord", "the palette changed live");
     let saved = std::fs::read_to_string(dir.path().join("config.toml")).expect("the save landed");
     assert!(
         saved.contains("\"nord\""),
@@ -14214,7 +14216,8 @@ fn tab_after_arrows_applies_from_the_arrow_position() {
         "Tab continues from the arrow-landed row"
     );
     assert_eq!(
-        app.theme.name, "Tokyo Night",
+        app.theme().name,
+        "Tokyo Night",
         "the applied theme's preview survives the retire"
     );
 }
@@ -14260,7 +14263,7 @@ fn arrows_and_tab_interoperate_in_both_directions() {
         format!("/theme {c3}"),
         "Tab applies from the arrow position"
     );
-    assert!(!app.theme.name.is_empty(), "the applied theme previews");
+    assert!(!app.theme().name.is_empty(), "the applied theme previews");
 
     // Arrow: navigate from index 3 to index 4 — the composer follows.
     app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
@@ -14270,7 +14273,7 @@ fn arrows_and_tab_interoperate_in_both_directions() {
         "the arrow applies its landed row after Tab applied one"
     );
     assert!(
-        app.theme.name != "Dracula" || c4 == "dracula",
+        app.theme().name != "Dracula" || c4 == "dracula",
         "the arrow previewed away from the original"
     );
 

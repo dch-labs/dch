@@ -990,7 +990,7 @@ fn a_waiting_steer_carries_its_chrome_at_the_edge_and_keeps_it_when_it_lands() {
     );
     assert_eq!(
         buffer[(5, steered_row_u16)].bg,
-        app.theme.ui.surface,
+        app.theme().ui.surface,
         "the waiting row rides the prompt box from its first frame"
     );
 

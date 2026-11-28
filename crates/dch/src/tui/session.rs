@@ -376,10 +376,10 @@ fn open_session_terminal(
     TerminalGuard::install_panic_hook();
     let (guard, terminal) =
         TerminalGuard::new(mouse_capture).map_err(|err| format!("terminal init: {err}"))?;
-    if dch_tui::sync_default_background(app.theme.ui.background) {
-        dch_tui::set_cursor_color(app.theme.ui.primary);
+    if dch_tui::sync_default_background(app.theme().ui.background) {
+        dch_tui::set_cursor_color(app.theme().ui.primary);
     } else {
-        app.theme = app.theme.deferred_to_terminal();
+        app.set_theme(app.theme().deferred_to_terminal());
     }
     dch_tui::arm_fatal_signal_restore();
     Ok((guard, terminal))

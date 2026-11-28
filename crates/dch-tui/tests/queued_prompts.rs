@@ -410,18 +410,21 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
     for offset in 0..6 {
         let (symbol, fg, bg) = &painted[row][column + offset];
         assert_eq!(
-            *bg, app.theme.ui.secondary,
+            *bg,
+            app.theme().ui.secondary,
             "the word rides the plan's traded accent, a pill of its own: {symbol:?}"
         );
         assert_eq!(
-            *fg, app.theme.ui.background,
+            *fg,
+            app.theme().ui.background,
             "the canvas color keeps the letters legible on the accent"
         );
     }
     for proud in [column - 1, column + 6] {
         let (_, _, bg) = &painted[row][proud];
         assert_eq!(
-            *bg, app.theme.ui.secondary,
+            *bg,
+            app.theme().ui.secondary,
             "one fill cell proud of the word on either side"
         );
     }
@@ -463,15 +466,17 @@ fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
         .find(|(symbol, _, _)| symbol == "\u{231b}")
         .expect("the waiting prompt carries the hourglass marker");
     assert_eq!(
-        marker.1, app.theme.ui.dim,
+        marker.1,
+        app.theme().ui.dim,
         "the marker rests in the dim register while the composer holds the keys"
     );
     drop(resting);
 
     press(&mut app, &ctrl(KeyCode::Char('w')));
-    app.theme = Theme::by_name("dracula").expect("the dracula theme is shipped");
+    app.set_theme(Theme::by_name("dracula").expect("the dracula theme is shipped"));
     assert_eq!(
-        app.theme.ui.secondary, app.theme.ui.dim,
+        app.theme().ui.secondary,
+        app.theme().ui.dim,
         "Dracula collapses the secondary accent into dim — the theme the \
          focus cue must survive"
     );
@@ -481,11 +486,13 @@ fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
     for offset in 0..6 {
         let (_, fg, bg) = &painted[row][column + offset];
         assert_eq!(
-            *bg, app.theme.ui.secondary,
+            *bg,
+            app.theme().ui.secondary,
             "the badge keeps its accent — focus is the marker's to tell"
         );
         assert_eq!(
-            *fg, app.theme.ui.background,
+            *fg,
+            app.theme().ui.background,
             "the canvas color keeps the letters legible on the accent"
         );
     }
@@ -495,11 +502,13 @@ fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
         .find(|(symbol, _, _)| symbol == "\u{231b}")
         .expect("the waiting prompt carries the hourglass marker");
     assert_ne!(
-        marker.1, app.theme.ui.dim,
+        marker.1,
+        app.theme().ui.dim,
         "the focused marker never renders in the resting voice"
     );
     assert_eq!(
-        marker.1, app.theme.ui.primary,
+        marker.1,
+        app.theme().ui.primary,
         "the keys light the marker in the primary accent, a cue no theme \
          can collapse away"
     );
@@ -508,7 +517,7 @@ fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
 #[test]
 fn a_deferring_theme_leaves_the_badge_unfilled() {
     let (mut app, _kept, _rx) = app_with_waiting(&["first waiting"]);
-    app.theme = Theme::by_name("transparent").expect("the transparent theme is shipped");
+    app.set_theme(Theme::by_name("transparent").expect("the transparent theme is shipped"));
 
     let painted = painted_rows(&mut app, 80, 24);
     let (row, column) = badge_at(&painted);
@@ -1128,8 +1137,8 @@ fn the_composer_greys_out_while_the_section_holds_the_keys() {
     // keys are landing. An edit brings it back to full voice — the
     // lifted prompt is being typed there.
     let (mut app, kept, _rx) = app_with_waiting(&["waiting while greyed"]);
-    let primary = app.theme.ui.primary;
-    let dim = app.theme.ui.dim;
+    let primary = app.theme().ui.primary;
+    let dim = app.theme().ui.dim;
 
     let full = painted_rows(&mut app, 80, 24);
     let primary_edges = full
@@ -1796,7 +1805,7 @@ fn the_section_renders_on_a_theme_that_paints_no_surface() {
     // The adaptation a session falls back to when the terminal never
     // answered the background query: the canvas colors go back to the
     // terminal, and nothing on screen may lean on a filled panel.
-    app.theme = app.theme.deferred_to_terminal();
+    app.set_theme(app.theme().deferred_to_terminal());
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
@@ -2010,7 +2019,7 @@ fn the_leave_chord_hands_the_keys_back_as_esc_does() {
     press(&mut app, &ctrl(KeyCode::Char('w')));
     assert_eq!(
         marker_fg(&mut app),
-        app.theme.ui.primary,
+        app.theme().ui.primary,
         "the enter chord hands the section the keys — the marker lights"
     );
 
@@ -2025,7 +2034,7 @@ fn the_leave_chord_hands_the_keys_back_as_esc_does() {
     press(&mut app, &ctrl(KeyCode::Char('w')));
     assert_eq!(
         marker_fg(&mut app),
-        app.theme.ui.primary,
+        app.theme().ui.primary,
         "the enter chord re-enters — not a one-way door"
     );
 }
